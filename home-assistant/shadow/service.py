@@ -5,6 +5,7 @@ import json
 import logging
 import os
 from pathlib import Path
+from math import ceil
 import signal
 import sqlite3
 from tempfile import TemporaryDirectory
@@ -35,8 +36,8 @@ CONFIG = Path(os.getenv("ROOM_CLIMATE_ROOMS_FILE", str(Path(__file__).with_name(
 DAY = 86400
 HISTORY = 7 * DAY
 POWER_REPORT_GAP_SECONDS = 120
-POLICY_REVISION = 7
-POLICY_START_KEY = "policy_started_1"  # Continuous observation started with the original policy.
+POLICY_REVISION = 8
+POLICY_START_KEY = f"policy_started_{POLICY_REVISION}"
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS power_models (
@@ -168,7 +169,7 @@ def recent_power_reports(recorder, entity, thermostat, start, end, *, as_of=None
     return sorted((stamp, watts) for stamp, watts in reports.items() if as_of is None or stamp <= as_of + 1e-6)
 
 
-def metrics(records):
+def metrics(records, *, fixed_band=False):
     values = [json.loads(r["value"]) for r in records]
     valid = [x for x in values if x["measured"] is not None and x["source_fresh"]]
     errors = [abs(x["measured"] - x["target"]) for x in valid]
@@ -225,7 +226,8 @@ def metrics(records):
             "nonunknown_power_minutes": sum(x["confidence"] != "未知" for x in values),
             "hypothetical_beeps": count,
             "projected_beeps_24h": round(count * 1440 / minutes, 1) if minutes >= 60 else None,
-            "within_comfort_pct": round(100 * sum(error <= x["comfort_half_band"] for error, x in zip(errors, valid)) / len(errors), 1) if errors else None,
+            "within_comfort_pct": round(100 * sum(error <= (.7 if fixed_band else x["comfort_half_band"]) + 1e-6
+                                               for error, x in zip(errors, valid)) / len(errors), 1) if errors else None,
             "within_ideal_pct": round(100 * sum(error <= .5 + 1e-6 for error in errors) / len(errors), 1) if errors else None,
             "metered_kwh": round(sum(x.get("metered_kwh") or 0 for x in values), 6) if metered_seconds else None,
             "metered_seconds": round(metered_seconds, 1),
@@ -496,6 +498,24 @@ def atomic(path, body):
     temp.replace(path)
 
 
+def deployed_release():
+    marker = Path(__file__).with_name(".release")
+    try:
+        with marker.open() as release:
+            marker_time = marker.stat().st_mtime
+            return release.read().strip(), marker_time
+    except FileNotFoundError:
+        return None, None
+
+
+def version_rows(db, floor, tick, commit, room=None):
+    return db.execute("""SELECT room,tick,value FROM decisions WHERE tick BETWEEN ? AND ?
+                        AND json_extract(value,'$.policy_revision')=?
+                        AND json_extract(value,'$.release_commit') IS ?
+                        AND (? IS NULL OR room=?) ORDER BY tick,room""",
+                      (floor, tick, POLICY_REVISION, commit, room, room))
+
+
 def live_actuations(start, end, journals=JOURNALS):
     counted = {}
     for path in journals.glob("continuous-*.json"):
@@ -504,58 +524,67 @@ def live_actuations(start, end, journals=JOURNALS):
         except FileNotFoundError:
             continue
         for action in state.get("commands", state.values() if "-actions-" in path.stem else ()):
-            if start <= action["sent_at"] < end and action["status"] not in {"prepared", "canceled"}:
+            if action["sent_at"] < end and action["status"] not in {"prepared", "canceled"}:
                 counted[action["room"], action["sent_at"]] = action
     counts = {name: 0 for name in ("attempts", "proxy_echoes", "starts", "stops", "reversals")}
     last_off = {}
     for action in sorted(counted.values(), key=lambda item: item["sent_at"]):
-        counts["attempts"] += 1
+        in_window = start <= action["sent_at"]
+        counts["attempts"] += in_window
         if action["status"] != "proxy_echo":
             continue
-        counts["proxy_echoes"] += 1
+        counts["proxy_echoes"] += in_window
         if action["kind"] != "mode":
             continue
         mode, before, room = action["value"], action["before"][0], action["room"]
         if mode == "off":
-            counts["stops"] += 1
+            counts["stops"] += in_window
             last_off[room] = before
         elif mode in {"cool", "heat"}:
             previous = last_off.pop(room, None) if before == "off" else before
-            counts["starts"] += before == "off"
-            counts["reversals"] += previous in {"cool", "heat"} and previous != mode
+            counts["starts"] += in_window and before == "off"
+            counts["reversals"] += in_window and previous in {"cool", "heat"} and previous != mode
     return counts
 
 
-def display(db, config, tick, error=None):
+def display(db, config, tick, error=None, *, release=(None, None)):
     arrivals = dict(db.execute("SELECT key,value FROM settings WHERE key IN ('started','valid_started',?)", (POLICY_START_KEY,)))
     started = int(arrivals.get("valid_started", arrivals["started"]))
+    commit, deployed_at = release
     policy_start = int(arrivals[POLICY_START_KEY]) if POLICY_START_KEY in arrivals else None
-    assessment = policy_start + 60 if policy_start is not None else None
+    assessment = deployed_at if deployed_at is not None else policy_start
     today = local(tick).date().isoformat()
-    floor = max(policy_start if policy_start is not None else tick, tick - DAY + 60)
+    release_floor = ceil(assessment/60)*60 if assessment is not None else tick+60
+    floor = max(release_floor, tick-DAY+60)
     expected = max(1, (tick-floor)//60+1)
     current = {}
     for room in config:
         row = db.execute("SELECT tick,value FROM decisions WHERE room=? ORDER BY tick DESC LIMIT 1", (room,)).fetchone()
         latest = json.loads(row["value"]) if row else {}
-        recent = db.execute("SELECT tick,value FROM decisions WHERE room=? AND tick>=? ORDER BY tick", (room, floor)).fetchall()
+        recent = version_rows(db, floor, tick, commit, room).fetchall()
         today_rows = db.execute("SELECT sum(hypothetical) FROM decisions WHERE room=? AND localday=?", (room, today)).fetchone()
-        totals = metrics(recent)
+        totals = metrics(recent, fixed_band=True)
         current[room] = {"latest": latest, "tick": row["tick"] if row else None,
                          "totals": totals, "today_hypothetical_beeps": today_rows[0] or 0,
                          "coverage_pct": round(100 * totals["valid_temperature_minutes"] / expected, 1)}
     complete_days = db.execute("SELECT * FROM daily ORDER BY localday DESC,room LIMIT 9").fetchall()
-    enough_data = assessment is not None and time.time()-assessment >= DAY and all(item["coverage_pct"] >= 80 for item in current.values())
+    enough_data = (assessment is not None and tick+60-assessment >= DAY and
+                   all(current[room]["coverage_pct"] >= 80 for room in ("bedroom", "living") if room in current))
     rules = db.execute("SELECT value FROM settings WHERE key='mijia_rules_confirmation'").fetchone()
     rules = json.loads(rules[0]) if rules else None
     shared_energy = {}
-    for row in db.execute("SELECT room,tick,value FROM decisions WHERE tick>=?", (floor,)):
+    for row in version_rows(db, floor, tick, commit):
         value = json.loads(row["value"])
-        if row["room"] in config and value.get("metered_seconds", 0) >= 60 - 1e-6:
+        if (row["room"] in config and row["tick"]-60 >= release_floor
+                and value.get("metered_seconds", 0) >= 60-1e-6):
             shared_energy.setdefault(row["tick"], []).append(value["metered_kwh"])
     complete_energy = [sum(readings) for readings in shared_energy.values() if len(readings) == len(config)]
     summary = {"started_at":local(started).isoformat(), "checked_at":local(tick).isoformat(),
-               "policy_revision": POLICY_REVISION, "assessment_started_at": local(assessment).isoformat() if assessment else None,
+               "policy_revision": POLICY_REVISION, "release_commit": commit,
+               "deployment_at": local(deployed_at).isoformat() if deployed_at is not None else None,
+               "assessment_window_from": local(floor).isoformat(), "assessment_window_to": local(tick+60).isoformat(),
+               "assessment_completed_minutes": max(0, (tick-floor)//60+1),
+               "assessment_started_at": local(assessment).isoformat() if assessment is not None else None,
                "earliest_24h_review":local(assessment+DAY).isoformat() if assessment else None,
                "72h_review":local(assessment+3*DAY).isoformat() if assessment else None,
                "data_ready_for_24h_review":enough_data and not error,
@@ -565,11 +594,12 @@ def display(db, config, tick, error=None):
                "observed_home_minutes": len(complete_energy),
                "observed_home_coverage_pct": round(100 * len(complete_energy) / expected, 1),
                "independent_temperature_rooms": [room for room in ("bedroom", "living") if room in config],
-               "live_actuations": live_actuations(floor-60, tick+60),
+               "live_actuations": live_actuations(max(floor-60, assessment or floor), tick+60),
                "metered_seconds_by_room": {room: r["totals"]["metered_seconds"] for room, r in current.items()},
+               "completed_days_scope": "cumulative_history",
                "completed_days":[dict(r, metrics=json.loads(r["metrics"])) for r in complete_days]}
     atomic(OUTPUT/"shadow-status.json", json.dumps(summary, indent=2, ensure_ascii=False)+"\n")
-    assessment_line = (f"累计观测的 24 小时评估点为 {local(assessment+DAY):%Y-%m-%d %H:%M %Z}。72 小时点 {local(assessment+3*DAY):%Y-%m-%d %H:%M %Z}。"
+    assessment_line = (f"本部署窗口的 24 小时评估点为 {local(assessment+DAY):%Y-%m-%d %H:%M %Z}。72 小时点 {local(assessment+3*DAY):%Y-%m-%d %H:%M %Z}。"
                        if assessment else "等待首组有效房间数据，24 小时评估尚未开始。")
     lines = ["# 三房温控影子记录", "", f"开始 {local(started):%Y-%m-%d %H:%M %Z}　最新观测时段 {local(tick):%Y-%m-%d %H:%M %Z}",
              assessment_line,
@@ -622,7 +652,7 @@ def display(db, config, tick, error=None):
     atomic(OUTPUT/"shadow-status.md", "\n".join(lines))
 
 
-def cycle(db, config, tick):
+def cycle(db, config, tick, *, release_commit=None):
     with closing(open_readonly(SOURCE / "home-assistant_v2.db")) as recorder, room_source(
         SOURCE / ".storage/room_climate_control.sqlite3"
     ) as rooms, db:
@@ -643,6 +673,7 @@ def cycle(db, config, tick):
             db.execute("INSERT OR IGNORE INTO settings VALUES (?,?)", (POLICY_START_KEY, str(tick)))
         for value in data.values():
             value["policy_revision"] = POLICY_REVISION
+            value["release_commit"] = release_commit
         db.executemany("INSERT OR IGNORE INTO decisions VALUES (?,?,?,?,?)",
                        [(room,tick,local(tick).date().isoformat(),int(value["hypothetical_send"]),encode(value)) for room,value in data.items()])
         daily(db,local(tick).date().isoformat())
@@ -667,6 +698,7 @@ def daily_snapshot(db, tick):
 def main():
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     config = json.loads(CONFIG.read_text())
+    release = deployed_release()
     stop = Event()
     signal.signal(signal.SIGTERM, lambda *_: stop.set())
     signal.signal(signal.SIGINT, lambda *_: stop.set())
@@ -680,9 +712,9 @@ def main():
             # HA writes its interval sample at any point within the minute.
             tick = int(time.time())//60*60 - 60
             try:
-                changed = cycle(db, config, tick)
+                changed = cycle(db, config, tick, release_commit=release[0])
                 if last_report is None or changed or last_error:
-                    display(db, config, tick)
+                    display(db, config, tick, release=release)
                     try:
                         review = trial_review(db, config, JOURNALS, time.time(), tick, LOCAL)
                         path = OUTPUT / "live-pilot-review.md"
@@ -700,7 +732,7 @@ def main():
                     LOG.warning("Shadow input or storage unavailable: %s", name)
                 last_error = name
                 try:
-                    display(db, config, tick, name)
+                    display(db, config, tick, name, release=release)
                 except (sqlite3.Error, OSError):
                     LOG.warning("Shadow status output unavailable")
             stop.wait(10)

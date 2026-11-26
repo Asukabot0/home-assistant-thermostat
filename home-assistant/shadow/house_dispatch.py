@@ -22,6 +22,18 @@ def all_rooms_assessed(live, connected):
                and 0 <= live[room]["temperature_age"] <= 1200 for room in connected)
 
 
+def excess_initial_output(mode, setting, bounds):
+    return bounds is not None and setting is not None and (
+        mode == "heat" and setting > bounds[1] or mode == "cool" and setting < bounds[0])
+
+
+def initial_safety_setting(mode, setting, target, limits):
+    bounds = setpoint_bounds(limits)
+    if target is None or not excess_initial_output(mode, setting, bounds):
+        return None
+    return max(bounds[0], min(bounds[1], round(target)))
+
+
 def final_gate(candidate, now, live, readings, connected, state, configurations, *, policy=POLICY):
     room, kind, value, purpose = candidate
     feedback = live[room]
@@ -34,7 +46,7 @@ def final_gate(candidate, now, live, readings, connected, state, configurations,
             or room in state["manual_holds"]
             or list(feedback["signature"][:3]) != state["baselines"][room]):
         return "等待可信回报或人工恢复"
-    if flag := matching_feedback(now, feedback, shadow["sample"], target, reversal=kind == "mode"):
+    if flag := matching_feedback(now, feedback, shadow["sample"], target, reversal=kind == "mode" and value != "off"):
         return flag
     if not current_power_evidence(now, feedback, shadow):
         return "等待本机新鲜功率上报"
@@ -44,6 +56,14 @@ def final_gate(candidate, now, live, readings, connected, state, configurations,
             return "超出设温边界"
         if purpose == "direct_high_easing" and not high_overshoot(now, feedback, shadow, configurations[room], shadow["house_view"], policy):
             return "持续高功率条件已解除"
+        if purpose == "initial_safety_easing":
+            batch = state.get("transitions", {}).get(group)
+            expected = initial_safety_setting(mode, numeric(setpoint), numeric(target),
+                                              configurations[room]["soft_limits"][mode])
+            if (batch and batch["mode"] == mode and now >= batch["ready_at"]
+                    and batch["members"].get(room, {}).get("phase") == "initial" and value == expected):
+                return None
+            return "继承设温归位条件已变化"
         if purpose == "reversal_initial":
             return None
         decision = {"mode": mode, "setpoint": value, "hypothetical_send": True,
@@ -119,10 +139,12 @@ def recovery_initial(room, mode, live, shadow, state, configurations, policy=POL
     measured = numeric(v["temperature"])
     if measured is None or abs(measured-target) > policy["mild_recovery_deviation"]:
         return base
-    # For a small excursion, approach with the weaker of the learned initial,
-    # the last acknowledged working setting, and one step on the mild side.
+    # Retain a milder comparable setting within one extra step of the
+    # conservative baseline. A previous shedding setpoint or proxy memory
+    # alone does not establish that an extreme setting can meet demand.
     direction = 1 if mode == "heat" else -1
-    choices = [base, round(target)-direction*policy["ordinary_step"]]
+    mild = min((base, round(target)-direction*policy["ordinary_step"]), key=lambda value: direction*value)
+    choices = [mild]
     remembered = numeric(v["adapter"]["setpoint"])
     if v["adapter"]["mode"] == mode and remembered is not None and bounds[0] <= remembered <= bounds[1]:
         choices.append(remembered)
@@ -136,7 +158,9 @@ def recovery_initial(room, mode, live, shadow, state, configurations, policy=POL
                             and a.get("target_at_send") == target and a["before"][0] == mode), None)
             if stopped and numeric(stopped["before"][1]) is not None:
                 choices.append(stopped["before"][1])
-    return int(max(bounds[0], min(bounds[1], min(choices, key=lambda value: direction*value))))
+    from_memory = min(direction*value for value in choices)
+    limited = direction*max(from_memory, direction*mild-policy["ordinary_step"])
+    return int(max(bounds[0], min(bounds[1], limited)))
 
 
 def coordinate(live, readings, ready, state, now, configurations, connected, policy=POLICY):

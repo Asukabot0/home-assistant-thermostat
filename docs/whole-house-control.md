@@ -35,3 +35,11 @@ python3 work/release_local.py --production /path/to/home-assistant --rollback /p
 ```
 
 After a release confirm the startup commit and hashes in `pilot-data/live-audit.jsonl`, fresh cycles, current locks and any naturally dispatched relay/proxy receipt pairs. Leave normal operation running across day and night to assess independent comfort and metered kWh under comparable coverage and weather.
+
+## Confirmed start inherits an unsafe temperature
+
+The companion can echo the correct mode with its remembered setting still active. If output would be excessive (heat above its maximum or cool below its minimum), discard the stale proposed initial value and recalculate a weakening action from the current target clamped to the mode and hardware limits. The repair remains attached to that confirmed batch until its own echo and uses the same fresh measurements, consent, manual holds, and durable journal as other commands. A legal setting needs no supplementary command when the direction is no longer requested. A weak-side out-of-bounds setting does not force an otherwise unwanted increase.
+
+A protective stop still needs valid mode, minimum runtime, a current independently reported power reading, and a usable low-draw reference for eventual restart. It does not wait for Recorder to include the latest change in instantaneous watts. Starting still requires the new state and a contiguous low-draw interval. For mild recovery, proxy memory may soften the conservative target by one additional ordinary step; a much weaker previous shedding setting alone cannot delay recovery through several serial increases.
+
+Live-release acceptance begins at the deployment marker and uses only minute rows tagged with the active commit and policy revision. A same-commit service restart preserves the deployment marker. Historical daily metrics remain available as cumulative context, and do not count toward the new release's first 24 hours.

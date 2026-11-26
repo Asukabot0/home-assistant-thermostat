@@ -335,9 +335,13 @@ class DispatchTests(unittest.TestCase):
         self.assertEqual(state["transitions"]["living_study"]["members"]["living"]["phase"], "initial")
         v["signature"] = (*v["signature"][:5], "标准", False)
         state = self.snapshot()
-        self.assertNotIn("living_study", state["transitions"])
-        self.assertEqual(state["commands"][-1]["purpose"], "energy_start")
+        self.assertEqual((state["commands"][-1]["purpose"], state["commands"][-1]["value"]),
+                         ("initial_safety_easing", 22))
+        self.assertTrue(state["transitions"]["living_study"]["members"]["living"]["initial_invalidated"])
         self.assertEqual(state["baselines"]["living"], ["heat", 27, "auto"])
+        state = self.snapshot()
+        self.assertNotIn("living_study", state["transitions"])
+        self.assertEqual(state["baselines"]["living"], ["heat", 22, "auto"])
 
     def test_reduction_returns_out_of_range_setting_to_its_soft_boundary_only(self):
         self.whole_scene(("heat", 27, 24.3, 240), ("heat", 24, 24, 200))
@@ -591,6 +595,121 @@ class DispatchTests(unittest.TestCase):
         self.assertEqual(state["commands"][-1]["status"],"unconfirmed")
         self.assertIn("bedroom",state["holds"])
         self.assertEqual(len(self.calls),1)
+
+    def start_for_initial(self, mode, inherited):
+        measured = 23.2 if mode == "heat" else 24.8
+        self.journal.unlink(missing_ok=True)
+        self.calls.clear()
+        self.now = NOW
+        self.whole_scene((mode, 24, measured, 8), (mode, 24, 24, 8))
+        self.park("bedroom", "living", ago=720, previous=mode)
+        state = self.snapshot()
+        self.assertEqual(state["commands"][-1]["purpose"], "energy_start")
+        current = self.live["bedroom"]
+        current["signature"] = (mode, inherited, *current["signature"][2:])
+        current["adapter"]["setpoint"] = inherited
+        return current
+
+    def refresh_for_initial(self, current, target=24, temp=None, minutes=4):
+        self.now = NOW + minutes*60
+        current["signature"] = (*current["signature"][:4], target, *current["signature"][5:])
+        if temp is not None:
+            current["temperature"] = temp
+        self.observe("bedroom")
+        self.observe("living")
+
+    def test_excessive_heat_and_cool_in_hold_are_repaired_after_real_start(self):
+        for mode, inherited in (("heat", 27), ("cool", 20)):
+            for minutes in (4, 12, 22):
+                with self.subTest(mode=mode, minutes=minutes):
+                    current = self.start_for_initial(mode, inherited)
+                    self.refresh_for_initial(current, temp=24, minutes=minutes)
+                    state = self.snapshot()
+                    self.assertEqual(len(self.calls), 2)
+                    mode_action, repair = state["commands"][-2:]
+                    self.assertEqual((repair["purpose"], repair["value"]), ("initial_safety_easing", 24))
+                    self.assertEqual(repair["transaction"], mode_action["transaction"])
+                    self.assertEqual(state["baselines"]["bedroom"], [mode, inherited, "auto"])
+                    self.assertEqual(mode_action["status"], "proxy_echo")
+                    state = self.snapshot()
+                    self.assertEqual(state["baselines"]["bedroom"], [mode, 24, "auto"])
+                    self.assertFalse(state["transitions"])
+                    self.assertEqual(len(self.calls), 2)
+
+    def test_initial_rebuilds_from_new_target_or_closes_legal_setting_in_hold(self):
+        current = self.start_for_initial("heat", 27)
+        self.refresh_for_initial(current, target=22, temp=22.1)
+        state = self.snapshot()
+        self.assertEqual(state["commands"][-1]["value"], 22)
+        self.assertEqual(len(self.calls), 2)
+        for inherited in (20, 23):
+            current = self.start_for_initial("heat", inherited)
+            self.refresh_for_initial(current, target=22, temp=22)
+            state = self.snapshot()
+            self.assertFalse(state["transitions"])
+            self.assertEqual(len(self.calls), 1)
+            self.assertEqual(state["baselines"]["bedroom"], ["heat", inherited, "auto"])
+
+    def test_initial_safety_honors_stale_data_pause_and_unresolved_echo(self):
+        for block in ("reading", "power", "permission", "failure", "manual", "accepted", "prepared"):
+            with self.subTest(block=block):
+                current = self.start_for_initial("cool", 20)
+                self.refresh_for_initial(current, temp=24)
+                if block=="reading":
+                    current["temperature_age"] = 1201
+                elif block=="power":
+                    current["adapter"]["from_power_s"] = 121
+                elif block=="permission":
+                    permit = json.loads(self.permit.read_text())
+                    permit["enabled"] = False
+                    self.permit.write_text(json.dumps(permit))
+                elif block=="failure":
+                    self.update_state(holds={"bedroom":"test"})
+                elif block=="manual":
+                    self.update_state(manual_holds={"bedroom":"test"})
+                else:
+                    self.now = NOW+60
+                    current["adapter"]["updated_at"] = NOW-5
+                    if block=="prepared":
+                        state = json.loads(self.journal.read_text())
+                        state["commands"][-1]["status"] = "prepared"
+                        self.update_state(commands=state["commands"])
+                state = self.snapshot()
+                self.assertEqual(len(self.calls), 1)
+                self.assertIn("bedroom", state["transitions"])
+                if block == "accepted":
+                    self.assertEqual(state["commands"][-1]["status"], "accepted")
+                if block=="prepared":
+                    self.assertEqual(state["commands"][-1]["status"], "unconfirmed")
+                    self.assertIn("bedroom", state["holds"])
+
+    def test_protective_stop_allows_new_power_value_but_requires_fresh_power(self):
+        self.whole_scene(("cool",24,24,240), ("heat",20,24.8,198))
+        self.recent_adjustment("living",21,ago=660)
+        v=self.live["living"]
+        v["adapter"]["power_state_updated_at"] = NOW
+        state = self.snapshot()
+        self.assertEqual(state["commands"][-1]["purpose"], "energy_off")
+        self.assertEqual(len(self.calls),1)
+        self.journal.unlink()
+        self.calls.clear()
+        self.whole_scene(("cool",24,24,240), ("heat",20,24.8,198))
+        self.recent_adjustment("living",21,ago=660)
+        self.live["living"]["adapter"]["from_power_s"] = 121
+        self.snapshot()
+        self.assertEqual(self.calls,[])
+
+    def test_mild_recovery_memory_cannot_reuse_extreme_shedding_setting(self):
+        for mode, remembered, expected in (("heat", 20, 22), ("cool", 26, 26)):
+            with self.subTest(mode=mode):
+                current = self.start_for_initial(mode, remembered)
+                self.refresh_for_initial(current, temp=23.2 if mode=="heat" else 24.8)
+                state = self.snapshot()
+                if mode=="heat":
+                    self.assertEqual((state["commands"][-1]["purpose"], state["commands"][-1]["value"]),
+                                     ("reversal_initial", expected))
+                else:
+                    self.assertEqual(len(self.calls), 1)
 
 
 if __name__ == "__main__":

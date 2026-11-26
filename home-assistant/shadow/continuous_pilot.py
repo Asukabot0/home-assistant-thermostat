@@ -15,7 +15,7 @@ from traceback import extract_tb
 from urllib.error import HTTPError
 
 from cadence import SHARED_ROOMS, save_receipt
-from house_dispatch import acknowledged, coordinate, final_gate, recovery_initial
+from house_dispatch import acknowledged, coordinate, final_gate, initial_safety_setting, recovery_initial
 from house_policy import ACTIVE, INDEPENDENT, POLICY
 from heating_pilot import DATA_DIR, ha_client, publish
 from model import increases_output, numeric
@@ -236,19 +236,29 @@ def assess(live, state, now, advise_room=room_advice, *, trial=True, isolated=()
     allocation_ready = {room: enabled and room not in incomplete and group(room) not in transitions
                         for room, enabled in ready.items()}
     need, reasons, candidates = coordinate(live, readings, allocation_ready, state, now, ROOMS, connected)
-    invalidated = []
+    invalidated, closed, safety = [], [], {}
     for room in sorted(incomplete):
         batch, member = members[room]
-        mode = live[room]["adapter"]["mode"]
-        if (ready[room] and need != "unknown" and mode == batch["mode"]
-                and not matching_feedback(now, live[room], readings[room]["sample"], live[room]["signature"][4])
-                and need != mode):
-            # The confirmed mode/baseline and any sent command remain in the
-            # journal. This only discards an unsent initial setpoint.
+        feedback = live[room]
+        mode, setpoint, _, _, target, _, _ = feedback["signature"]
+        if (not ready[room] or need == "unknown" or mode != batch["mode"]
+                or matching_feedback(now, feedback, readings[room]["sample"], target)):
+            continue
+        if need != mode:
+            if not member.get("initial_invalidated") or member["target"] != target:
+                invalidated.append(room)
+            member.pop("initial", None)
+            member.update(initial_invalidated=True, target=target)
+        safe_setting = initial_safety_setting(mode, numeric(setpoint), numeric(target), ROOMS[room]["soft_limits"][mode])
+        if safe_setting is not None:
+            safety[room] = safe_setting
+        elif need != mode:
+            # Only close unsent work. The echo, baseline and historical
+            # commands remain in the durable journal.
             member["phase"] = "done"
-            invalidated.append(room)
-    if invalidated:
-        incomplete.difference_update(invalidated)
+            closed.append(room)
+    if closed:
+        incomplete.difference_update(closed)
         for key, batch in list(transitions.items()):
             if key not in state["holds"] and all(m["phase"] == "done" for m in batch["members"].values()):
                 del transitions[key]
@@ -268,12 +278,18 @@ def assess(live, state, now, advise_room=room_advice, *, trial=True, isolated=()
                 detail.update({key: view[key] for key in ("cold_seconds", "warm_seconds", "cold_confirmed", "warm_confirmed")})
     for room in sorted(incomplete):
         batch, member = members[room]
-        if not ready[room] or now < batch["ready_at"] or need in {"unknown", "conflict"}:
+        if not ready[room] or now < batch["ready_at"] or need == "unknown":
+            continue
+        if room in safety:
+            details[room]["status"] = "已确认模式继承超出软限的设温，按当前目标安全减载"
+            candidates.append((-3, (0, 0), room, "temperature", safety[room], "initial_safety_easing"))
+            continue
+        if need == "conflict":
             continue
         mode = live[room]["adapter"]["mode"]
         current = live[room]["adapter"]["setpoint"]
         target = live[room]["signature"][4]
-        if mode != batch["mode"]:
+        if mode != batch["mode"] or need != mode:
             continue
         initial = recovery_initial(room, mode, live, readings[room], state, ROOMS)
         if initial is None or matching_feedback(now, live[room], readings[room]["sample"], target):
@@ -293,7 +309,7 @@ def assess(live, state, now, advise_room=room_advice, *, trial=True, isolated=()
     trace["rejections"] = []
     for priority, ranking, *action in sorted(candidates):
         room, kind, _, purpose = action
-        if (trial and kind == "temperature" and purpose != "reversal_initial"
+        if (trial and kind == "temperature" and purpose not in {"reversal_initial", "initial_safety_easing"}
                 and sum(c["room"] == room and c["kind"] == "temperature" and c["status"] != "canceled"
                         for c in state["commands"]) >= MAX_STEPS):
             details[room]["status"] = "已达本次试点的设温次数限制"
@@ -364,9 +380,9 @@ def cycle(call):
         audit("cycle", outcome="permit_expiring", assessment=trace, verification=verification, rooms=checked)
         return
     batch = None
-    if purpose in {"energy_start", "reversal_initial"}:
+    if purpose in {"energy_start", "reversal_initial", "initial_safety_easing"}:
         batch = state["transitions"].get(group(room))
-        if batch is None:
+        if batch is None and purpose == "energy_start":
             batch = start_batch(state, room, value, checked, sent)
     action = {"room": room, "kind": kind, "value": value, "before": previous, "sent_at": sent, "status": "prepared",
               "purpose": purpose, "transaction": batch["id"] if batch else None, "target_at_send": checked[room]["target_c"],
