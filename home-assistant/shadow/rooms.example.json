@@ -1,0 +1,65 @@
+{
+  "bedroom": {
+    "name": "Bedroom",
+    "temperature": "sensor.example_bedroom_temperature",
+    "power": "sensor.example_bedroom_local_power",
+    "power_fallback": "sensor.example_bedroom_legacy_power",
+    "adapter": "climate.example_bedroom_ac",
+    "reference": "Bedroom temperature",
+    "soft_limits": {
+      "cool": [
+        22,
+        26
+      ],
+      "heat": [
+        20,
+        25
+      ]
+    },
+    "transition_off_seconds": 240,
+    "overshoot_high_power_seconds": 180,
+    "witness_trial_id": "example-bedroom-witness"
+  },
+  "living": {
+    "name": "Living room",
+    "temperature": "sensor.example_living_temperature",
+    "power": "sensor.example_living_local_power",
+    "power_fallback": "sensor.example_living_legacy_power",
+    "adapter": "climate.example_living_ac",
+    "reference": "Living temperature",
+    "soft_limits": {
+      "cool": [
+        22,
+        26
+      ],
+      "heat": [
+        20,
+        25
+      ]
+    },
+    "transition_off_seconds": 240,
+    "overshoot_high_power_seconds": 180,
+    "witness_trial_id": "example-living-witness"
+  },
+  "study": {
+    "name": "Study",
+    "temperature": "sensor.example_living_temperature",
+    "power": "sensor.example_study_local_power",
+    "power_fallback": "sensor.example_study_legacy_power",
+    "adapter": "climate.example_study_ac",
+    "reference": "Living temperature",
+    "soft_limits": {
+      "cool": [
+        22,
+        26
+      ],
+      "heat": [
+        20,
+        25
+      ]
+    },
+    "transition_off_seconds": 240,
+    "overshoot_high_power_seconds": 180,
+    "witness_trial_id": "example-study-witness"
+  }
+}

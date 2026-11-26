@@ -1,0 +1,9 @@
+{
+  "domain": "room_climate_control",
+  "name": "Room Climate Control",
+  "version": "0.1.0",
+  "dependencies": ["climate", "versatile_thermostat"],
+  "integration_type": "service",
+  "iot_class": "calculated",
+  "codeowners": []
+}

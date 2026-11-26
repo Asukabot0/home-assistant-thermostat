@@ -1,0 +1,33 @@
+name: room-thermostat-pilot
+
+services:
+  heating-pilot:
+    image: ghcr.io/home-assistant/home-assistant:2026.11.3
+    entrypoint: ["/usr/local/bin/python", "-u", "/opt/shadow/continuous_pilot.py"]
+    restart: unless-stopped
+    read_only: true
+    tmpfs: [/tmp]
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    mem_limit: 160m
+    pids_limit: 32
+    environment:
+      TZ: Asia/Tokyo
+      PYTHONDONTWRITEBYTECODE: "1"
+      ROOM_CLIMATE_HA_URL: ${ROOM_CLIMATE_HA_URL:-http://homeassistant:8123}
+    volumes:
+      - ./shadow:/opt/shadow:ro
+      - ./shadow-data:/data:ro
+      - ./private/home-assistant.env:/access/home-assistant.env:ro
+      - ./pilot-data:/pilot
+    networks: [homeassistant]
+    logging:
+      driver: json-file
+      options:
+        max-size: 2m
+        max-file: "2"
+
+networks:
+  homeassistant:
+    external: true
+    name: ${HA_NETWORK:-homeassistant_default}

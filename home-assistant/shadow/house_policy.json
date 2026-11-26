@@ -1,0 +1,19 @@
+{
+  "ideal_band": 0.5,
+  "comfort_band": 0.7,
+  "ordinary_step": 1,
+  "large_step": 2,
+  "large_deviation": 2.0,
+  "temperature_dwell_seconds": 1200,
+  "trend_window_seconds": 900,
+  "trend_report_max_age_seconds": 300,
+  "forecast_seconds": 600,
+  "recovery_horizon_seconds": 1800,
+  "minimum_trend_span_seconds": 300,
+  "minimum_progress_c": 0.15,
+  "feedback_wait_seconds": 600,
+  "mode_dwell_seconds": 1800,
+  "min_run_seconds": 900,
+  "min_off_seconds": 300,
+  "reversal_run_seconds": 3600
+}

@@ -1,0 +1,11 @@
+{
+  "enabled": false,
+  "start": 0,
+  "end": null,
+  "isolated_rooms": [],
+  "rooms": {
+    "bedroom": ["heat", 24, "auto"],
+    "living": ["heat", 24, "auto"],
+    "study": ["heat", 24, "auto"]
+  }
+}

@@ -1,0 +1,25 @@
+room_climate_control:
+  rooms:
+    bedroom:
+      name: Bedroom
+      adapter: climate.example_bedroom_ac
+      temperature: sensor.example_bedroom_temperature
+      power: sensor.example_bedroom_local_power
+      temperature_reference: Bedroom temperature
+      actuation_approved: false
+    living:
+      name: Living room
+      adapter: climate.example_living_ac
+      temperature: sensor.example_living_temperature
+      power: sensor.example_living_local_power
+      temperature_reference: Living room temperature
+      group: living_study
+      actuation_approved: false
+    study:
+      name: Study
+      adapter: climate.example_study_ac
+      temperature: sensor.example_living_temperature
+      power: sensor.example_study_local_power
+      temperature_reference: Shared living room temperature
+      group: living_study
+      actuation_approved: false
