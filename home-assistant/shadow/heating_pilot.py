@@ -3,7 +3,6 @@ from datetime import datetime
 import json
 from math import isfinite
 import os
-import os
 from pathlib import Path
 import signal
 import sqlite3

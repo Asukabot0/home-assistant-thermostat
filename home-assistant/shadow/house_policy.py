@@ -11,23 +11,39 @@ ACTIVE = {"heat", "cool"}
 INDEPENDENT = ("bedroom", "living")
 
 
-def recent_trend(history, sample, now, since, policy=POLICY):
+def independent_points(history, sample, now, since, window, *, same_operation):
     """Estimate change using independent reports after the latest control context."""
-    identity = tuple(sample.get(key) for key in ("adapter_mode", "reported", "desired", "temperature_source"))
+    keys = ("desired", "temperature_source")
+    if same_operation:
+        keys += ("adapter_mode", "reported")
+    identity = tuple(sample.get(key) for key in keys)
     points = {}
     for row in reversed([*history, sample]):
-        if row["tick"] < now - policy["trend_window_seconds"]:
+        if row["tick"] < now - window or row["measured"] is None or row["temp_report"] is None:
             break
-        if tuple(row.get(key) for key in ("adapter_mode", "reported", "desired", "temperature_source")) != identity:
+        if tuple(row.get(key) for key in keys) != identity:
             break
         stamp, value = row["temp_report"], row["measured"]
         if (value is not None and stamp is not None
-                and max(since, now-policy["trend_window_seconds"]) < stamp <= now):
+                and max(since, now-window) < stamp <= now):
             points.setdefault(stamp, value)
-    points = sorted(points.items())
-    if (len(points) < 3 or points[-1][0] - points[0][0] < policy["minimum_trend_span_seconds"]
-            or now - points[-1][0] > policy["trend_report_max_age_seconds"]):
-        return None
+    return sorted(points.items())
+
+
+def recent_trend(history, sample, now, since, policy=POLICY):
+    points = independent_points(history, sample, now, since, policy["trend_window_seconds"], same_operation=True)
+    dense = (len(points) >= 3 and points[-1][0] - points[0][0] >= policy["minimum_trend_span_seconds"]
+             and now - points[-1][0] <= policy["trend_report_max_age_seconds"])
+    if not dense:
+        points = independent_points(history, sample, now, since, policy["sparse_trend_window_seconds"], same_operation=True)
+        if len(points) < 2 or now - points[-1][0] > policy["sparse_report_age_seconds"]:
+            return None
+        span = points[-1][0] - points[0][0]
+        rapid = (span >= policy["rapid_report_span_seconds"]
+                 and abs(points[-1][1]-points[0][1]) >= policy["rapid_report_change_c"]
+                 and now-points[-1][0] <= policy["trend_report_max_age_seconds"])
+        if span < policy["sparse_report_span_seconds"] and not rapid:
+            return None
     rates = [(v2-v1)/(t2-t1) for i, (t1, v1) in enumerate(points) for t2, v2 in points[i+1:]
              if t2-t1 >= 120]
     return median(rates) * policy["forecast_seconds"] if rates else None
@@ -36,7 +52,7 @@ def recent_trend(history, sample, now, since, policy=POLICY):
 def outside_for(history, sample, direction, now, policy=POLICY):
     """Accumulate the excursion across setpoint/mode changes, within one target and sensor."""
     if sample["measured"] is None or direction * (sample["measured"]-sample["desired"]) <= policy["comfort_band"]:
-        return 0
+        return 0, now
     since = sample["tick"]
     for row in reversed(history[:-1]):
         if (since-row["tick"] != 60 or row["desired"] != sample["desired"]
@@ -46,15 +62,19 @@ def outside_for(history, sample, direction, now, policy=POLICY):
                 or direction * (row["measured"]-sample["desired"]) <= policy["comfort_band"]):
             break
         since = row["tick"]
-    return now - since
+    return now - since, since
 
 
 def thermostat_view(history, sample, now, since, policy=POLICY):
-    return {
-        "trend": recent_trend(history, sample, now, since, policy),
-        "cold_seconds": outside_for(history, sample, -1, now, policy),
-        "warm_seconds": outside_for(history, sample, 1, now, policy),
-    }
+    view = {"trend": recent_trend(history, sample, now, since, policy), "report_at": sample["temp_report"]}
+    for label, direction in (("cold", -1), ("warm", 1)):
+        duration, start = outside_for(history, sample, direction, now, policy)
+        # A minute row can lag its temperature report by up to one minute.
+        points = independent_points(history, sample, now, start-60, 3900, same_operation=False)
+        outside = [at for at, temp in points if direction*(temp-sample["desired"]) > policy["comfort_band"]]
+        view[f"{label}_seconds"] = duration
+        view[f"{label}_confirmed"] = len(outside) >= 2 and outside[-1]-outside[0] >= policy["sparse_report_span_seconds"]
+    return view
 
 
 def recovering(delta, predicted, policy=POLICY):
@@ -65,7 +85,7 @@ def recovering(delta, predicted, policy=POLICY):
     return predicted * (-1 if delta > 0 else 1) >= required
 
 
-def temperature_change(mode, current, measured, target, view, limits, *, has_output, weakening=False,
+def temperature_change(mode, current, measured, target, view, limits, *, has_output, weakening=False, direct_high=False,
                        policy=POLICY):
     bounds = setpoint_bounds(limits)
     if bounds is None or mode not in ACTIVE:
@@ -75,14 +95,17 @@ def temperature_change(mode, current, measured, target, view, limits, *, has_out
     deviation = thermal_direction * delta
     predicted = view["trend"]
     early = (has_output and predicted is not None and abs(deviation) <= policy["comfort_band"]
-             and predicted * thermal_direction > 0
+             and predicted * thermal_direction >= policy["minimum_progress_c"]
              and deviation + predicted * thermal_direction > policy["ideal_band"])
-    if weakening:
+    if direct_high:
         step = -thermal_direction * policy["ordinary_step"]
-        reason = "逐步减弱无需求方向或冗余输出"
+        reason = "持续高功率超过理想线，直接减载"
     elif early:
         step = -thermal_direction * policy["ordinary_step"]
         reason = "预计越过理想带，提前减载"
+    elif weakening:
+        step = -thermal_direction * policy["ordinary_step"]
+        reason = "逐步减弱无需求方向或冗余输出"
     elif abs(delta) <= policy["comfort_band"]:
         return None, "在容忍带内，维持"
     elif recovering(delta, predicted, policy):

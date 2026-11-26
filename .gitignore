@@ -16,3 +16,5 @@ __pycache__/
 /home-assistant/config/custom_components/*
 !/home-assistant/config/custom_components/room_climate_control/
 /outputs/
+/home-assistant/shadow/.release
+/home-assistant/release-backups/

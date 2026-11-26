@@ -17,9 +17,11 @@ COOL_BOUNDS = [22, 26]
 HEAT_BOUNDS = [20, 25]
 
 
-def qualifying_episode(db, state, room, end, *, mode="cool", setpoint=28, edit=None, duration=1200):
+def qualifying_episode(db, state, room, end, *, mode="cool", setpoint=28, edit=None, duration=1200, target=24, modify=None):
     ticks = range(end-EPISODE_SECONDS, end+1, 60)
-    rows = [{"tick": t, "adapter_mode": mode, "reported": setpoint, "measured": 24, "temp_report": t} for t in ticks]
+    rows = [{"tick": t, "adapter_mode": mode, "reported": setpoint, "measured": target, "desired": target, "temp_report": t} for t in ticks]
+    if modify:
+        modify(rows)
     if edit:
         rows[-1].update(edit)
     db.executemany("INSERT OR IGNORE INTO decisions VALUES (?,?,?,?,?)",
@@ -58,11 +60,29 @@ def run(path):
         assert qualifying_episode(db, session, "living", TICK, duration=1199) is None
         assert qualifying_episode(db, session, "living", TICK)["episodes"] == 1
 
+        future = TICK+7200
+        for offset, target in enumerate((22, 24, 26)):
+            assert qualifying_episode(db, session, "living", future+offset*1200, target=target,
+                                      setpoint=target+1)
+        def cached(rows):
+            for row in rows:
+                row["temp_report"] = rows[0]["tick"]
+        def drifting(rows):
+            for i,row in enumerate(rows):
+                row["measured"] = 23.8+i*.02
+        def target_changed(rows):
+            rows[10]["desired"] = 23
+        for i, modification in enumerate((cached, drifting, target_changed)):
+            qualifying_episode(db, session, "living", future+3600+i*1200, modify=modification)
+        assert db.execute("SELECT count(*) FROM stable_episode_quality WHERE room='living'").fetchone()[0] == 4
+
         end = TICK + LEARNING_WINDOW + 2401
         assert learned_offset(db, "bedroom", "cool", end) is None
         for i in range(22):
             db.execute("INSERT INTO stable_episodes VALUES (?,?,?,?,?)",
                        ("bedroom", "cool", end+i*1200-1200, end+i*1200, 3 if i >= 2 else -4))
+            db.execute("INSERT INTO stable_episode_quality VALUES (?,?,?,?,?)",
+                       ("bedroom", "cool", end+i*1200, 24, 3))
         assert learned_offset(db, "bedroom", "cool", end+21*1200)["episodes"] == 20
         assert initial_setpoint(db, "bedroom", "cool", end+21*1200, 24, COOL_BOUNDS) == 26
     with closing(sqlite3.connect(path)) as db:

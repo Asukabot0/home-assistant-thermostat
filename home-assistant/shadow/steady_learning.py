@@ -4,6 +4,7 @@ from statistics import median
 
 from cadence import SHARED_ROOMS
 from math import ceil, floor
+from house_policy import POLICY
 from model import clip, numeric, setpoint_bounds
 
 
@@ -14,6 +15,11 @@ SCHEMA = """
 CREATE TABLE IF NOT EXISTS stable_episodes (
     room TEXT NOT NULL, mode TEXT NOT NULL, started INTEGER NOT NULL,
     ended INTEGER NOT NULL, offset REAL NOT NULL,
+    PRIMARY KEY (room, mode, ended)
+);
+CREATE TABLE IF NOT EXISTS stable_episode_quality (
+    room TEXT NOT NULL, mode TEXT NOT NULL, ended INTEGER NOT NULL,
+    target REAL NOT NULL, reports INTEGER NOT NULL,
     PRIMARY KEY (room, mode, ended)
 );
 """
@@ -36,7 +42,7 @@ def learning_session(journals, tick):
         session = json.loads((journals / f"continuous-{int(start)}.json").read_text(encoding="utf-8"))
     except FileNotFoundError:
         return None
-    return session if session["start"] == start else None
+    return dict(session, isolated_rooms=permit.get("isolated_rooms", [])) if session["start"] == start else None
 
 
 def learning_active(session, room, virtual):
@@ -44,7 +50,7 @@ def learning_active(session, room, virtual):
         return None
     attrs = json.loads(virtual["shared_attrs"] or "{}")
     group = "living_study" if room in SHARED_ROOMS else room
-    if (room in session.get("manual_holds", {}) or room in session["holds"] or group in session["holds"]
+    if (room in session.get("isolated_rooms", ()) or room in session.get("manual_holds", {}) or room in session["holds"] or group in session["holds"]
             or attrs.get("preset_mode") != "标准" or attrs.get("control_hold_latched", False)):
         return None
     return session["start"]
@@ -96,15 +102,27 @@ def record_episode(db, room, tick, history, session, active_since, power_span):
     if not window:
         return
     mode, setpoint = window[-1]["adapter_mode"], window[-1]["reported"]
-    if (mode not in {"heat", "cool"} or setpoint is None
+    target = numeric(window[-1].get("desired"))
+    if (mode not in {"heat", "cool"} or setpoint is None or target is None
             or [row["tick"] for row in window] != list(range(start, tick+1, 60))):
         return
     previous = db.execute("SELECT max(ended) FROM stable_episodes WHERE room=? AND mode=?", (room, mode)).fetchone()[0]
     if previous is not None and start < previous:
         return
     if any(row["adapter_mode"] != mode or row["reported"] != setpoint or row["measured"] is None
-           or not 23.5 <= row["measured"] <= 24.5 or row["temp_report"] is None
+           or row["desired"] != target
+           or abs(row["measured"]-target) > POLICY["ideal_band"] + 1e-6 or row["temp_report"] is None
            or not -59 <= row["tick"]-row["temp_report"] <= 1200 for row in window):
+        return
+    reports = sorted({row["temp_report"]: row["measured"] for row in window
+                      if start <= row["temp_report"] <= tick+59}.items())
+    if len(reports) < 2:
+        return
+    first, last = reports[0], reports[-1]
+    if (first[0]-start > 300 or tick-last[0] > 300
+            or any(b[0]-a[0] > POLICY["sparse_report_age_seconds"] for a,b in zip(reports,reports[1:]))
+            or abs(last[1]-first[1]) > .2+1e-6
+            or max(v for _,v in reports)-min(v for _,v in reports) > .3+1e-6):
         return
     prior = db.execute(
         "SELECT tick,value FROM decisions WHERE room=? AND tick>=? AND tick<? ORDER BY tick", (room, start, tick)
@@ -116,13 +134,15 @@ def record_episode(db, room, tick, history, session, active_since, power_span):
     if any(action["room"] == room and start-900 <= action["sent_at"] <= tick+59
            and action["status"] != "canceled" and not action_responded(action, commands) for action in commands):
         return
-    offset = clip(median(setpoint - row["measured"] for row in window), -4, 4)
+    offset = clip(median(setpoint - measured for _, measured in reports), -4, 4)
     db.execute("INSERT OR IGNORE INTO stable_episodes VALUES (?,?,?,?,?)", (room, mode, start, tick, offset))
+    db.execute("INSERT OR IGNORE INTO stable_episode_quality VALUES (?,?,?,?,?)", (room, mode, tick, target, len(reports)))
 
 
 def learned_offset(db, room, mode, tick):
     offsets = db.execute(
-        """SELECT offset FROM stable_episodes WHERE room=? AND mode=? AND ended BETWEEN ? AND ?
+        """SELECT offset FROM stable_episodes JOIN stable_episode_quality USING(room,mode,ended)
+           WHERE room=? AND mode=? AND ended BETWEEN ? AND ?
            ORDER BY ended DESC LIMIT ?""",
         (room, mode, tick-LEARNING_WINDOW, tick, EPISODE_LIMIT)
     ).fetchall()

@@ -5,7 +5,7 @@ import json
 from time import time
 
 from cadence import latest_beeps
-from house_policy import thermostat_view
+from house_policy import ACTIVE, POLICY, recovering, thermostat_view
 from model import Activity, OVERSHOOT_HIGH_POWER_SECONDS, RAPID_REPORT_MAX_AGE, advise, increases_output, numeric
 from service import CONFIG, DATA, POWER_REPORT_GAP_SECONDS, initial_setpoint, open_readonly, power_context
 
@@ -31,8 +31,9 @@ def refresh_temperature(sample, live, now):
     measured = numeric(live["temperature"])
     reported = live.get("temperature_report_at")
     observed = sample.get("observed_at")
-    if (measured is not None and measured != sample["measured"] and observed is not None
-            and reported is not None and observed <= reported <= now <= observed + FEEDBACK_WINDOW_SECONDS
+    if (measured is not None and observed is not None and reported is not None
+            and reported > (sample.get("temp_report") or 0)
+            and observed <= reported <= now <= observed + FEEDBACK_WINDOW_SECONDS
             and 0 <= live["temperature_age"] <= 1200):
         return dict(sample, measured=measured, temp_report=reported)
     return sample
@@ -54,6 +55,23 @@ def credible_output(now, live, shadow):
     if cutoff is None and edges:
         cutoff = max(edges)
     return watts is not None and cutoff is not None and watts > cutoff and current_power_evidence(now, live, shadow)
+
+
+def high_overshoot(now, live, shadow, config, view, policy=POLICY):
+    mode, _, _, _, target, _, _ = live["signature"]
+    if mode not in ACTIVE or view is None or not current_power_evidence(now, live, shadow):
+        return False
+    watts = numeric(live["adapter"]["power"])
+    temp, target = numeric(live["temperature"]), numeric(target)
+    edges = shadow["edges"]
+    band = shadow["power_evidence"].get("bands", {}).get("high", {})
+    direction = 1 if mode == "heat" else -1
+    return bool(watts is not None and edges and watts > max(edges)
+                and band.get("threshold") == max(edges)
+                and band.get("seconds", 0) >= config.get("overshoot_high_power_seconds", OVERSHOOT_HIGH_POWER_SECONDS)
+                and temp is not None and target is not None
+                and direction*(temp-target) >= policy["ideal_band"] - 1e-6
+                and not recovering(temp-target, view["trend"], policy))
 
 
 def room_advice(room, fixed_mode="heat", *, offsets=None, mode_changed_at=None, ignore_reversal_beep=False,

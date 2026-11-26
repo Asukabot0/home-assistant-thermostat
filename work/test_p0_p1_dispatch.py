@@ -185,6 +185,8 @@ class DispatchTests(unittest.TestCase):
         self.assertIsNone(initial_setpoint(self.db, "bedroom", "heat", NOW, 24, (31, 35)))
         with self.db:
             self.db.execute("INSERT INTO stable_episodes VALUES ('bedroom','heat',?,?,?)", (TICK-1200, TICK, 4))
+            self.assertEqual(initial_setpoint(self.db, "bedroom", "heat", NOW, 22, (20, 25)), 22)
+            self.db.execute("INSERT INTO stable_episode_quality VALUES ('bedroom','heat',?,?,?)", (TICK, 22, 3))
         self.assertEqual(initial_setpoint(self.db, "bedroom", "heat", NOW, 22, (20, 25)), 23)
 
     def whole_scene(self, bedroom, living, study=None):
@@ -208,7 +210,7 @@ class DispatchTests(unittest.TestCase):
             self.observe(room)
         self.permit.write_text(json.dumps(data))
 
-    def observe(self, room, *, change=0, minutes=32, new_report=True):
+    def observe(self, room, *, change=0, minutes=32, new_report=True, cadence=60, high_seconds=0, history=None):
         tick = self.now // 60 * 60
         v = self.live[room]
         adapter = v["adapter"]
@@ -220,14 +222,18 @@ class DispatchTests(unittest.TestCase):
             self.db.execute("DELETE FROM decisions WHERE room=?", (room,))
             for stamp in range(tick-minutes*60, tick+1, 60):
                 report = min(stamp, v["temperature_report_at"])
+                report = tick - ((tick-report+cadence-1)//cadence)*cadence
                 value = {"target": v["signature"][4], "quiet": False, "reported_mode": adapter["mode"],
-                         "from_setpoint": adapter["setpoint"], "measured": v["temperature"]-change*(tick-stamp)/600,
+                         "from_setpoint": adapter["setpoint"],
+                         "measured": history.get(stamp, v["temperature"]) if history else
+                                     v["temperature"]-change*(tick-report)/600,
                          "source_fresh": True, "temperature_report_at": report,
                          "temperature_source": v["temperature_source"], "outdoor": 14, "activity": "fixture",
                          "confidence": "推测·中", "power_reason": "fixture", "model": {"edges_w": [190]},
                          "power_report_at": stamp, "power_report_w": adapter["power"], "low_power_cutoff": 30,
                          "power_evidence": {"context": v["power_context"], "last_report": tick,
-                                            "bands": {"low": {"since": tick-900}}},
+                                            "bands": {"low": {"since": tick-900},
+                                                      "high": {"seconds": high_seconds, "threshold": 190}}},
                          "reversal_low_cutoff": 28, "power_state_updated_at": adapter["power_state_updated_at"]}
                 self.db.execute("INSERT INTO decisions VALUES (?,?,?,?,?)",
                                 (room, stamp, "1970-01-01", 0, json.dumps(value)))
@@ -329,8 +335,9 @@ class DispatchTests(unittest.TestCase):
         self.assertEqual(state["transitions"]["living_study"]["members"]["living"]["phase"], "initial")
         v["signature"] = (*v["signature"][:5], "标准", False)
         state = self.snapshot()
-        self.assertEqual((state["commands"][-1]["purpose"], state["commands"][-1]["value"]),
-                         ("reversal_initial", 22))
+        self.assertNotIn("living_study", state["transitions"])
+        self.assertEqual(state["commands"][-1]["purpose"], "energy_start")
+        self.assertEqual(state["baselines"]["living"], ["heat", 27, "auto"])
 
     def test_reduction_returns_out_of_range_setting_to_its_soft_boundary_only(self):
         self.whole_scene(("heat", 27, 24.3, 240), ("heat", 24, 24, 200))
@@ -433,6 +440,157 @@ class DispatchTests(unittest.TestCase):
         self.observe("bedroom")
         self.snapshot()
         self.assertEqual(self.calls[-1][1]["hvac_mode"], "heat")
+
+    def update_state(self, **fields):
+        state = json.loads(self.journal.read_text()) if self.journal.exists() else {
+            "start": TICK-4000, "commands": [], "holds": {},
+            "baselines": {room: list(v["signature"][:3]) for room, v in self.live.items()}}
+        state.update(fields)
+        self.journal.write_text(json.dumps(state))
+
+    def park(self, *rooms, ago=600, previous="heat"):
+        parked = {}
+        for room in rooms:
+            live = self.live[room]
+            live["signature"] = ("off", None, *live["signature"][2:])
+            live["adapter"].update(mode="off", setpoint=None, power=8, last_mode_change=self.now-ago)
+            self.observe(room)
+            parked[room] = {"off_at": self.now-ago, "mode": previous, "started_at": self.now-4400}
+        self.update_state(parked=parked)
+
+    def recent_adjustment(self, room, old, *, ago, value=None):
+        v = self.live[room]
+        mode, setting, fan = v["signature"][:3]
+        self.update_state(commands=[{
+            "room": room, "kind": "temperature", "value": setting if value is None else value,
+            "before": [mode, old, fan], "sent_at": self.now-ago, "proxy_at": self.now-ago,
+            "purpose": "temperature", "status": "proxy_echo", "followup": {}}])
+
+    def test_sparse_bedroom_recovery_counts_reports_not_cached_minutes(self):
+        self.whole_scene(("heat", 24, 22.9, 8), ("heat", 24, 24, 8))
+        self.park("bedroom", "living", ago=650)
+        self.observe("bedroom", minutes=30, cadence=3600)
+        self.snapshot()
+        self.assertEqual(len(self.calls), 0)
+        self.observe("bedroom", minutes=32, cadence=900)
+        sent = self.snapshot()
+        self.assertEqual(len(self.calls), 1)
+        self.assertEqual((sent["commands"][-1]["room"], sent["commands"][-1]["value"]), ("bedroom", "heat"))
+        self.snapshot()
+        self.assertLessEqual(len(self.calls), 2)
+
+    def test_comfortable_unsaturated_lead_does_not_block_local_start(self):
+        self.whole_scene(("heat", 22, 24.0, 120), ("heat", 23, 22.9, 8))
+        self.park("living")
+        state = self.snapshot()
+        self.assertEqual((state["commands"][-1]["room"], state["commands"][-1]["purpose"]), ("living", "energy_start"))
+
+    def test_initial_21_heat_is_void_when_new_target_22_is_already_too_warm(self):
+        self.whole_scene(("heat", 21, 23.4, 20), ("cool", 24, 23.4, 20))
+        v = self.live["bedroom"]
+        v["signature"] = (*v["signature"][:4], 22, *v["signature"][5:])
+        self.observe("bedroom")
+        v["adapter"]["last_mode_change"] = NOW-300
+        self.update_state(transitions={"bedroom": {"id": NOW-300, "mode": "heat", "ready_at": NOW-60,
+                                                   "members": {"bedroom": {"phase": "initial", "target": 24}}}})
+        state = self.snapshot()
+        self.assertEqual(state["baselines"]["bedroom"], ["heat", 21, "auto"])
+        self.assertFalse(state["transitions"])
+        self.assertFalse(self.calls)
+
+    def test_direct_high_and_trend_actions_have_distinct_purposes(self):
+        for mode, temp, slope in (("heat",24.5,.0), ("cool",23.5,.0), ("heat",24.3,.5), ("cool",23.7,-.5)):
+            with self.subTest(mode=mode, temp=temp):
+                self.calls.clear()
+                self.journal.unlink(missing_ok=True)
+                self.whole_scene((mode,24,temp,230),(mode,24,24,8))
+                self.observe("bedroom", minutes=15, change=slope, high_seconds=180)
+                state=self.snapshot()
+                self.assertEqual(len(self.calls),1)
+                self.assertEqual(state["commands"][-1]["purpose"], "trend_easing" if slope else "direct_high_easing")
+                self.snapshot()
+                self.assertEqual(len(self.calls),1)
+
+    def test_direct_high_recheck_withdraws_fast_path_and_recovery_suppresses_it(self):
+        self.whole_scene(("heat",24,24.5,240),("heat",24,24,8))
+        self.observe("bedroom",high_seconds=180,change=-.4)
+        self.snapshot()
+        self.assertEqual(self.calls,[])
+        self.observe("bedroom",high_seconds=179)
+        self.snapshot()
+        self.assertEqual(self.calls,[])
+        self.observe("bedroom",high_seconds=180)
+        def drop(call, room):
+            v=self.feedback(call,room)
+            if room=="bedroom" and pilot.room_feedback.call_count>3:
+                v["adapter"]["power"]=20
+            return v
+        # Reset the invocation count for the two assessments of this cycle.
+        pilot.room_feedback.reset_mock()
+        pilot.room_feedback.side_effect=drop
+        self.snapshot()
+        self.assertEqual(self.calls,[])
+
+    def test_conflict_allows_only_weakening_adverse_output(self):
+        self.whole_scene(("cool",24,23.1,240),("cool",24,25.1,8))
+        state=self.snapshot()
+        self.assertEqual((state["commands"][-1]["room"],state["commands"][-1]["value"]),("bedroom",25))
+        self.assertEqual(len(self.calls),1)
+
+    def test_acceptance_reduction_exits_at_once_after_new_adverse_feedback(self):
+        self.whole_scene(("heat",23,24.0,8),("heat",23,24.8,8),("heat",22,24.8,198))
+        self.park("bedroom","living")
+        self.recent_adjustment("study",23,ago=350)
+        self.observe("living",change=.2)
+        self.observe("study",change=.2)
+        self.live["study"]["adapter"]["last_mode_change"]=self.now-3600
+        state=self.snapshot()
+        self.assertEqual((state["commands"][-1]["room"],state["commands"][-1]["purpose"]),("study","energy_off"))
+        self.assertEqual(len(self.calls),1)
+
+    def test_acceptance_parked_start_after_parallel_wait_and_mild_initial(self):
+        self.whole_scene(("heat",24,23.4,8),("heat",24,24.8,8),("heat",22,24.8,8))
+        self.park("bedroom","living","study",ago=290,previous="heat")
+        state=self.snapshot()
+        self.assertEqual(len(self.calls),0)  # The newest low report proves only 300 seconds minus the cycle offset.
+        self.now+=60
+        for room in self.live:
+            self.observe(room)
+        sent=self.snapshot()
+        self.assertEqual((sent["commands"][-1]["room"],sent["commands"][-1]["value"]),("living","cool"))
+        self.now+=60
+        # In this replay use a less-conservative stored companion setting after mode acknowledgement.
+        v=self.live["living"]
+        v["signature"]=("cool",24,*v["signature"][2:])
+        v["adapter"]["setpoint"]=24
+        for room in self.live:
+            self.observe(room)
+        sent=self.snapshot()
+        self.assertEqual((sent["commands"][-1]["value"],sent["commands"][-1]["purpose"]),(25,"reversal_initial"))
+        self.assertEqual(len(self.calls),2)
+
+    def test_acceptance_cooling_eases_before_full_escalation_window(self):
+        self.whole_scene(("heat",23,23.4,8),("cool",24,24.1,260))
+        self.park("bedroom")
+        self.recent_adjustment("living",25,ago=420)
+        self.observe("living",change=-.8,minutes=6,cadence=300)
+        state=self.snapshot()
+        self.assertEqual((state["commands"][-1]["purpose"],state["commands"][-1]["value"]),("trend_easing",25))
+        self.snapshot()
+        self.assertEqual(len(self.calls),1)
+
+    def test_accepted_on_restart_waits_for_proxy_or_times_out_without_resending(self):
+        self.scenario("heat",20,23,20)
+        sent=self.snapshot()
+        self.assertEqual(sent["commands"][-1]["status"],"accepted")
+        self.live["bedroom"]["adapter"]["updated_at"]=self.now-60
+        self.now+=60
+        self.snapshot()
+        self.now+=130
+        state=self.snapshot()
+        self.assertEqual(state["commands"][-1]["status"],"unconfirmed")
+        self.assertIn("bedroom",state["holds"])
+        self.assertEqual(len(self.calls),1)
 
 
 if __name__ == "__main__":

@@ -1,7 +1,7 @@
 """Coordinate connected rooms before any command enters the durable journal."""
 from house_policy import ACTIVE, INDEPENDENT, POLICY, recovering, temperature_change, whole_house_need
 from model import increases_output, numeric, setpoint_bounds
-from pilot_gate import credible_output, current_power_evidence, eligible, matching_feedback
+from pilot_gate import credible_output, current_power_evidence, eligible, high_overshoot, matching_feedback
 
 
 def acknowledged(actions):
@@ -27,7 +27,10 @@ def final_gate(candidate, now, live, readings, connected, state, configurations,
     feedback = live[room]
     shadow = readings[room]
     mode, setpoint, _, _, target, _, _ = feedback["signature"]
-    if (not shadow["witness"] == "matched" or not shadow["followup_complete"]
+    group = "living_study" if room in {"living","study"} else room
+    if (feedback["signature"][3] != "auto" or feedback["signature"][5:] != ("标准", False)
+            or feedback["native_authorized"] is not False or group in state["holds"]
+            or not shadow["witness"] == "matched" or not shadow["followup_complete"]
             or room in state["manual_holds"]
             or list(feedback["signature"][:3]) != state["baselines"][room]):
         return "等待可信回报或人工恢复"
@@ -39,6 +42,8 @@ def final_gate(candidate, now, live, readings, connected, state, configurations,
         bounds = setpoint_bounds(configurations[room]["soft_limits"][mode])
         if bounds is None or not bounds[0] <= value <= bounds[1]:
             return "超出设温边界"
+        if purpose == "direct_high_easing" and not high_overshoot(now, feedback, shadow, configurations[room], shadow["house_view"], policy):
+            return "持续高功率条件已解除"
         if purpose == "reversal_initial":
             return None
         decision = {"mode": mode, "setpoint": value, "hypothetical_send": True,
@@ -75,6 +80,65 @@ def final_gate(candidate, now, live, readings, connected, state, configurations,
     return None
 
 
+def observed_after(now, action, live, room, wait):
+    if action is None:
+        return True
+    return (now-action["proxy_at"] >= wait
+            and action["proxy_at"] < (live[room].get("temperature_report_at") or 0) <= now)
+
+
+def attachment(room):
+    return "living" if room == "study" else room
+
+
+def guard_peers(zones, zone_room, mode, policy):
+    direction = 1 if mode == "heat" else -1
+    return any(name != zone_room and (
+        direction*(zone["measured"]-zone["target"]) >= policy["ideal_band"]-policy["peer_ideal_guard_c"]
+        or direction*(zone["measured"]-zone["target"]+(zone["view"]["trend"] or 0)) > policy["ideal_band"])
+        for name, zone in zones.items())
+
+
+def needs_local(zone, mode, policy):
+    direction = 1 if mode == "heat" else -1
+    delta = zone["measured"]-zone["target"]
+    side = "cold" if mode == "heat" else "warm"
+    return (direction*delta < -policy["comfort_band"]
+            and zone["view"][f"{side}_seconds"] >= policy["temperature_dwell_seconds"]
+            and (zone["view"]["trend"] is not None or zone["view"].get(f"{side}_confirmed"))
+            and not recovering(delta, zone["view"]["trend"], policy))
+
+
+def recovery_initial(room, mode, live, shadow, state, configurations, policy=POLICY):
+    v = live[room]
+    base = shadow["initial_setpoints"].get(mode)
+    bounds = setpoint_bounds(configurations[room]["soft_limits"][mode])
+    if base is None or bounds is None:
+        return None
+    target = v["signature"][4]
+    measured = numeric(v["temperature"])
+    if measured is None or abs(measured-target) > policy["mild_recovery_deviation"]:
+        return base
+    # For a small excursion, approach with the weaker of the learned initial,
+    # the last acknowledged working setting, and one step on the mild side.
+    direction = 1 if mode == "heat" else -1
+    choices = [base, round(target)-direction*policy["ordinary_step"]]
+    remembered = numeric(v["adapter"]["setpoint"])
+    if v["adapter"]["mode"] == mode and remembered is not None and bounds[0] <= remembered <= bounds[1]:
+        choices.append(remembered)
+    if room != "study":
+        history = state.get("last_mode_setting", {}).get(room, {}).get(mode)
+        if history and history.get("target") == target:
+            choices.append(history["value"])
+        else:
+            stopped = next((a for a in reversed(acknowledged(state["commands"]))
+                            if a["room"] == room and a["kind"] == "mode" and a["value"] == "off"
+                            and a.get("target_at_send") == target and a["before"][0] == mode), None)
+            if stopped and numeric(stopped["before"][1]) is not None:
+                choices.append(stopped["before"][1])
+    return int(max(bounds[0], min(bounds[1], min(choices, key=lambda value: direction*value))))
+
+
 def coordinate(live, readings, ready, state, now, configurations, connected, policy=POLICY):
     zone_rooms = tuple(room for room in INDEPENDENT if room in connected)
     if not zone_rooms or not all_rooms_assessed(live, zone_rooms):
@@ -84,117 +148,119 @@ def coordinate(live, readings, ready, state, now, configurations, connected, pol
     if any(zone["view"] is None for zone in zones.values()):
         return "unknown", {}, []
     need = whole_house_need(zones, policy)
-    if need == "conflict":
-        return need, {}, []
     actions = acknowledged([a for a in state["commands"] if a["room"] in connected])
     last_house = max(actions, key=lambda a: a["proxy_at"], default=None)
-    house_ready = observation_ready(now, last_house, live, zone_rooms, policy)
+    last_strengthening = max((a for a in actions if a["kind"] == "mode" and a["value"] in ACTIVE
+                              or a["kind"] == "temperature" and increases_output(a["before"][0], a["before"][1], a["value"])),
+                             key=lambda a: a["proxy_at"], default=None)
+    last_exit = max((a for a in actions if a["kind"] == "mode" and a["value"] == "off"),
+                    key=lambda a: a["proxy_at"], default=None)
     modes = {room: live[room]["adapter"]["mode"] for room in connected}
-    active = [room for room, mode in modes.items() if mode in ACTIVE]
-    attached = {room: ("living" if room == "study" else room) for room in connected}
-    active_zones = [room for room in active if attached[room] in zones]
+    active = {room for room, mode in modes.items() if mode in ACTIVE and attachment(room) in zones}
     mixed = len({modes[room] for room in active}) > 1
-    reasons, candidates = {}, []
-    if need == "hold" and mixed and active_zones:
-        # When nobody needs a direction, keep the incumbent or the primary room.
-        lead = state.get("house_lead")
-        if lead not in active_zones:
-            lead = min(active_zones, key=lambda room: (room == "study", room != "bedroom", room))
-        direction = modes[lead]
-    else:
-        direction = need
-    opposite = [room for room in active if direction in ACTIVE and modes[room] != direction]
-    same = [room for room in active_zones if modes[room] == direction or direction == "hold"]
     lead = state.get("house_lead")
-    effective = [room for room in same if need in ACTIVE
-                 and (zones[attached[room]]["measured"]-zones[attached[room]]["target"])
-                 * (1 if need == "heat" else -1) < 0
-                 and recovering(zones[attached[room]]["measured"]-zones[attached[room]]["target"],
-                                zones[attached[room]]["view"]["trend"], policy)]
-    preferred = effective or same
+    direction = need
+    if need == "hold" and mixed:
+        if lead not in active:
+            lead = min(active, key=lambda room: (room == "study", room != "bedroom"))
+        direction = modes[lead]
+    opposite = {room for room in active if direction in ACTIVE and modes[room] != direction}
+    same = active - opposite
+    demanded = {room for room in zones if need in ACTIVE and needs_local(zones[room], need, policy)}
+    local_active = {room for room in same if attachment(room) in demanded and ready[room]}
+    preferred = local_active or same
     if lead not in preferred:
-        def lead_priority(room):
-            zone = zones[attached[room]]
-            deficit = (zone["target"]-zone["measured"]) * (1 if direction == "heat" else -1)
-            return (-max(0.0, deficit), room == "study", room != "bedroom", room)
-        lead = min(preferred, key=lead_priority, default=None)
-    if lead is not None:
-        state["house_lead"] = lead
-    lead_saturated = False
-    if lead is not None and need in ACTIVE:
-        lead_zone = zones[attached[lead]]
-        lead_view = lead_zone["view"]
-        lead_setting = live[lead]["adapter"]["setpoint"]
-        limits = setpoint_bounds(configurations[lead]["soft_limits"][need])
-        lead_progress = lead_view["trend"]
-        lead_saturated = (limits is not None and lead_progress is not None
-                          and not recovering(lead_zone["measured"]-lead_zone["target"], lead_progress, policy)
-                          and (lead_setting >= limits[1] if need == "heat" else lead_setting <= limits[0]))
-    locality_ok = need not in ACTIVE or all(
-        z["view"]["trend"] is None or
-        ((z["measured"]-z["target"]+z["view"]["trend"]) * (1 if need == "heat" else -1) <= policy["comfort_band"])
-        for z in zones.values())
+        lead = min(preferred, key=lambda room: (room == "study", room != "bedroom"), default=None)
+    state["house_lead"] = lead
     stable = all(abs(z["measured"]-z["target"]) <= policy["ideal_band"]
                  and z["view"]["trend"] is not None
-                 and abs(z["view"]["trend"]) < policy["minimum_progress_c"]
-                 for z in zones.values())
+                 and abs(z["view"]["trend"]) < policy["minimum_progress_c"] for z in zones.values())
+    reasons, candidates = {}, []
     for room in sorted(connected):
-        if not ready[room] or attached[room] not in zones:
+        ref = attachment(room)
+        if not ready[room] or ref not in zones:
             continue
         live_room = live[room]
-        zone = zones[attached[room]]
+        zone = zones[ref]
         measured, target, view = zone["measured"], live_room["signature"][4], zone["view"]
-        mode = modes[room]
-        setting = live_room["adapter"]["setpoint"]
+        mode, setting = modes[room], live_room["adapter"]["setpoint"]
+        limits = configurations[room]["soft_limits"]
         last = max((a for a in actions if a["room"] == room), key=lambda a: a["proxy_at"], default=None)
-        elapsed = observation_ready(now, last, live, (attached[room],), policy)
-        if not elapsed:
-            reasons[room] = "等待动作后观察时间和新室温"
-            continue
         if mode == "off":
-            if room not in state["parked"] or need not in ACTIVE or opposite or not house_ready or not locality_ok:
+            if room not in state["parked"] or need not in ACTIVE or opposite or ref not in demanded:
+                reasons[room] = "等待持续需求或原方向退出"
                 continue
-            dwell = view["cold_seconds" if need == "heat" else "warm_seconds"]
-            required = policy["temperature_dwell_seconds"] if state["parked"][room]["mode"] == need else policy["mode_dwell_seconds"]
-            if dwell < required:
+            same_local = {a for a in same if attachment(a) == ref}
+            saturated = any(
+                (bounds := setpoint_bounds(configurations[a]["soft_limits"][need])) is not None
+                and (live[a]["adapter"]["setpoint"] >= bounds[1] if need == "heat"
+                     else live[a]["adapter"]["setpoint"] <= bounds[0]) for a in same_local)
+            if same_local and not saturated:
+                reasons[room] = "同区域现有设备仍可承担需求"
                 continue
-            progress = view["trend"]
-            if progress is None or recovering(measured-target, progress, policy):
-                reasons[room] = "等待可信的未改善趋势"
+            if room == "study" and guard_peers(zones, ref, need, policy):
+                reasons[room] = "另一测点接近不利理想边界，优先直接测温区域"
                 continue
-            if lead is not None and not lead_saturated:
+            if (not observed_after(now, last, live, ref, 0)
+                    or not active and not observed_after(now, last_exit, live, ref, 0)
+                    or not observed_after(now, last_strengthening, live, ref, policy["feedback_wait_seconds"])
+                    or last_strengthening is not None and not observed_after(
+                        now, last_strengthening, live, attachment(last_strengthening["room"]), policy["feedback_wait_seconds"])):
+                reasons[room] = "等待停机后新室温或前次加码响应"
                 continue
             if readings[room]["initial_setpoints"].get(need) is not None:
-                reasons[room] = "需求持续且现有输出未能改善，按需启机"
-                candidates.append((3, -abs(measured-target), room, "mode", need, "energy_start"))
+                reasons[room] = "持续需求已由真实室温确认，按需启机"
+                candidates.append((3, (room == "study", -abs(measured-target)), room, "mode", need, "energy_start"))
             continue
-        shedding = (need == "hold" and stable and house_ready and len(same) > 1 and room != lead)
-        if room in opposite or shedding:
-            already_reduced = any(a["room"] == room and a.get("purpose") == "coordinated_easing"
-                                  and a["proxy_at"] >= live_room["adapter"]["last_mode_change"] for a in actions)
-            output = credible_output(now, live_room, readings[room])
-            proposed, reason = temperature_change(mode, setting, measured, target, view,
-                                                  configurations[room]["soft_limits"][mode], has_output=output,
-                                                  weakening=True, policy=policy)
-            if proposed is not None and output and not already_reduced:
-                reasons[room] = reason
-                candidates.append((0, room != "study", room, "temperature", proposed, "coordinated_easing"))
-            else:
-                reasons[room] = "退出无需求方向或冗余设备"
-                candidates.append((1, room != "study", room, "mode", "off", "energy_off"))
-            continue
+
+        direction_sign = 1 if mode == "heat" else -1
+        delta = measured-target
         output = credible_output(now, live_room, readings[room])
-        proposed, reason = temperature_change(mode, setting, measured, target, view,
-                                              configurations[room]["soft_limits"][mode], has_output=output,
-                                              policy=policy)
+        direct = high_overshoot(now, live_room, readings[room], configurations[room], view, policy)
+        recent_reduction = (last is not None and last["kind"] == "temperature"
+                            and last["before"][0] == mode
+                            and last["proxy_at"] >= live_room["adapter"]["last_mode_change"]
+                            and not increases_output(mode, last["before"][1], last["value"]))
+        own_feedback = observed_after(now, last, live, ref, policy["reduction_wait_seconds"])
+        peer_guard = guard_peers(zones, ref, mode, policy)
+        adverse = direction_sign*delta > policy["ideal_band"]+1e-6 and not recovering(delta, view["trend"], policy)
+        adverse_peer = peer_guard and direction_sign*delta >= -policy["ideal_band"] and output
+        shedding = need == "hold" and stable and len(same)>1 and room != lead
+        unused = room in opposite or shedding or (need != mode and (adverse or adverse_peer))
+        if unused and own_feedback:
+            if recent_reduction or not output:
+                # A confirmed setpoint alone is not a confirmed reduction of load.
+                # A dormant label is only cleared for a sustained opposite need,
+                # or when verified ongoing output is worsening comfort.
+                if output or room in opposite and demanded:
+                    reasons[room] = "减载后仍无本方向需求，退出输出" if recent_reduction else "退出阻塞的相反模式"
+                    candidates.append((1, (room != "study", 0), room, "mode", "off", "energy_off"))
+                continue
+
+        proposed, reason = temperature_change(mode, setting, measured, target, view, limits[mode],
+                                              has_output=output, weakening=unused and output,
+                                              direct_high=direct, policy=policy)
         reasons[room] = reason
         if proposed is None:
+            if unused and output and own_feedback:
+                reasons[room] = "已到软边界且仍有不需要的负荷，退出输出"
+                candidates.append((1, (room != "study", 0), room, "mode", "off", "energy_off"))
             continue
-        increasing = increases_output(mode, setting, proposed)
-        if increasing and (need != mode or opposite or not house_ready or not locality_ok
-                           or (room != lead and not lead_saturated)
-                           or any(m not in {mode, "off", "fan_only"} for m in modes.values())):
-            reasons[room] = "等待全屋同向需求、主机或动作后新反馈"
-            continue
-        candidates.append((2, -abs(measured-target), room, "temperature", proposed, "temperature"))
+        if increases_output(mode, setting, proposed):
+            if (mode != need or opposite or ref not in demanded
+                    or (lead != room and lead is not None and attachment(lead) == ref)
+                    or not observation_ready(now, last_house, live, zone_rooms, policy)):
+                reasons[room] = "等待全屋同向需求、主机或动作后新反馈"
+                continue
+            if peer_guard:
+                proposed = min(proposed, setting+policy["ordinary_step"]) if mode=="heat" else max(proposed, setting-policy["ordinary_step"])
+                reasons[room] = "另一测点接近不利理想边界，仅本区小步加码"
+            candidates.append((4, (0, -abs(delta)), room, "temperature", proposed, "temperature"))
+        elif own_feedback:
+            purpose = ("direct_high_easing" if direct else "trend_easing" if reason == "预计越过理想带，提前减载"
+                       else "coordinated_easing" if unused else "temperature")
+            candidates.append((-2 if reason == "归位模式软限" else 0 if unused or direct else 2, (room != "study", -abs(delta)), room,
+                               "temperature", proposed, purpose))
+        else:
+            reasons[room] = "等待本机动作后新室温再减载"
     return need, reasons, candidates

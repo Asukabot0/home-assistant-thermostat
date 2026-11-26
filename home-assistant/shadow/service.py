@@ -35,7 +35,7 @@ CONFIG = Path(os.getenv("ROOM_CLIMATE_ROOMS_FILE", str(Path(__file__).with_name(
 DAY = 86400
 HISTORY = 7 * DAY
 POWER_REPORT_GAP_SECONDS = 120
-POLICY_REVISION = 6
+POLICY_REVISION = 7
 POLICY_START_KEY = "policy_started_1"  # Continuous observation started with the original policy.
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
@@ -186,7 +186,42 @@ def metrics(records):
             and value["reported_mode"] == after["reported_mode"] and value["from_setpoint"] == after["from_setpoint"]):
             actual = after["measured"] - value["measured"]
             forecast_errors.append(abs(actual - value["prediction_15m_delta"]))
-    return {"minutes": minutes, "valid_temperature_minutes": len(valid),
+    episodes = []
+    excursion = []
+    for row, value in zip(records, values):
+        tick = row["tick"]
+        fresh = value["measured"] is not None and value["source_fresh"]
+        error = value["measured"]-value["target"] if fresh and value["target"] is not None else None
+        side = (1 if error > .7+1e-6 else -1 if error < -.7-1e-6 else 0) if error is not None else None
+        if excursion and (side != excursion[-1][1] or tick != excursion[-1][0]+60
+                          or value["target"] != excursion[-1][3]):
+            recovered = side == 0 and tick == excursion[-1][0]+60 and value["target"] == excursion[-1][3]
+            episodes.append((excursion, recovered))
+            excursion = []
+        if side:
+            excursion.append((tick, side, abs(error), value["target"]))
+    if excursion:
+        episodes.append((excursion, False))
+    overshoots = []
+    for run, complete in episodes:
+        if not complete:
+            continue
+        recovered_at, side, _, target = run[-1]
+        displacement = 0.0
+        for tick in range(recovered_at+60, recovered_at+1801, 60):
+            point = points.get(tick)
+            if (not point or not point["source_fresh"] or point["target"] != target
+                    or point["measured"] is None):
+                break
+            displacement = max(displacement, -side*(point["measured"]-target))
+        overshoots.append(round(displacement, 3))
+    return {"minutes": minutes,
+            "post_recovery_overshoot_30m_c": overshoots,
+            "outside_comfort_minutes": sum(len(run) for run, _ in episodes),
+            "longest_outside_comfort_minutes": max((len(run) for run, _ in episodes), default=0),
+            "recovery_minutes_completed": [len(run) for run, complete in episodes if complete],
+            "peak_above_target_c": round(max((x["measured"]-x["target"] for x in valid), default=0), 3) if valid else None,
+            "peak_below_target_c": round(max((x["target"]-x["measured"] for x in valid), default=0), 3) if valid else None, "valid_temperature_minutes": len(valid),
             "nonunknown_power_minutes": sum(x["confidence"] != "未知" for x in values),
             "hypothetical_beeps": count,
             "projected_beeps_24h": round(count * 1440 / minutes, 1) if minutes >= 60 else None,
@@ -356,7 +391,7 @@ def load_room(db, rooms, recorder, code, config, tick, actual_beep, shared_simul
             if observed_since-row["tick"] != 60 or tick-row["tick"] > 1860:
                 break
             observed_since = row["tick"]
-    power_states, power_state = power_state_window(recorder, config["power"], observed_since, tick+60)
+    _, power_state = power_state_window(recorder, config["power"], observed_since, tick+60)
     low_cutoff, _ = low_power_span(tick, (), model)
     verified_low = reversal_low_cutoff(config, low_cutoff)
     observed_at = virtual["updated"] if virtual and tick <= virtual["updated"] < tick + 60 else None
@@ -367,7 +402,7 @@ def load_room(db, rooms, recorder, code, config, tick, actual_beep, shared_simul
                            (code, tick)).fetchone()
         previous = json.loads(prior["value"]).get("power_evidence") if prior else None
         evidence = power_evidence(observed_at, recent, context,
-                                  {"low": verified_low, "above_low": verified_low, "high": high_cutoff}, previous)
+                                  {"low": verified_low, "above_low": verified_low, "high": high_cutoff, "learning": low_cutoff}, previous)
     bands = evidence["bands"] if evidence else {}
     low_seconds = bands.get("low", {}).get("seconds", 0)
     above_low_seconds = bands.get("above_low", {}).get("seconds", 0)
@@ -378,11 +413,14 @@ def load_room(db, rooms, recorder, code, config, tick, actual_beep, shared_simul
     else:
         activity = Activity("未知", "未知", "等待该分钟的 HA 观测")
     active_since = learning_active(session, code, virtual) if source_fresh and fresh_power else None
-    learning_power_span = power_span(tick, power_states, lambda watts: watts > low_cutoff) if low_cutoff is not None else 0
+    learning_power_span = bands.get("learning", {}).get("seconds", 0)
     if active_since is not None and learning_power_span >= EPISODE_SECONDS:
         since = tick - EPISODE_SECONDS
         auto = continuous_entity(recorder, thermostat, since, tick+60,
-                                 lambda row: learning_active(session, code, row) is not None)
+                                 lambda row: learning_active(session, code, row) is not None
+                                 and (fields := json.loads(row["shared_attrs"] or "{}")).get("temperature_entity_id") == attrs.get("temperature_entity_id")
+                                 and numeric(fields.get("temperature")) == latest["desired"]
+                                 and power_context(fields, config["power"]) == context)
         steady = auto and continuous_entity(recorder, config["adapter"], since, tick+60,
             lambda row: row["state"] == latest["adapter_mode"]
             and numeric(json.loads(row["shared_attrs"] or "{}").get("temperature")) == latest["reported"])
@@ -458,6 +496,36 @@ def atomic(path, body):
     temp.replace(path)
 
 
+def live_actuations(start, end, journals=JOURNALS):
+    counted = {}
+    for path in journals.glob("continuous-*.json"):
+        try:
+            state = json.loads(path.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            continue
+        for action in state.get("commands", state.values() if "-actions-" in path.stem else ()):
+            if start <= action["sent_at"] < end and action["status"] not in {"prepared", "canceled"}:
+                counted[action["room"], action["sent_at"]] = action
+    counts = {name: 0 for name in ("attempts", "proxy_echoes", "starts", "stops", "reversals")}
+    last_off = {}
+    for action in sorted(counted.values(), key=lambda item: item["sent_at"]):
+        counts["attempts"] += 1
+        if action["status"] != "proxy_echo":
+            continue
+        counts["proxy_echoes"] += 1
+        if action["kind"] != "mode":
+            continue
+        mode, before, room = action["value"], action["before"][0], action["room"]
+        if mode == "off":
+            counts["stops"] += 1
+            last_off[room] = before
+        elif mode in {"cool", "heat"}:
+            previous = last_off.pop(room, None) if before == "off" else before
+            counts["starts"] += before == "off"
+            counts["reversals"] += previous in {"cool", "heat"} and previous != mode
+    return counts
+
+
 def display(db, config, tick, error=None):
     arrivals = dict(db.execute("SELECT key,value FROM settings WHERE key IN ('started','valid_started',?)", (POLICY_START_KEY,)))
     started = int(arrivals.get("valid_started", arrivals["started"]))
@@ -495,6 +563,9 @@ def display(db, config, tick, error=None):
                "source_error":error,"rooms":current,
                "observed_home_kwh": round(sum(complete_energy), 6) if complete_energy else None,
                "observed_home_minutes": len(complete_energy),
+               "observed_home_coverage_pct": round(100 * len(complete_energy) / expected, 1),
+               "independent_temperature_rooms": [room for room in ("bedroom", "living") if room in config],
+               "live_actuations": live_actuations(floor-60, tick+60),
                "metered_seconds_by_room": {room: r["totals"]["metered_seconds"] for room, r in current.items()},
                "completed_days":[dict(r, metrics=json.loads(r["metrics"])) for r in complete_days]}
     atomic(OUTPUT/"shadow-status.json", json.dumps(summary, indent=2, ensure_ascii=False)+"\n")
