@@ -36,10 +36,16 @@ CONFIG = Path(os.getenv("ROOM_CLIMATE_ROOMS_FILE", str(Path(__file__).with_name(
 DAY = 86400
 HISTORY = 7 * DAY
 POWER_REPORT_GAP_SECONDS = 120
-POLICY_REVISION = 8
+RECORDER_INPUT_GRACE_SECONDS = 90
+LATE_RECORDER = {"recorder_snapshot_missing", "recorder_power_unmatched"}
+POLICY_REVISION = 9
 POLICY_START_KEY = f"policy_started_{POLICY_REVISION}"
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS power_reports (
+    source TEXT NOT NULL, observer_epoch TEXT NOT NULL, report_at REAL NOT NULL, watts REAL,
+    PRIMARY KEY (source, observer_epoch, report_at)
+);
 CREATE TABLE IF NOT EXISTS power_models (
     room TEXT NOT NULL, trained INTEGER NOT NULL, status TEXT NOT NULL, model TEXT,
     PRIMARY KEY (room, trained)
@@ -149,24 +155,43 @@ def power_context(attrs, entity):
     return None
 
 
-def recent_power_reports(recorder, entity, thermostat, start, end, *, as_of=None, context=None):
-    """Recover unchanged readings reported to HA and timestamped by the room observer."""
-    reports = dict(powers(recorder, entity, start, end=end))
+def recent_power_reports(recorder, entity, thermostat, start, end, *, as_of=None, context=None, ledger=None):
+    """Merge timestamped Recorder/observer reports with pairs already verified in this epoch."""
+    upper = min(end, as_of + 1e-6) if as_of is not None else end
+    if context is not None:
+        if context[0] != entity:
+            return []
+        start = max(start, datetime.fromisoformat(context[1]).timestamp())
+    if upper < start:
+        return []
+    def in_window(stamp):
+        return start <= stamp < end and (as_of is None or stamp <= upper)
+
+    reports = {stamp: watts for stamp, watts in powers(recorder, entity, start, end=end) if in_window(stamp)}
+    if context is not None and ledger is not None:
+        # Recorder's last_reported can be advanced for the same underlying
+        # state row. Keep both the exact timestamps and the values we saw.
+        for stamp, watts in ledger.execute(
+            """SELECT report_at,watts FROM power_reports WHERE source=? AND observer_epoch=?
+               AND report_at BETWEEN ? AND ?""", (*context, start, upper)
+        ):
+            if in_window(stamp) and (stamp not in reports or (reports[stamp] is not None and reports[stamp] >= 0)):
+                reports[stamp] = watts
     for row in state_history(recorder, thermostat, start, end=end):
         attrs = json.loads(row["shared_attrs"] or "{}")
-        if context is not None and power_context(attrs, entity) != context:
+        observed_context = power_context(attrs, entity)
+        if observed_context is None or (context is not None and observed_context != context):
             continue
         observer = attrs.get("power_reported_at")
         if not observer:
             continue
         stamp = datetime.fromisoformat(observer).timestamp()
-        if not start <= stamp < end or stamp in reports:
+        if not in_window(stamp) or stamp in reports or stamp > row["updated"]+1e-6:
             continue
         raw = state_history(recorder, entity, 0, end=stamp + 1e-6, tail=True)
         if raw and raw["reported"] is not None and raw["reported"] <= stamp + 1e-6:
             reports[stamp] = numeric(raw["state"])
-    # Recorder keeps fractional seconds beyond the observer's ISO precision.
-    return sorted((stamp, watts) for stamp, watts in reports.items() if as_of is None or stamp <= as_of + 1e-6)
+    return sorted(reports.items())
 
 
 def metrics(records, *, fixed_band=False):
@@ -375,16 +400,35 @@ def load_room(db, rooms, recorder, code, config, tick, actual_beep, shared_simul
     attrs = json.loads(virtual["shared_attrs"] or "{}") if virtual else {}
     context = power_context(attrs, config["power"])
     observed = None
-    if config.get("power_fallback") and virtual and virtual["updated"] >= tick:
+    if context is not None and virtual["updated"] >= tick:
         # The local poll may run after the observer within the same minute.
         observed = attrs.get("power_reported_at")
     as_of = datetime.fromisoformat(observed).timestamp() if observed else None
     recent = recent_power_reports(recorder, config["power"], thermostat, tick - 1860 - POWER_REPORT_GAP_SECONDS,
-                                  tick + 60, as_of=as_of, context=context)
+                                  tick + 60, as_of=as_of, context=context, ledger=db)
+    if (as_of is not None and 0 <= virtual["updated"]-as_of <= POWER_REPORT_GAP_SECONDS
+            and latest and latest["tick"] == tick and latest["watts"] is not None
+            and not any(abs(stamp-as_of) <= 1e-6 for stamp, _ in recent)):
+        # Match the observer's actual report timestamp to the room sample
+        # and Recorder state in this minute. The Recorder row can already
+        # carry a later last_reported for the same value by the time it commits.
+        raw = state_history(recorder, config["power"], 0, end=as_of+1e-6, tail=True)
+        if raw and numeric(raw["state"]) == latest["watts"]:
+            recent.append((as_of, latest["watts"]))
+            recent.sort()
     source_fresh = bool(latest and latest["tick"] == tick and latest["temp_report"] is not None
                         and latest["measured"] is not None and -59 <= tick-latest["temp_report"] <= 1200)
     fresh_power = bool(latest and latest["tick"] == tick and latest["watts"] is not None and recent
                        and recent[-1][1] == latest["watts"] and -59 <= tick-recent[-1][0] <= 600)
+    observed_at = virtual["updated"] if virtual and tick <= virtual["updated"] < tick + 60 else None
+    evidence_status = ("recorder_snapshot_missing" if observed_at is None else
+                       "observer_context_missing" if context is None else
+                       "no_fresh_report")
+    if (observed_at is not None and context is not None and as_of is not None
+            and 0 <= observed_at-as_of <= POWER_REPORT_GAP_SECONDS and latest and latest["tick"] == tick
+            and latest["watts"] is not None
+            and (not fresh_power or abs(recent[-1][0]-as_of) > 1e-6)):
+        evidence_status = "recorder_power_unmatched"
     model, trained = latest_model(db, code, tick, recorder, config["power"], fresh_power,
                                   fallback=config.get("power_fallback"))
     observed_since = tick
@@ -396,15 +440,27 @@ def load_room(db, rooms, recorder, code, config, tick, actual_beep, shared_simul
     _, power_state = power_state_window(recorder, config["power"], observed_since, tick+60)
     low_cutoff, _ = low_power_span(tick, (), model)
     verified_low = reversal_low_cutoff(config, low_cutoff)
-    observed_at = virtual["updated"] if virtual and tick <= virtual["updated"] < tick + 60 else None
     high_cutoff = model["edges_w"][-1] if model and model["edges_w"] else None
     evidence = None
-    if fresh_power and context is not None and observed_at is not None:
-        prior = db.execute("SELECT value FROM decisions WHERE room=? AND tick<? ORDER BY tick DESC LIMIT 1",
-                           (code, tick)).fetchone()
-        previous = json.loads(prior["value"]).get("power_evidence") if prior else None
+    if (context is not None and observed_at is not None and as_of is not None
+            and evidence_status != "recorder_power_unmatched"):
+        # Durable, epoch-scoped pairs. Keep unavailable points as separators.
+        # Retrying the same report cannot change a saved value or extend time.
+        db.executemany("INSERT OR IGNORE INTO power_reports VALUES (?,?,?,?)",
+                       [(*context, stamp, watts) for stamp, watts in recent])
+    if (fresh_power and context is not None and observed_at is not None and as_of is not None
+            and evidence_status != "recorder_power_unmatched"):
+        prior = db.execute("""SELECT value FROM decisions WHERE room=? AND tick BETWEEN ? AND ?
+                              ORDER BY tick DESC""", (code, tick-240, tick-60))
+        previous = None
+        for row in prior:
+            saved = json.loads(row["value"])
+            if saved.get("power_evidence_status") not in LATE_RECORDER:
+                previous = saved.get("power_evidence")
+                break
         evidence = power_evidence(observed_at, recent, context,
                                   {"low": verified_low, "above_low": verified_low, "high": high_cutoff, "learning": low_cutoff}, previous)
+        evidence_status = "ready" if evidence["last_report"] is not None else "no_fresh_report"
     bands = evidence["bands"] if evidence else {}
     low_seconds = bands.get("low", {}).get("seconds", 0)
     above_low_seconds = bands.get("above_low", {}).get("seconds", 0)
@@ -437,7 +493,7 @@ def load_room(db, rooms, recorder, code, config, tick, actual_beep, shared_simul
     current = advise(tick, latest, profile, history, activity, last, {}, ignore_beep=True,
                      last_beep_at=max((at for at in anchors if at is not None), default=None),
                      reversal_from_low_power=low_seconds >= 300, limits=config.get("soft_limits"))
-    energy, coverage = metered_interval(recent, tick-60, tick) if context else (0, 0)
+    energy, coverage = metered_interval(recent, tick-60, tick) if context and evidence_status != "recorder_power_unmatched" else (0, 0)
     current.update({"activity": activity.state, "power_reason": activity.reason,
                     "metered_kwh": energy if coverage else None, "metered_seconds": coverage,
                     "source_fresh": source_fresh, "physical_state_verified": False,
@@ -455,7 +511,7 @@ def load_room(db, rooms, recorder, code, config, tick, actual_beep, shared_simul
                     "low_power_seconds": low_seconds,
                     "above_low_seconds": above_low_seconds,
                     "above_high_seconds": above_high_seconds,
-                    "power_evidence": evidence,
+                    "power_evidence": evidence, "power_evidence_status": evidence_status,
                     "reported_mode": latest["adapter_mode"] if latest else None,
                     "from_setpoint": latest["reported"] if latest else None,
                     "outdoor": latest["outdoor"] if latest else None,
@@ -652,24 +708,36 @@ def display(db, config, tick, error=None, *, release=(None, None)):
     atomic(OUTPUT/"shadow-status.md", "\n".join(lines))
 
 
-def cycle(db, config, tick, *, release_commit=None):
+def decision_complete(db, config, tick):
+    return db.execute("SELECT count(*) FROM decisions WHERE tick=?", (tick,)).fetchone()[0] == len(config)
+
+
+def cycle(db, config, tick, *, release_commit=None, now=None):
+    if decision_complete(db, config, tick):
+        return False
+    now = time.time() if now is None else now
+    awaiting_inputs = now < tick+60+RECORDER_INPUT_GRACE_SECONDS
     with closing(open_readonly(SOURCE / "home-assistant_v2.db")) as recorder, room_source(
         SOURCE / ".storage/room_climate_control.sqlite3"
     ) as rooms, db:
-        # Wait for HA's minute tick, including after parallel container start. No historical decisions are replayed.
-        latest = rooms.execute("SELECT max(tick) FROM samples").fetchone()[0]
-        if latest is None or 0 <= tick-latest <= 120 and latest != tick:
-            return False
-        if db.execute("SELECT count(*) FROM decisions WHERE tick=?", (tick,)).fetchone()[0] == len(config):
+        if awaiting_inputs and rooms.execute("SELECT count(*) FROM samples WHERE tick=?", (tick,)).fetchone()[0] < len(config):
             return False
         shared = db.execute("SELECT max(tick) FROM decisions WHERE hypothetical=1 AND room IN (?,?)", SHARED_ROOMS).fetchone()[0]
-        recorded = latest_beeps(db, time.time())
+        recorded = latest_beeps(db, now)
         session = learning_session(JOURNALS, tick)
+        db.execute("SAVEPOINT input_snapshot")
         data = {room: load_room(db, rooms, recorder, room, settings, tick, recorded.get(room),
                                 shared if room in SHARED_ROOMS else None, session) for room, settings in config.items()}
+        if awaiting_inputs and any(d["power_evidence_status"] in LATE_RECORDER
+                                   for d in data.values()):
+            # The observer SQLite commit can lead the Recorder commit. A
+            # partial snapshot is not a power interruption or a decision.
+            db.execute("ROLLBACK TO input_snapshot")
+            db.execute("RELEASE input_snapshot")
+            return False
         coordinate(data)
         if all(value["source_fresh"] for value in data.values()):
-            db.execute("INSERT OR IGNORE INTO settings VALUES ('valid_started',?)", (str(int(time.time())),))
+            db.execute("INSERT OR IGNORE INTO settings VALUES ('valid_started',?)", (str(int(now)),))
             db.execute("INSERT OR IGNORE INTO settings VALUES (?,?)", (POLICY_START_KEY, str(tick)))
         for value in data.values():
             value["policy_revision"] = POLICY_REVISION
@@ -677,6 +745,7 @@ def cycle(db, config, tick, *, release_commit=None):
         db.executemany("INSERT OR IGNORE INTO decisions VALUES (?,?,?,?,?)",
                        [(room,tick,local(tick).date().isoformat(),int(value["hypothetical_send"]),encode(value)) for room,value in data.items()])
         daily(db,local(tick).date().isoformat())
+        db.execute("RELEASE input_snapshot")
     return True
 
 
@@ -687,6 +756,8 @@ def daily_snapshot(db, tick):
     path = folder / f"shadow-{name}.sqlite3"
     if path.exists():
         return
+    with db:
+        db.execute("DELETE FROM power_reports WHERE report_at<?", (tick-HISTORY,))
     temporary = path.with_suffix(".tmp")
     with closing(sqlite3.connect(temporary)) as dest:
         db.backup(dest)
@@ -708,11 +779,23 @@ def main():
         LOG.info("Offline shadow service running for %d rooms", len(config))
         last_report = None
         last_error = None
+        cursor = None
         while not stop.is_set():
             # HA writes its interval sample at any point within the minute.
-            tick = int(time.time())//60*60 - 60
+            now = time.time()
+            tick = int(now)//60*60 - 60
+            if cursor is None:
+                latest = db.execute("SELECT max(tick) FROM decisions").fetchone()[0]
+                cursor = min(tick, latest+60) if latest is not None else tick
+            cursor = max(cursor, tick-120)
             try:
-                changed = cycle(db, config, tick, release_commit=release[0])
+                changed = False
+                while cursor <= tick:
+                    written = cycle(db, config, cursor, release_commit=release[0], now=now)
+                    if not written and not decision_complete(db, config, cursor):
+                        break
+                    cursor += 60
+                    changed |= written
                 if last_report is None or changed or last_error:
                     display(db, config, tick, release=release)
                     try:

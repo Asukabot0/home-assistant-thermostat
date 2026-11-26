@@ -15,7 +15,7 @@ from traceback import extract_tb
 from urllib.error import HTTPError
 
 from cadence import SHARED_ROOMS, save_receipt
-from house_dispatch import acknowledged, coordinate, final_gate, initial_safety_setting, recovery_initial
+from house_dispatch import acknowledged, cancel_gentle, coordinate, final_gate, initial_safety_setting, public_gentle, recovery_initial
 from house_policy import ACTIVE, INDEPENDENT, POLICY
 from heating_pilot import DATA_DIR, ha_client, publish
 from model import increases_output, numeric
@@ -222,6 +222,15 @@ def assess(live, state, now, advise_room=room_advice, *, trial=True, isolated=()
                          "status": hold or ("手动隔离" if room in isolated else
                                             "等待自动状态和有效数据" if not ready[room] else "等待全屋分配")}
     if pending:
+        if plan := state.get("gentle"):
+            zone, unit = plan["zone"], plan["unit"]
+            if any(r not in connected or r in manual or group(r) in state["holds"]
+                   or live[r]["signature"][3] != "auto" or live[r]["signature"][5:] != ("标准", False)
+                   or live[r]["native_authorized"] is not False for r in (zone, unit)):
+                trace["gentle_exit"] = cancel_gentle(state, now, "control_paused")
+            elif (live[zone].get("temperature_source") != plan["source"]
+                  or any(live[r]["signature"][4] != plan["target"] for r in (zone, unit))):
+                trace["gentle_exit"] = cancel_gentle(state, now, "target_or_source_changed")
         trace["pending_rooms"] = sorted(pending)
         for room in pending:
             details[room]["status"] = "等待米家指令回报"
@@ -235,7 +244,9 @@ def assess(live, state, now, advise_room=room_advice, *, trial=True, isolated=()
     incomplete = {room for room, (_, member) in members.items() if member["phase"] == "initial"}
     allocation_ready = {room: enabled and room not in incomplete and group(room) not in transitions
                         for room, enabled in ready.items()}
-    need, reasons, candidates = coordinate(live, readings, allocation_ready, state, now, ROOMS, connected)
+    need, reasons, candidates = coordinate(live, readings, allocation_ready, state, now, ROOMS, connected,
+                                           trace=trace, control_ready=ready)
+    plan = state.get("gentle")
     invalidated, closed, safety = [], [], {}
     for room in sorted(incomplete):
         batch, member = members[room]
@@ -244,7 +255,11 @@ def assess(live, state, now, advise_room=room_advice, *, trial=True, isolated=()
         if (not ready[room] or need == "unknown" or mode != batch["mode"]
                 or matching_feedback(now, feedback, readings[room]["sample"], target)):
             continue
-        if need != mode:
+        optional = member.get("gentle_at")
+        invalid = need != mode or (optional is not None and trace["normal_need"] != mode and (
+            plan is None or plan["unit"] != room or plan["selected_at"] != optional
+            or trace["gentle"]["reason"] in {"inside_ideal_band", "peer_comfort_risk"}))
+        if invalid:
             if not member.get("initial_invalidated") or member["target"] != target:
                 invalidated.append(room)
             member.pop("initial", None)
@@ -252,7 +267,7 @@ def assess(live, state, now, advise_room=room_advice, *, trial=True, isolated=()
         safe_setting = initial_safety_setting(mode, numeric(setpoint), numeric(target), ROOMS[room]["soft_limits"][mode])
         if safe_setting is not None:
             safety[room] = safe_setting
-        elif need != mode:
+        elif invalid:
             # Only close unsent work. The echo, baseline and historical
             # commands remain in the durable journal.
             member["phase"] = "done"
@@ -264,7 +279,15 @@ def assess(live, state, now, advise_room=room_advice, *, trial=True, isolated=()
                 del transitions[key]
         allocation_ready = {room: enabled and room not in incomplete and group(room) not in transitions
                             for room, enabled in ready.items()}
-        need, reasons, candidates = coordinate(live, readings, allocation_ready, state, now, ROOMS, connected)
+        # Assess again to release allocation slots. Preserve the first
+        # lifecycle event in the audit, and do not acquire a new gentle owner
+        # during the same assessment that discarded an old continuation.
+        followup = {}
+        need, reasons, candidates = coordinate(live, readings, allocation_ready, state, now, ROOMS, connected,
+                                               trace=followup, control_ready=ready,
+                                               acquire_gentle=trace["gentle"]["state"] != "exited")
+        if trace["gentle"]["state"] not in {"selected", "exited"}:
+            trace["gentle"] = followup["gentle"]
     trace.update(need=need, lead=state.get("house_lead"), invalidated_initial=invalidated)
     for room, detail in details.items():
         detail["house_need"] = need
@@ -289,7 +312,8 @@ def assess(live, state, now, advise_room=room_advice, *, trial=True, isolated=()
         mode = live[room]["adapter"]["mode"]
         current = live[room]["adapter"]["setpoint"]
         target = live[room]["signature"][4]
-        if mode != batch["mode"] or need != mode:
+        if (mode != batch["mode"] or need != mode
+                or (state.get("gentle") is not None and state["gentle"]["unit"] != room)):
             continue
         initial = recovery_initial(room, mode, live, readings[room], state, ROOMS)
         if initial is None or matching_feedback(now, live[room], readings[room]["sample"], target):
@@ -305,6 +329,8 @@ def assess(live, state, now, advise_room=room_advice, *, trial=True, isolated=()
         else:
             details[room]["status"] = "按当前目标补发已确认模式的初值"
             candidates.append((-1, (0, 0), room, "temperature", initial, "reversal_initial"))
+    if plan := state.get("gentle"):
+        trace["gentle"]["allocation_reason"] = details[plan["unit"]]["status"]
     trace["candidates"] = [item[2:] for item in sorted(candidates)]
     trace["rejections"] = []
     for priority, ranking, *action in sorted(candidates):
@@ -325,15 +351,34 @@ def assess(live, state, now, advise_room=room_advice, *, trial=True, isolated=()
 
 def start_batch(state, room, desired, details, sent):
     member = {"phase": "queued", "target": details[room]["target_c"]}
+    if plan := state.get("gentle"):
+        if plan["unit"] == room and plan["mode"] == desired:
+            member["gentle_at"] = plan["selected_at"]
     batch = {"id": sent, "mode": desired, "members": {room: member}, "ready_at": sent}
     state["transitions"][group(room)] = batch
     return batch
 
 
+def cancel_inactive_gentle(now):
+    exits = []
+    for path in DATA_DIR.glob("continuous-*.json"):
+        if not path.stem.removeprefix("continuous-").isdigit():
+            continue
+        try:
+            state = json.loads(path.read_text())
+        except FileNotFoundError:
+            continue
+        if ended := cancel_gentle(state, now, "permit_inactive"):
+            put_state(path, state)
+            exits.append(ended)
+    return exits
+
+
 def cycle(call):
     permit = read_permit(time())
     if permit is None:
-        audit("cycle", outcome="permit_inactive")
+        exits = cancel_inactive_gentle(time())
+        audit("cycle", outcome="permit_inactive", gentle_exits=exits)
         publish("实机控制已暂停或验证窗口已结束")
         return
     trial = permit["end"] is not None
@@ -369,6 +414,10 @@ def cycle(call):
     verification = {}
     checked, confirmed = assess(refreshed, state, time(), trial=trial, isolated=isolated, trace=verification)
     if selection != confirmed or read_permit(time()) != permit:
+        if selection == confirmed:
+            ended = cancel_gentle(state, time(), "permit_inactive")
+            if ended:
+                verification["gentle_exit"] = ended
         put_state(path, state)
         audit("cycle", outcome="recheck_changed", assessment=trace, verification=verification,
               proposed=selection, final=None, rooms=checked)
@@ -390,13 +439,17 @@ def cycle(call):
               "before_room_c": numeric(refreshed[room]["temperature"]),
               "before_watts": numeric(refreshed[room]["adapter"]["power"]),
               "before_mode_at": refreshed[room]["adapter"]["last_mode_change"], "followup": {}, "physical_verified": False}
+    if ((plan := state.get("gentle")) and room == plan["unit"]
+            and purpose in {"energy_start", "gentle_temperature", "reversal_initial"}):
+        action["gentle"] = public_gentle(plan)
     state["commands"].append(action)
     put_state(path, state)
     if read_permit(time()) != permit or time() >= end-20:
         action.update(status="canceled")
+        ended = cancel_gentle(state, time(), "permit_inactive")
         put_state(path, state)
         audit("cycle", outcome="permit_revoked", assessment=trace, verification=verification,
-              proposed=selection, final=None, command_at=sent, rooms=checked)
+              proposed=selection, final=None, command_at=sent, rooms=checked, gentle_exits=[ended] if ended else [])
         return
     service, field = ("set_temperature", "temperature") if kind == "temperature" else ("set_hvac_mode", "hvac_mode")
     audit("cycle", outcome="dispatch", assessment=trace, verification=verification, final=selection,

@@ -167,7 +167,9 @@ INSERT INTO states VALUES (1,'100',11940,11940,1,NULL),(2,'500',12005,12005,1,NU
 assert powers(recorder, "sensor.synthetic_power", 0, end=12000) == [(11940, 100)]
 recorder.execute("INSERT INTO states_meta VALUES (3,'climate.synthetic_observer')")
 for key, observed in ((2, 12500), (3, 12820)):
-    attrs = json.dumps({"power_reported_at": datetime.fromtimestamp(observed, timezone.utc).isoformat()})
+    attrs = json.dumps({"power_reported_at": datetime.fromtimestamp(observed, timezone.utc).isoformat(),
+                        "power_entity_id": "sensor.synthetic_power",
+                        "power_observer_started_at": "1970-01-01T00:00:00+00:00"})
     recorder.execute("INSERT INTO state_attributes VALUES (?,?)", (key, attrs))
     recorder.execute("INSERT INTO states VALUES (?,?,?,?,?,?)", (key+10,"cool",observed+10,observed+10,3,key))
 reports = recent_power_reports(recorder,"sensor.synthetic_power","climate.synthetic_observer",12400,12900)

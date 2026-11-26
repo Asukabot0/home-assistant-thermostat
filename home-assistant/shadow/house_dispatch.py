@@ -1,6 +1,6 @@
 """Coordinate connected rooms before any command enters the durable journal."""
-from house_policy import ACTIVE, INDEPENDENT, POLICY, recovering, temperature_change, whole_house_need
-from model import increases_output, numeric, setpoint_bounds
+from house_policy import ACTIVE, INDEPENDENT, POLICY, TEMP_EPSILON, recovering, temperature_change, whole_house_need
+from model import automatic_setpoint, increases_output, numeric, setpoint_bounds
 from pilot_gate import credible_output, current_power_evidence, eligible, high_overshoot, matching_feedback
 
 
@@ -50,6 +50,26 @@ def final_gate(candidate, now, live, readings, connected, state, configurations,
         return flag
     if not current_power_evidence(now, feedback, shadow):
         return "等待本机新鲜功率上报"
+    plan = state.get("gentle")
+    optional = purpose == "gentle_temperature" or (purpose in {"energy_start", "reversal_initial"} and plan is not None)
+    if optional:
+        index = tuple(ref for ref in INDEPENDENT if ref in connected)
+        if (plan is None or plan["unit"] != room or plan["zone"] not in index
+                or target != plan["target"] or live[plan["zone"]]["signature"][4] != plan["target"]
+                or live[plan["zone"]]["temperature_source"] != plan["source"]
+                or (value if kind == "mode" else mode) != plan["mode"]
+                or not all_rooms_assessed(live, index)):
+            return "温和需求或目标已变化"
+        zones = zones_for(live, readings, index)
+        if (any(z["view"] is None for z in zones.values()) or whole_house_need(zones, policy) != "hold"
+                or gentle_block(plan, zones, policy)
+                or live[plan["zone"]]["temperature_age"] > policy["sparse_report_age_seconds"]):
+            return "温和加码条件或另一测点余量已变化"
+        if any(live[peer]["adapter"]["mode"] not in {plan["mode"], "off", "fan_only"} for peer in connected-{room}):
+            return "等待相反或未知模式退出"
+        if purpose == "gentle_temperature" and (not increases_output(mode,setpoint,value)
+                                                or abs(value-setpoint) > min(1, policy["gentle_step"])+TEMP_EPSILON):
+            return "温和调温须按本方向且最多一步"
     if kind == "temperature":
         bounds = setpoint_bounds(configurations[room]["soft_limits"][mode])
         if bounds is None or not bounds[0] <= value <= bounds[1]:
@@ -119,6 +139,161 @@ def guard_peers(zones, zone_room, mode, policy):
         for name, zone in zones.items())
 
 
+def zones_for(live, readings, zone_rooms):
+    return {room: {"measured": numeric(live[room]["temperature"]), "target": numeric(live[room]["signature"][4]),
+                   "view": readings[room]["house_view"]} for room in zone_rooms}
+
+
+def peer_comfort_risk(zones, zone, mode, policy):
+    direction = 1 if mode == "heat" else -1
+    for room, other in zones.items():
+        if room == zone:
+            continue
+        adverse = direction*(other["measured"]-other["target"])
+        progress = direction*(other["view"]["trend"] or 0)
+        if adverse + max(0, progress) > policy["comfort_band"]+TEMP_EPSILON:
+            return True
+    return False
+
+
+def gentle_deficit(zone, mode):
+    direction = 1 if mode == "heat" else -1
+    return direction*(zone["target"]-zone["measured"])
+
+
+def forecast_returns_to_ideal(zone, mode, policy):
+    deficit = gentle_deficit(zone, mode)
+    direction = 1 if mode == "heat" else -1
+    forecast = zone["view"]["trend"]
+    return (deficit > policy["ideal_band"] and forecast is not None
+            and direction*forecast >= deficit-policy["ideal_band"]-TEMP_EPSILON)
+
+
+def gentle_block(plan, zones, policy):
+    zone = zones[plan["zone"]]
+    if peer_comfort_risk(zones, plan["zone"], plan["mode"], policy):
+        return "peer_comfort_risk"
+    if gentle_deficit(zone, plan["mode"]) <= policy["ideal_band"]+TEMP_EPSILON:
+        return "inside_ideal_band"
+    if forecast_returns_to_ideal(zone, plan["mode"], policy):
+        return "returning_to_ideal"
+    return None
+
+
+def public_gentle(plan):
+    return {key: plan[key] for key in ("zone", "unit", "mode", "target", "selected_at")}
+
+
+def cancel_gentle(state, now, reason, policy=POLICY):
+    plan = state.pop("gentle", None)
+    if plan is None:
+        return None
+    state["gentle_guard"] = {"mode": plan["mode"], "until": now+policy["gentle_switch_wait_seconds"]}
+    if reason in {"control_paused", "target_or_source_changed", "permit_inactive"}:
+        state["gentle_requalify_at"] = now
+    return dict(public_gentle(plan), reason=reason)
+
+
+def gentle_unit(live, ready, configurations, zone, mode, target, policy):
+    for room in (zone, "study"):
+        if attachment(room) != zone or not ready.get(room):
+            continue
+        feedback = live[room]
+        adapter = feedback["adapter"]
+        if feedback["signature"][4] != target or mode not in adapter["modes"]:
+            continue
+        if adapter["mode"] == "off":
+            return room
+        if adapter["mode"] == mode:
+            setting = numeric(adapter["setpoint"])
+            limits = configurations[room]["soft_limits"][mode]
+            bounds = setpoint_bounds(limits)
+            step = min(1, policy["gentle_step"]) * (1 if mode=="heat" else -1)
+            if (setting is not None and bounds and bounds[0] <= setting <= bounds[1]
+                    and automatic_setpoint(setting, step, limits) is not None):
+                return room
+    return None
+
+
+def choose_gentle(live, zones, control_ready, state, now, normal, connected, configurations, policy, *, acquire):
+    trace = {"state": "idle", "reason": "no_qualified_zone", "zones": {}}
+    plan = state.get("gentle")
+    if normal != "hold":
+        reason = "stale_temperature" if normal == "unknown" else "normal_demand_priority"
+        trace["reason"] = reason
+        if ended := cancel_gentle(state, now, reason, policy):
+            trace.update(state="exited", exit=ended)
+        return None, trace
+
+    if plan is not None:
+        zone, unit, mode = plan["zone"], plan["unit"], plan["mode"]
+        if zone not in zones or not control_ready.get(zone) or not control_ready.get(unit):
+            reason = "control_paused"
+        elif (zones[zone]["target"] != plan["target"] or live[zone]["temperature_source"] != plan["source"]
+              or live[unit]["signature"][4] != plan["target"]):
+            reason = "target_or_source_changed"
+        elif live[zone]["temperature_age"] > policy["sparse_report_age_seconds"]:
+            reason = "stale_temperature"
+        elif gentle_deficit(zones[zone], mode) <= policy["gentle_exit_band"]+TEMP_EPSILON:
+            reason = "entered_exit_band"
+        elif forecast_returns_to_ideal(zones[zone], mode, policy):
+            reason = "returning_to_ideal"
+        else:
+            block = gentle_block(plan, zones, policy)
+            trace.update(state="active", reason=block or "held_selection", **public_gentle(plan))
+            return plan, trace
+        trace.update(state="exited", reason=reason, exit=cancel_gentle(state, now, reason, policy))
+        return None, trace
+
+    if not acquire:
+        return None, trace
+    guard = state.get("gentle_guard")
+    if guard and now >= guard["until"]:
+        del state["gentle_guard"]
+        guard = None
+    options = []
+    for name, zone in zones.items():
+        evidence = zone["view"].get("gentle")
+        result = trace["zones"][name] = {}
+        if evidence is None or live[name]["temperature_age"] > policy["sparse_report_age_seconds"]:
+            result["reason"] = ("stale_temperature" if live[name]["temperature_age"] > policy["sparse_report_age_seconds"]
+                                else "no_ideal_band_excursion")
+            continue
+        mode = evidence["mode"]
+        since = max(evidence["since"], state.get("gentle_requalify_at", 0))
+        reports = [stamp for stamp in evidence["reports"] if stamp >= since]
+        dwell = now-since
+        span = reports[-1]-reports[0] if len(reports) >= 2 else 0
+        result.update(mode=mode, seconds=dwell, reports=len(reports), report_span=span)
+        unit = gentle_unit(live, control_ready, configurations, name, mode, zone["target"], policy)
+        proposed = {"zone": name, "unit": unit, "mode": mode, "target": zone["target"],
+                    "source": live[name]["temperature_source"], "selected_at": now}
+        reason = gentle_block(proposed, zones, policy)
+        if dwell < policy["gentle_dwell_seconds"]:
+            result["reason"] = "waiting_dwell"
+        elif span < policy["gentle_report_span_seconds"]:
+            result["reason"] = "waiting_independent_reports"
+        elif reason:
+            result["reason"] = reason
+        elif guard and guard["mode"] != mode:
+            result["reason"] = "direction_hold"
+        elif not control_ready.get(name) or unit is None:
+            result["reason"] = "no_controllable_local_unit"
+        elif unit == "study" and guard_peers(zones, name, mode, policy):
+            result["reason"] = "prefer_independent_zone_near_peer_boundary"
+        else:
+            result["reason"] = "qualified"
+            opposing = any(live[room]["adapter"]["mode"] in ACTIVE-{mode} for room in connected)
+            priority = (opposing, unit=="study", -round(gentle_deficit(zone, mode), 6), -dwell, name)
+            options.append((priority, proposed))
+    if not options:
+        return None, trace
+    _, plan = min(options, key=lambda entry: entry[0])
+    state["gentle"] = plan
+    trace.update(state="selected", reason="qualified_local_demand", **public_gentle(plan))
+    return plan, trace
+
+
 def needs_local(zone, mode, policy):
     direction = 1 if mode == "heat" else -1
     delta = zone["measured"]-zone["target"]
@@ -163,15 +338,22 @@ def recovery_initial(room, mode, live, shadow, state, configurations, policy=POL
     return int(max(bounds[0], min(bounds[1], limited)))
 
 
-def coordinate(live, readings, ready, state, now, configurations, connected, policy=POLICY):
+def coordinate(live, readings, ready, state, now, configurations, connected, policy=POLICY, *,
+               trace=None, control_ready=None, acquire_gentle=True):
+    trace = {} if trace is None else trace
+    if control_ready is None:
+        control_ready = ready
     zone_rooms = tuple(room for room in INDEPENDENT if room in connected)
-    if not zone_rooms or not all_rooms_assessed(live, zone_rooms):
-        return "unknown", {}, []
-    zones = {room: {"measured": numeric(live[room]["temperature"]), "target": numeric(live[room]["signature"][4]),
-                    "view": readings[room]["house_view"]} for room in zone_rooms}
-    if any(zone["view"] is None for zone in zones.values()):
-        return "unknown", {}, []
-    need = whole_house_need(zones, policy)
+    zones = zones_for(live, readings, zone_rooms) if all_rooms_assessed(live, zone_rooms) else {}
+    normal = (whole_house_need(zones, policy) if zones and all(z["view"] is not None for z in zones.values())
+              else "unknown")
+    gentle, trace["gentle"] = choose_gentle(live, zones, control_ready, state, now, normal, connected,
+                                           configurations, policy, acquire=acquire_gentle)
+    trace["normal_need"] = normal
+    if normal == "unknown":
+        return normal, {}, []
+    need = gentle["mode"] if gentle else normal
+    gentle_reason = gentle_block(gentle, zones, policy) if gentle else None
     actions = acknowledged([a for a in state["commands"] if a["room"] in connected])
     last_house = max(actions, key=lambda a: a["proxy_at"], default=None)
     last_strengthening = max((a for a in actions if a["kind"] == "mode" and a["value"] in ACTIVE
@@ -190,7 +372,8 @@ def coordinate(live, readings, ready, state, now, configurations, connected, pol
         direction = modes[lead]
     opposite = {room for room in active if direction in ACTIVE and modes[room] != direction}
     same = active - opposite
-    demanded = {room for room in zones if need in ACTIVE and needs_local(zones[room], need, policy)}
+    demanded = ({gentle["zone"]} if gentle and gentle_reason is None else set()) if gentle else {
+        room for room in zones if need in ACTIVE and needs_local(zones[room], need, policy)}
     local_active = {room for room in same if attachment(room) in demanded and ready[room]}
     preferred = local_active or same
     if lead not in preferred:
@@ -211,6 +394,12 @@ def coordinate(live, readings, ready, state, now, configurations, connected, pol
         limits = configurations[room]["soft_limits"]
         last = max((a for a in actions if a["room"] == room), key=lambda a: a["proxy_at"], default=None)
         if mode == "off":
+            if gentle and room == gentle["unit"] and gentle_reason is not None:
+                reasons[room] = "温和恢复暂不加码：" + gentle_reason
+                continue
+            if gentle and room != gentle["unit"]:
+                reasons[room] = "当前温和需求仅分配给一个本区设备"
+                continue
             if room not in state["parked"] or need not in ACTIVE or opposite or ref not in demanded:
                 reasons[room] = "等待持续需求或原方向退出"
                 continue
@@ -233,7 +422,8 @@ def coordinate(live, readings, ready, state, now, configurations, connected, pol
                 reasons[room] = "等待停机后新室温或前次加码响应"
                 continue
             if readings[room]["initial_setpoints"].get(need) is not None:
-                reasons[room] = "持续需求已由真实室温确认，按需启机"
+                reasons[room] = ("理想带外持续偏差已由独立上报确认，温和启机" if gentle else
+                                 "持续需求已由真实室温确认，按需启机")
                 candidates.append((3, (room == "study", -abs(measured-target)), room, "mode", need, "energy_start"))
             continue
 
@@ -250,7 +440,14 @@ def coordinate(live, readings, ready, state, now, configurations, connected, pol
         adverse = direction_sign*delta > policy["ideal_band"]+1e-6 and not recovering(delta, view["trend"], policy)
         adverse_peer = peer_guard and direction_sign*delta >= -policy["ideal_band"] and output
         shedding = need == "hold" and stable and len(same)>1 and room != lead
-        unused = room in opposite or shedding or (need != mode and (adverse or adverse_peer))
+        peer_risk = peer_comfort_risk(zones, ref, mode, policy)
+        if gentle:
+            # A mild request cannot displace opposite output that is still
+            # helping its own zone. Only intervene for actual adverse output.
+            unused = output and ((need != mode and (adverse or (peer_risk and adverse_peer)))
+                                 or (room == gentle["unit"] and peer_risk))
+        else:
+            unused = room in opposite or shedding or (need != mode and (adverse or adverse_peer))
         if unused and own_feedback:
             if recent_reduction or not output:
                 # A confirmed setpoint alone is not a confirmed reduction of load.
@@ -264,6 +461,15 @@ def coordinate(live, readings, ready, state, now, configurations, connected, pol
         proposed, reason = temperature_change(mode, setting, measured, target, view, limits[mode],
                                               has_output=output, weakening=unused and output,
                                               direct_high=direct, policy=policy)
+        gentle_step = (proposed is None and gentle is not None and room == gentle["unit"] and mode == need
+                       and gentle_reason is None and ref in demanded and not unused)
+        if gentle_step:
+            if bounds := setpoint_bounds(limits[mode]):
+                if bounds[0] <= setting <= bounds[1]:
+                    proposed = automatic_setpoint(setting, direction_sign*min(1,policy["gentle_step"]), limits[mode])
+            reason = "理想带外持续偏差，温和调温" if proposed is not None else "温和调温已达本机软限"
+        elif gentle and room == gentle["unit"] and gentle_reason is not None and proposed is None and not unused:
+            reason = "温和恢复暂不加码：" + gentle_reason
         reasons[room] = reason
         if proposed is None:
             if unused and output and own_feedback:
@@ -272,14 +478,16 @@ def coordinate(live, readings, ready, state, now, configurations, connected, pol
             continue
         if increases_output(mode, setting, proposed):
             if (mode != need or opposite or ref not in demanded
-                    or (lead != room and lead is not None and attachment(lead) == ref)
+                    or (gentle and (room != gentle["unit"] or peer_risk or not gentle_step))
+                    or (not gentle and lead != room and lead is not None and attachment(lead) == ref)
                     or not observation_ready(now, last_house, live, zone_rooms, policy)):
                 reasons[room] = "等待全屋同向需求、主机或动作后新反馈"
                 continue
             if peer_guard:
                 proposed = min(proposed, setting+policy["ordinary_step"]) if mode=="heat" else max(proposed, setting-policy["ordinary_step"])
                 reasons[room] = "另一测点接近不利理想边界，仅本区小步加码"
-            candidates.append((4, (0, -abs(delta)), room, "temperature", proposed, "temperature"))
+            candidates.append((4, (0, -abs(delta)), room, "temperature", proposed,
+                               "gentle_temperature" if gentle_step else "temperature"))
         elif own_feedback:
             purpose = ("direct_high_easing" if direct else "trend_easing" if reason == "预计越过理想带，提前减载"
                        else "coordinated_easing" if unused else "temperature")

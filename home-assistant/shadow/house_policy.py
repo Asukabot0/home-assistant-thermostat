@@ -9,6 +9,7 @@ from model import automatic_setpoint, numeric, setpoint_bounds
 POLICY = json.loads(Path(__file__).with_name("house_policy.json").read_text())
 ACTIVE = {"heat", "cool"}
 INDEPENDENT = ("bedroom", "living")
+TEMP_EPSILON = 1e-6
 
 
 def independent_points(history, sample, now, since, window, *, same_operation):
@@ -65,8 +66,36 @@ def outside_for(history, sample, direction, now, policy=POLICY):
     return now - since, since
 
 
+def gentle_evidence(history, sample, now, policy):
+    """Count real reports inside one contiguous ideal-to-comfort excursion."""
+    delta = sample["measured"]-sample["desired"]
+    mode = "heat" if delta < 0 else "cool"
+    sign = -1 if delta < 0 else 1
+    def in_band(row):
+        return (row["measured"] is not None and row["temp_report"] is not None
+                and row["desired"] == sample["desired"]
+                and row.get("temperature_source") == sample.get("temperature_source")
+                and -59 <= row["tick"]-row["temp_report"] <= 1200
+                and policy["ideal_band"]+TEMP_EPSILON < sign*(row["measured"]-sample["desired"])
+                     <= policy["comfort_band"]+TEMP_EPSILON)
+
+    if not in_band(sample) or sample.get("temperature_source") is None:
+        return None
+    since = sample["tick"]
+    reports = {int(sample["temp_report"])}
+    for row in reversed(history[:-1]):
+        if since-row["tick"] != 60 or not in_band(row):
+            break
+        since = row["tick"]
+        reports.add(int(row["temp_report"]))
+    # Do not let a cached report captured before this excursion or before a
+    # target change count as one of the confirming reports.
+    return {"mode": mode, "since": since, "reports": sorted(stamp for stamp in reports if since <= stamp <= now)}
+
+
 def thermostat_view(history, sample, now, since, policy=POLICY):
-    view = {"trend": recent_trend(history, sample, now, since, policy), "report_at": sample["temp_report"]}
+    view = {"trend": recent_trend(history, sample, now, since, policy), "report_at": sample["temp_report"],
+            "gentle": gentle_evidence(history, sample, now, policy)}
     for label, direction in (("cold", -1), ("warm", 1)):
         duration, start = outside_for(history, sample, direction, now, policy)
         # A minute row can lag its temperature report by up to one minute.
@@ -129,8 +158,8 @@ def temperature_change(mode, current, measured, target, view, limits, *, has_out
 
 def whole_house_need(zones, policy=POLICY):
     deltas = [z["measured"]-z["target"] for z in zones.values()]
-    cold = any(delta < -policy["comfort_band"] for delta in deltas)
-    warm = any(delta > policy["comfort_band"] for delta in deltas)
+    cold = any(delta < -policy["comfort_band"]-TEMP_EPSILON for delta in deltas)
+    warm = any(delta > policy["comfort_band"]+TEMP_EPSILON for delta in deltas)
     if cold and warm:
         return "conflict"
     return "heat" if cold else "cool" if warm else "hold"
