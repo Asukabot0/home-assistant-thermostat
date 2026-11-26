@@ -236,8 +236,6 @@ def choose_gentle(live, zones, control_ready, state, now, normal, connected, con
             reason = "stale_temperature"
         elif gentle_deficit(zones[zone], mode) <= policy["gentle_exit_band"]+TEMP_EPSILON:
             reason = "entered_exit_band"
-        elif forecast_returns_to_ideal(zones[zone], mode, policy):
-            reason = "returning_to_ideal"
         else:
             block = gentle_block(plan, zones, policy)
             trace.update(state="active", reason=block or "held_selection", **public_gentle(plan))

@@ -258,7 +258,7 @@ def assess(live, state, now, advise_room=room_advice, *, trial=True, isolated=()
         optional = member.get("gentle_at")
         invalid = need != mode or (optional is not None and trace["normal_need"] != mode and (
             plan is None or plan["unit"] != room or plan["selected_at"] != optional
-            or trace["gentle"]["reason"] in {"inside_ideal_band", "peer_comfort_risk"}))
+            or trace["gentle"]["reason"] in {"inside_ideal_band", "peer_comfort_risk", "returning_to_ideal"}))
         if invalid:
             if not member.get("initial_invalidated") or member["target"] != target:
                 invalidated.append(room)

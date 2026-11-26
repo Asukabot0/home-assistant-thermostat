@@ -146,6 +146,19 @@ class GentleRecoveryTests(unittest.TestCase):
         self.assertEqual(h.calls,[])
         self.assertEqual(self.assessment()["gentle"]["zones"]["bedroom"]["reason"], "peer_comfort_risk")
 
+    def test_trend_suspends_strengthening_but_keeps_owner_until_measured_exit(self):
+        h = self.scene(active="bedroom")
+        self.assertEqual(h.snapshot()["commands"][-1]["purpose"],"gentle_temperature")
+        self.set_room("bedroom", degrees=23.45, minutes=12, change=.20)
+        state = h.snapshot()
+        self.assertEqual(state["gentle"]["zone"],"bedroom")
+        self.assertEqual(self.assessment()["gentle"]["reason"],"returning_to_ideal")
+        self.assertEqual(len(h.calls),1)
+        self.set_room("bedroom", degrees=23.7, minutes=1)
+        self.assertNotIn("gentle", h.snapshot())
+        self.assertEqual(self.assessment()["gentle"]["exit"]["reason"],"entered_exit_band")
+        self.assertEqual(len(h.calls),1)
+
     def test_normal_demand_preempts_opposing_gentle_intent(self):
         h = self.scene()
         h.snapshot()
