@@ -32,7 +32,7 @@ from neural_shadow.data_pipeline import (  # noqa: E402
 from neural_shadow.nn_model import load_checkpoint  # noqa: E402
 from neural_shadow.runtime import ShadowRuntime, ShadowRuntimeConfig  # noqa: E402
 from neural_shadow.synthetic import generate_synthetic_history  # noqa: E402
-from neural_shadow.train import ReadinessGates, forward_chain_split, train_and_evaluate  # noqa: E402
+from neural_shadow.train import ReadinessGates, forward_chain_split_dataset, train_and_evaluate  # noqa: E402
 
 
 def run_e2e(
@@ -78,7 +78,7 @@ def run_e2e(
     rt_cfg = ShadowRuntimeConfig(state_dir=work_dir / "state", output_dir=work_dir / "output")
     runtime = ShadowRuntime(dataset.site, rt_cfg, loaded)
 
-    split = forward_chain_split(dataset.cutoff_ts, max_horizon_seconds=float(max(dataset.spec.horizons_minutes) * 60))
+    split = forward_chain_split_dataset(dataset)
     seal_indices = split.test_idx[::3][:12] if split.test_idx.size > 0 else split.val_idx[:6]
     sealed_ids = []
     for idx in seal_indices:

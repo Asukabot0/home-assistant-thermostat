@@ -2303,6 +2303,8 @@ def build_dataset(
         y_tval = np.zeros((n_k,), dtype=bool)
         interv = np.zeros((n_k,), dtype=bool)
         label_report_times: dict[str, dict[str, float | None]] = {z: {} for z in spec.zone_names}
+        actual_max_label_ts = t0 + max_horizon_s
+        embargo_s = max_horizon_s + float(settle_window_s) + MAX_POWER_GAP_SECONDS
 
         for h_idx, h_min in enumerate(horizons_minutes):
             h_s = float(h_min * 60)
@@ -2345,6 +2347,7 @@ def build_dataset(
                 if t0_temp is not None and fut is not None:
                     y_td[z_idx, h_idx] = float(fut.value_c - t0_temp)
                     y_tv[z_idx, h_idx] = True
+                    actual_max_label_ts = max(actual_max_label_ts, float(fut.report_at), float(fut.observed_at))
 
             # Power labels (3 units + total): require complete coverage (has_gap == False)
             # so missing intervals are NEVER silently treated as 0 Wh.
@@ -2362,6 +2365,11 @@ def build_dataset(
                     y_uwh[u_idx, h_idx] = float(full_wh)
                     y_uval[u_idx, h_idx] = True
                     total_wh_acc += float(full_wh)
+                    closing_ts = max(
+                        (r.report_at for r in pslice if r.report_at <= t0 + h_s + MAX_POWER_GAP_SECONDS),
+                        default=t0 + h_s,
+                    )
+                    actual_max_label_ts = max(actual_max_label_ts, float(closing_ts))
                 else:
                     unit_whs_valid = False
             y_tcov[h_idx] = float(min_cov)
@@ -2374,7 +2382,8 @@ def build_dataset(
             continue
 
         meta["label_report_times"] = label_report_times
-        meta["max_label_ts"] = t0 + max_horizon_s
+        meta["max_label_ts"] = float(actual_max_label_ts)
+        meta["label_lookahead_bound_ts"] = float(t0 + embargo_s)
         meta["intervened_by_horizon"] = {str(h): bool(interv[i]) for i, h in enumerate(horizons_minutes)}
 
         cutoffs.append(t0)
@@ -2498,6 +2507,8 @@ def build_dataset(
         "min_wh_coverage": max(float(min_wh_coverage), 1.0),
         "require_complete_wh_coverage": True,
         "settle_window_seconds": settle_window_s,
+        "max_power_gap_seconds": MAX_POWER_GAP_SECONDS,
+        "label_embargo_seconds": float(max_horizon_s + float(settle_window_s) + MAX_POWER_GAP_SECONDS),
         "data_sha256": data_digest,
     }
     return BuiltDataset(

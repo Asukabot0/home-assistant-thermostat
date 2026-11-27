@@ -15,7 +15,11 @@ import torch
 import torch.nn.functional as F
 
 from . import DataOrigin, FEATURE_VERSION, MODEL_ARCH_VERSION, ModelState
-from .data_pipeline import BuiltDataset
+from .data_pipeline import (
+    BuiltDataset,
+    DEFAULT_SETTLE_WINDOW_SECONDS,
+    MAX_POWER_GAP_SECONDS,
+)
 from .evaluate import Z_80, evaluate_all_models
 from .nn_model import (
     FeatureNormalizer,
@@ -61,28 +65,45 @@ def forward_chain_split(
     cutoff_ts: np.ndarray,
     *,
     max_horizon_seconds: float = 3600.0,
+    settle_window_seconds: float = DEFAULT_SETTLE_WINDOW_SECONDS,
+    max_power_gap_seconds: float = MAX_POWER_GAP_SECONDS,
+    embargo_seconds: float | None = None,
+    max_label_ts: np.ndarray | None = None,
     train_frac: float = 0.60,
     val_frac: float = 0.20,
 ) -> ForwardChainSplit:
     """Chronological forward-chaining split guaranteeing zero future label leakage across boundaries.
 
-    Every training sample satisfies: cutoff_ts[i] + max_horizon_seconds <= train_cutoff_ts.
-    Every validation sample satisfies: train_cutoff_ts <= cutoff_ts[j] and cutoff_ts[j] + max_horizon_seconds <= val_cutoff_ts.
-    Every test sample satisfies: val_cutoff_ts <= cutoff_ts[k].
+    The embargo covers the full worst-case label look-ahead:
+      embargo_seconds = max_horizon_seconds + settle_window_seconds + max_power_gap_seconds
+    and, when per-sample ``max_label_ts`` is supplied, every sample's actual latest label
+    observation timestamp must also precede the next split boundary.
     """
+    effective_embargo = (
+        float(embargo_seconds)
+        if embargo_seconds is not None
+        else float(max_horizon_seconds) + float(settle_window_seconds) + float(max_power_gap_seconds)
+    )
     n = int(cutoff_ts.shape[0])
     if n < 6:
         empty = np.zeros((0,), dtype=np.int64)
-        return ForwardChainSplit(empty, empty, empty, None, None, max_horizon_seconds)
+        return ForwardChainSplit(empty, empty, empty, None, None, effective_embargo)
 
-    order = np.argsort(cutoff_ts, kind="mergesort")
-    ts_sorted = cutoff_ts[order]
+    cutoff_arr = np.asarray(cutoff_ts, dtype=np.float64)
+    label_end = cutoff_arr + effective_embargo
+    if max_label_ts is not None:
+        max_label_arr = np.asarray(max_label_ts, dtype=np.float64)
+        if max_label_arr.shape != cutoff_arr.shape:
+            raise ValueError("max_label_ts must match cutoff_ts shape")
+        label_end = np.maximum(label_end, max_label_arr)
+
+    order = np.argsort(cutoff_arr, kind="mergesort")
+    ts_sorted = cutoff_arr[order]
 
     t_start = float(ts_sorted[0])
     t_end = float(ts_sorted[-1])
     total_span = t_end - t_start
-    if total_span <= 2.5 * max_horizon_seconds:
-        # Too short to place two 60m embargoes cleanly; use index quantiles with strict embargo filtering.
+    if total_span <= 2.5 * effective_embargo:
         tr_pos = max(1, int(n * train_frac))
         va_pos = max(tr_pos + 1, int(n * (train_frac + val_frac)))
         train_cutoff = float(ts_sorted[min(tr_pos, n - 1)])
@@ -91,9 +112,9 @@ def forward_chain_split(
         train_cutoff = float(np.quantile(ts_sorted, train_frac))
         val_cutoff = float(np.quantile(ts_sorted, train_frac + val_frac))
 
-    train_mask = (cutoff_ts + max_horizon_seconds) <= train_cutoff + 1e-6
-    val_mask = (cutoff_ts >= train_cutoff - 1e-6) & ((cutoff_ts + max_horizon_seconds) <= val_cutoff + 1e-6)
-    test_mask = cutoff_ts >= val_cutoff - 1e-6
+    train_mask = label_end <= train_cutoff + 1e-6
+    val_mask = (cutoff_arr >= train_cutoff - 1e-6) & (label_end <= val_cutoff + 1e-6)
+    test_mask = cutoff_arr >= val_cutoff - 1e-6
 
     train_idx = np.where(train_mask)[0].astype(np.int64)
     val_idx = np.where(val_mask)[0].astype(np.int64)
@@ -101,9 +122,11 @@ def forward_chain_split(
 
     # Assert mathematically zero overlap and zero label bleed across boundaries.
     if train_idx.size > 0 and val_idx.size > 0:
-        assert float(cutoff_ts[train_idx].max()) + max_horizon_seconds <= float(cutoff_ts[val_idx].min()) + 1e-5
+        assert float(label_end[train_idx].max()) <= float(cutoff_arr[val_idx].min()) + 1e-5
+        assert float(cutoff_arr[train_idx].max()) + effective_embargo <= float(cutoff_arr[val_idx].min()) + 1e-5
     if val_idx.size > 0 and test_idx.size > 0:
-        assert float(cutoff_ts[val_idx].max()) + max_horizon_seconds <= float(cutoff_ts[test_idx].min()) + 1e-5
+        assert float(label_end[val_idx].max()) <= float(cutoff_arr[test_idx].min()) + 1e-5
+        assert float(cutoff_arr[val_idx].max()) + effective_embargo <= float(cutoff_arr[test_idx].min()) + 1e-5
 
     return ForwardChainSplit(
         train_idx=train_idx,
@@ -111,7 +134,37 @@ def forward_chain_split(
         test_idx=test_idx,
         train_cutoff_ts=train_cutoff,
         val_cutoff_ts=val_cutoff,
-        embargo_seconds=max_horizon_seconds,
+        embargo_seconds=effective_embargo,
+    )
+
+
+def forward_chain_split_dataset(
+    dataset: BuiltDataset,
+    *,
+    train_frac: float = 0.60,
+    val_frac: float = 0.20,
+) -> ForwardChainSplit:
+    """Split a BuiltDataset using its full worst-case label look-ahead and actual per-sample max_label_ts."""
+    max_h = float(max(dataset.spec.horizons_minutes) * 60)
+    settle_w = float(dataset.manifest.get("settle_window_seconds", DEFAULT_SETTLE_WINDOW_SECONDS))
+    power_gap = float(dataset.manifest.get("max_power_gap_seconds", MAX_POWER_GAP_SECONDS))
+    embargo_s = max_h + settle_w + power_gap
+    max_label_ts = np.asarray(
+        [
+            float(m.get("max_label_ts", float(c) + embargo_s))
+            for c, m in zip(dataset.cutoff_ts, dataset.metadata)
+        ],
+        dtype=np.float64,
+    )
+    return forward_chain_split(
+        dataset.cutoff_ts,
+        max_horizon_seconds=max_h,
+        settle_window_seconds=settle_w,
+        max_power_gap_seconds=power_gap,
+        embargo_seconds=embargo_s,
+        max_label_ts=max_label_ts,
+        train_frac=train_frac,
+        val_frac=val_frac,
     )
 
 
@@ -333,8 +386,7 @@ def train_and_evaluate(
     """Train ThermostatShadowGRU with forward-chaining split, calibrate on val, and evaluate."""
     _set_deterministic_seed(seed)
     gates = gates or ReadinessGates()
-    max_horizon_s = float(max(dataset.spec.horizons_minutes) * 60)
-    split = forward_chain_split(dataset.cutoff_ts, max_horizon_seconds=max_horizon_s)
+    split = forward_chain_split_dataset(dataset)
 
     base_artifact = build_untrained_artifact(dataset.site, dataset.spec, seed=seed)
     model = base_artifact.model

@@ -45,7 +45,7 @@ from .nn_model import ModelVersionMismatchError, load_checkpoint
 from .runtime import ShadowRuntime, ShadowRuntimeConfig
 from .scoring import ScoringPolicy
 from .synthetic import generate_synthetic_history
-from .train import ReadinessGates, forward_chain_split, train_and_evaluate
+from .train import ReadinessGates, forward_chain_split, forward_chain_split_dataset, train_and_evaluate
 
 LOG = logging.getLogger("neural-shadow")
 
@@ -161,7 +161,7 @@ def _cmd_train(args: argparse.Namespace) -> int:
 def _cmd_evaluate(args: argparse.Namespace) -> int:
     ds = load_dataset(Path(args.dataset))
     artifact = load_checkpoint(Path(args.checkpoint), expected_site=ds.site, expected_spec=ds.spec, strict=True)
-    split = forward_chain_split(ds.cutoff_ts, max_horizon_seconds=float(max(ds.spec.horizons_minutes) * 60))
+    split = forward_chain_split_dataset(ds)
     report = evaluate_all_models(artifact, ds, split.train_idx, split.val_idx, split.test_idx)
     if args.output:
         Path(args.output).parent.mkdir(parents=True, exist_ok=True)

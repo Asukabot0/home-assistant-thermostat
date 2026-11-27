@@ -65,7 +65,12 @@ from neural_shadow.nn_model import (  # noqa: E402
 from neural_shadow.runtime import ShadowRuntime, ShadowRuntimeConfig  # noqa: E402
 from neural_shadow.scoring import ScoringPolicy, evaluate_and_rank_candidates, score_candidate_prediction  # noqa: E402
 from neural_shadow.synthetic import generate_synthetic_history  # noqa: E402
-from neural_shadow.train import ReadinessGates, forward_chain_split, train_and_evaluate  # noqa: E402
+from neural_shadow.train import (  # noqa: E402
+    ReadinessGates,
+    forward_chain_split,
+    forward_chain_split_dataset,
+    train_and_evaluate,
+)
 from run_neural_shadow_e2e import run_e2e  # noqa: E402
 
 
@@ -189,6 +194,29 @@ class NeuralShadowRegressionTests(unittest.TestCase):
                 else r
                 for r in hist_b.power_reports[u]
             ]
+        for u in hist_b.proxy_states:
+            hist_b.proxy_states[u] = [
+                ProxyStateEvent(
+                    r.unit, r.at, "cool" if r.mode != "cool" else "heat", 19.0, 29.0, manual_hold=True, uncertain=True
+                )
+                if r.at > t0
+                else r
+                for r in hist_b.proxy_states[u]
+            ]
+        hist_b.actions = [
+            ActionEvent(
+                a.at, a.sent_at, a.unit, "manual_change", "off", 18.0, "cool", 19.0, "manual_external", "unconfirmed", False,
+                quality_flags=("failed_call", "manual_operation"),
+            )
+            if a.at > t0
+            else a
+            for a in hist_b.actions
+        ] + [
+            ActionEvent(
+                t0 + 60.0, t0 + 55.0, self.site.unit_names[0], "mode", "off", 24.0, "cool", 19.0, "controller", "unconfirmed",
+                False, quality_flags=("failed_call",),
+            )
+        ]
 
         xh_a, meta_a = extract_history_window(_HistoryIndex(hist_a), self.spec, t0)
         xh_b, meta_b = extract_history_window(_HistoryIndex(hist_b), self.spec, t0)
@@ -196,15 +224,18 @@ class NeuralShadowRegressionTests(unittest.TestCase):
         self.assertEqual(meta_a["zone_temps"], meta_b["zone_temps"])
         self.assertEqual(meta_a["unit_watts"], meta_b["unit_watts"])
         self.assertEqual(meta_a["env_temps"], meta_b["env_temps"])
+        self.assertEqual(meta_a["unit_modes"], meta_b["unit_modes"])
+        self.assertEqual(meta_a["unit_setpoints"], meta_b["unit_setpoints"])
 
-        # Forward-chaining split embargo check (60m label horizon cannot cross into val or test)
+        # Forward-chaining split embargo check (full 60m + settle_window + power_gap cannot cross into val or test)
         ds = build_dataset(hist_a)
-        split = forward_chain_split(ds.cutoff_ts, max_horizon_seconds=3600.0)
+        split = forward_chain_split_dataset(ds)
         self.assertGreater(split.train_idx.size, 0)
         self.assertGreater(split.val_idx.size, 0)
         self.assertGreater(split.test_idx.size, 0)
-        self.assertLessEqual(float(ds.cutoff_ts[split.train_idx].max()) + 3600.0, float(ds.cutoff_ts[split.val_idx].min()) + 1e-5)
-        self.assertLessEqual(float(ds.cutoff_ts[split.val_idx].max()) + 3600.0, float(ds.cutoff_ts[split.test_idx].min()) + 1e-5)
+        self.assertGreaterEqual(split.embargo_seconds, 4020.0)
+        self.assertLessEqual(float(ds.cutoff_ts[split.train_idx].max()) + split.embargo_seconds, float(ds.cutoff_ts[split.val_idx].min()) + 1e-5)
+        self.assertLessEqual(float(ds.cutoff_ts[split.val_idx].max()) + split.embargo_seconds, float(ds.cutoff_ts[split.test_idx].min()) + 1e-5)
 
         # Normalizer fitted on train split MUST be completely unaffected by mutating test split by +100
         norm_1 = FeatureNormalizer.fit(
@@ -224,6 +255,77 @@ class NeuralShadowRegressionTests(unittest.TestCase):
         np.testing.assert_array_equal(norm_1.hist_mean, norm_2.hist_mean)
         np.testing.assert_array_equal(norm_1.hist_std, norm_2.hist_std)
         np.testing.assert_array_equal(norm_1.hist_fill, norm_2.hist_fill)
+
+    # B5 regression: embargo must cover late temp reports (+settle_window) and closing power reports (+max_power_gap)
+    def test_b5_embargo_covers_late_temp_and_power_label_lookahead(self):
+        base = 1_800_000_000.0
+        # Sparse ~9-minute temperature reports and ~90-second power reports so 60m labels routinely land > t0+3600s
+        raw_temp = []
+        raw_env = []
+        raw_power = []
+        proxy_by_unit = {u: [] for u in self.site.unit_names}
+        total_min = 36 * 60
+        for m in range(0, total_min + 1, 9):
+            t = base + m * 60.0 + 40.0
+            for z in self.site.zones:
+                raw_temp.append(TempReport(z.name, "zone_primary", z.primary_entity, t, 23.8, t + 2.0, "fresh", is_exact_precision=True))
+        for m in range(0, total_min + 1, 10):
+            t = base + m * 60.0
+            raw_env.append(TempReport("outdoor_reference", "environment", "outdoor_reference", t, 18.0, t, "fresh", is_exact_precision=True))
+        t_p = base
+        while t_p <= base + total_min * 60.0 + 180.0:
+            for act in self.site.actuators:
+                raw_power.append(PowerReport(act.name, act.power_entity, "ep1", t_p, 200.0))
+            t_p += 90.0
+        for m in range(0, total_min + 1, 5):
+            t = base + m * 60.0
+            for act in self.site.actuators:
+                proxy_by_unit[act.name].append(ProxyStateEvent(act.name, t, "heat", 23.0, 24.0, source_fresh=True))
+
+        hist = _finalize_canonical(
+            site=self.site,
+            data_origin=DataOrigin.SYNTHETIC.value,
+            source_description="b5_late_reports_fixture",
+            raw_temp=raw_temp,
+            raw_env=raw_env,
+            raw_power=raw_power,
+            proxy_by_unit=proxy_by_unit,
+            actions=[],
+            config_versions=[],
+            quality_counts={},
+        )
+        ds = build_dataset(hist)
+        split = forward_chain_split_dataset(ds)
+
+        self.assertEqual(split.embargo_seconds, 3600.0 + 300.0 + 120.0)
+        self.assertGreater(split.train_idx.size, 0)
+        self.assertGreater(split.val_idx.size, 0)
+        self.assertGreater(split.test_idx.size, 0)
+
+        # Confirm late reports (> t0 + 3600s) genuinely exist in the dataset AND are tracked accurately in max_label_ts
+        late_label_count = sum(
+            1
+            for i in range(ds.cutoff_ts.size)
+            if ds.metadata[i]["max_label_ts"] > float(ds.cutoff_ts[i]) + 3600.0 + 1.0
+        )
+        self.assertGreater(late_label_count, 50)
+
+        val_start = float(ds.cutoff_ts[split.val_idx].min())
+        test_start = float(ds.cutoff_ts[split.test_idx].min())
+        for idx in split.train_idx:
+            m = ds.metadata[int(idx)]
+            self.assertLessEqual(m["max_label_ts"], val_start + 1e-5)
+            for z_times in m["label_report_times"].values():
+                for rep_ts in z_times.values():
+                    if rep_ts is not None:
+                        self.assertLessEqual(rep_ts, val_start + 1e-5)
+        for idx in split.val_idx:
+            m = ds.metadata[int(idx)]
+            self.assertLessEqual(m["max_label_ts"], test_start + 1e-5)
+            for z_times in m["label_report_times"].values():
+                for rep_ts in z_times.values():
+                    if rep_ts is not None:
+                        self.assertLessEqual(rep_ts, test_start + 1e-5)
 
     # 3. Shared sensors & future sensor mapping configurability
     def test_shared_sensor_not_double_counted_and_future_sensors_configurable(self):
