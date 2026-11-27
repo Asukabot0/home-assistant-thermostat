@@ -554,7 +554,315 @@ def release_groups(audit, frames, power, meter_by_unit, zones, commands, start, 
     return results
 
 
-def collect(root, start, end, runtime, key, *, previous_archive=None):
+def read_neural_shadow(folder, start, end, schema):
+    """Read-only, exception-isolated export of neural shadow scores, gaps, health, freshness, and versions."""
+    acquired = time()
+    try:
+        folder = Path(folder)
+        status_path = folder / "neural-shadow-status.json"
+        health_path = folder / "neural-shadow-health.json"
+        scores_path = folder / "neural-shadow-scores.jsonl"
+
+        pub_token = lambda v: v if isinstance(v, str) and re.fullmatch(r"[a-z][a-z0-9_-]{0,55}", v) else None
+        iso_token = (
+            lambda v: v
+            if isinstance(v, str)
+            and stamp(v) is not None
+            and re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})", v)
+            else None
+        )
+
+        def safe_num(v):
+            if isinstance(v, bool):
+                return None
+            return num(v)
+
+        def safe_int(v, *, low=-10**12, high=10**12):
+            x = safe_num(v)
+            if x is None or abs(x - round(x)) > 1e-6 or not (low <= x <= high):
+                return None
+            return int(round(x))
+
+        status_raw = {}
+        status_error = None
+        if status_path.is_file():
+            try:
+                loaded_status = load_json(status_path)
+            except Exception as exc:
+                status_error = type(exc).__name__
+            else:
+                if isinstance(loaded_status, dict):
+                    status_raw = loaded_status
+                else:
+                    status_error = "InvalidStatusType"
+
+        health_raw = {}
+        health_error = None
+        if health_path.is_file():
+            try:
+                loaded_health = load_json(health_path)
+            except Exception as exc:
+                health_error = type(exc).__name__
+            else:
+                if isinstance(loaded_health, dict):
+                    health_raw = loaded_health
+                else:
+                    health_error = "InvalidHealthType"
+
+        model_raw = status_raw.get("model")
+        if model_raw is not None and not isinstance(model_raw, dict):
+            status_error = status_error or "InvalidModelType"
+            model_info = {}
+        else:
+            model_info = model_raw or {}
+
+        raw_model_id = model_info.get("model_id")
+        model_id_tok = (
+            schema.id("ns_model", raw_model_id)
+            if isinstance(raw_model_id, (str, int, float)) and not isinstance(raw_model_id, bool) and raw_model_id != ""
+            else None
+        )
+        versions = {
+            "model_id": model_id_tok,
+            "model_state": pub_token(model_info.get("model_state")),
+            "deployment_eligible": bool(model_info.get("deployment_eligible", False))
+            if isinstance(model_info.get("deployment_eligible"), bool)
+            else False,
+            "model_arch_version": pub_token(model_info.get("model_arch_version")),
+            "feature_version": pub_token(model_info.get("feature_version")),
+            "constraint_version": pub_token(model_info.get("constraint_version")),
+            "config_fingerprint": model_info.get("config_fingerprint")
+            if isinstance(model_info.get("config_fingerprint"), str)
+            and HEXDIGEST.fullmatch(model_info["config_fingerprint"])
+            else None,
+            "training_cutoff_utc": iso_token(model_info.get("training_cutoff_utc")),
+            "data_origin": pub_token(model_info.get("data_origin")),
+            "parameter_count": safe_int(model_info.get("parameter_count"), low=0),
+        }
+
+        # Check health state, fail-closed status, and freshness (> 2 * poll_interval_seconds -> stale/unavailable)
+        raw_poll = safe_num(status_raw.get("poll_interval_seconds"))
+        if raw_poll is None or not (10.0 <= raw_poll <= 86400.0):
+            raw_poll = safe_num(health_raw.get("poll_interval_seconds"))
+        poll_s = raw_poll if (raw_poll is not None and 10.0 <= raw_poll <= 86400.0) else 300.0
+        max_stale_s = 2.0 * poll_s
+
+        status_ts = safe_num(status_raw.get("generated_at"))
+        if status_ts is None:
+            gen_utc = iso_token(status_raw.get("generated_at_utc"))
+            status_ts = stamp(gen_utc) if gen_utc is not None else None
+        health_ts = safe_num(health_raw.get("at"))
+        if health_ts is None:
+            h_utc = iso_token(health_raw.get("at_utc"))
+            health_ts = stamp(h_utc) if h_utc is not None else None
+        fresh_ts_candidates = [t for t in (status_ts, health_ts) if t is not None]
+        latest_ts = max(fresh_ts_candidates) if fresh_ts_candidates else None
+
+        health_state = pub_token(health_raw.get("state"))
+        status_state = pub_token(status_raw.get("state"))
+        health_model_state = pub_token(health_raw.get("model_state"))
+        health_overrides_status = health_ts is None or status_ts is None or health_ts >= status_ts - 1.0
+
+        age_vs_now = (acquired - latest_ts) if latest_ts is not None else None
+        age_vs_end = (end - latest_ts) if latest_ts is not None else None
+        is_stale = (
+            latest_ts is None
+            or (age_vs_now is not None and age_vs_now > max_stale_s)
+            or (age_vs_end is not None and age_vs_end > max_stale_s)
+        )
+
+        fail_reason = None
+        outward_status = "available"
+        if status_error is not None or health_error is not None:
+            outward_status = "unavailable"
+            fail_reason = "corrupt_status_or_health"
+            versions["model_state"] = "unavailable"
+            versions["deployment_eligible"] = False
+        elif not (status_path.is_file() or health_path.is_file()):
+            outward_status = "unavailable"
+            fail_reason = "status_missing"
+            versions["model_state"] = "unavailable"
+            versions["deployment_eligible"] = False
+        elif (
+            (health_overrides_status and (health_state == "version_mismatch" or health_model_state == "version_mismatch"))
+            or status_state == "version_mismatch"
+            or versions["model_state"] == "version_mismatch"
+        ):
+            outward_status = "unavailable"
+            fail_reason = "version_mismatch"
+            versions["model_state"] = "version_mismatch"
+            versions["deployment_eligible"] = False
+        elif (
+            (health_overrides_status and health_state in {"unavailable", "error"})
+            or status_state in {"unavailable", "error"}
+            or versions["model_state"] == "unavailable"
+        ):
+            outward_status = "unavailable"
+            fail_reason = health_state if (health_overrides_status and health_state in {"unavailable", "error"}) else (status_state or "unavailable")
+            versions["model_state"] = "unavailable"
+            versions["deployment_eligible"] = False
+        elif is_stale:
+            outward_status = "unavailable"
+            fail_reason = "stale"
+            versions["model_state"] = "stale"
+            versions["deployment_eligible"] = False
+
+        rows = []
+        skipped_malformed_rows = 0
+        if scores_path.is_file():
+            with scores_path.open("r", encoding="utf-8", errors="replace") as stream:
+                for line in stream:
+                    if not line.strip():
+                        continue
+                    try:
+                        rec = json.loads(line)
+                        if not isinstance(rec, dict):
+                            skipped_malformed_rows += 1
+                            continue
+                        end_ts = safe_num(rec.get("horizon_end_ts"))
+                        if end_ts is None or not (start <= end_ts < end):
+                            continue
+                        h_min = safe_int(rec.get("horizon_minutes"), low=1, high=1440)
+                        if h_min is None:
+                            skipped_malformed_rows += 1
+                            continue
+                        zone_errs = {}
+                        raw_zone_errs = rec.get("factual_hold_temp_errors")
+                        if isinstance(raw_zone_errs, dict):
+                            for z, zval in raw_zone_errs.items():
+                                if not isinstance(z, str) or not isinstance(zval, dict):
+                                    continue
+                                z_alias = schema.aliases.get(z, schema.id("zones", z))
+                                z_out = {}
+                                for k in ("pred_delta_c", "actual_delta_c", "signed_error_c", "abs_error_c", "sigma_c", "within_pi80"):
+                                    if k not in zval:
+                                        continue
+                                    z_out[k] = bool(zval[k]) if k == "within_pi80" else safe_num(zval.get(k))
+                                zone_errs[z_alias] = z_out
+                        elif raw_zone_errs is not None:
+                            skipped_malformed_rows += 1
+                            continue
+                        wh_err_raw = rec.get("factual_hold_wh_error")
+                        wh_err = (
+                            {
+                                k: (bool(wh_err_raw[k]) if k == "within_pi80" else safe_num(wh_err_raw.get(k)))
+                                for k in ("pred_total_wh", "actual_total_wh", "signed_error_wh", "abs_error_wh", "sigma_wh", "within_pi80")
+                                if k in wh_err_raw
+                            }
+                            if isinstance(wh_err_raw, dict)
+                            else None
+                        )
+                        raw_pid = rec.get("prediction_id")
+                        pid_val = raw_pid if isinstance(raw_pid, (str, int, float)) and not isinstance(raw_pid, bool) else None
+                        rows.append(
+                            {
+                                "id": schema.id("ns_score", (pid_val, h_min)),
+                                "horizon_minutes": h_min,
+                                "cutoff_ts": safe_num(rec.get("cutoff_ts")),
+                                "horizon_end_ts": end_ts,
+                                "intervened": bool(rec.get("intervened", False)),
+                                "factual_settlement_kind": pub_token(rec.get("factual_settlement_kind")),
+                                "recommended_execution_status": pub_token(rec.get("recommended_execution_status")),
+                                "model_state": pub_token(rec.get("model_state")),
+                                "model_arch_version": pub_token(rec.get("model_arch_version")),
+                                "feature_version": pub_token(rec.get("feature_version")),
+                                "config_fingerprint": rec.get("config_fingerprint")
+                                if isinstance(rec.get("config_fingerprint"), str)
+                                and HEXDIGEST.fullmatch(rec["config_fingerprint"])
+                                else None,
+                                "training_cutoff_ts": safe_num(rec.get("training_cutoff_ts")),
+                                "factual_hold_temp_errors": zone_errs,
+                                "factual_hold_wh_error": wh_err,
+                                "joint_wh_coverage_ratio": safe_num(rec.get("joint_wh_coverage_ratio")),
+                                "joint_wh_has_gap": bool(rec.get("joint_wh_has_gap", True)),
+                                "joint_wh_label_valid": bool(rec.get("joint_wh_label_valid", False)),
+                            }
+                        )
+                    except Exception:
+                        skipped_malformed_rows += 1
+                        continue
+        rows.sort(key=lambda r: (r["horizon_end_ts"], r["horizon_minutes"], r["id"]))
+        by_horizon = {}
+        for h_min in sorted({r["horizon_minutes"] for r in rows} | {15, 30, 60}):
+            h_rows = [r for r in rows if r["horizon_minutes"] == h_min]
+            f_rows = [r for r in h_rows if not r["intervened"]]
+            z_keys = sorted({z for r in f_rows for z in r["factual_hold_temp_errors"]})
+            z_summary = {}
+            for z in z_keys:
+                errs = [r["factual_hold_temp_errors"][z] for r in f_rows if z in r["factual_hold_temp_errors"]]
+                abs_e = [e["abs_error_c"] for e in errs if e.get("abs_error_c") is not None]
+                sgn_e = [e["signed_error_c"] for e in errs if e.get("signed_error_c") is not None]
+                cov_e = [1.0 if e.get("within_pi80") else 0.0 for e in errs if "within_pi80" in e]
+                z_summary[z] = {
+                    "n_factual": len(abs_e),
+                    "mae_c": round(sum(abs_e) / len(abs_e), 4) if abs_e else None,
+                    "bias_c": round(sum(sgn_e) / len(sgn_e), 4) if sgn_e else None,
+                    "pi80_coverage": round(sum(cov_e) / len(cov_e), 4) if cov_e else None,
+                }
+            wh_errs = [
+                r["factual_hold_wh_error"]
+                for r in f_rows
+                if r.get("factual_hold_wh_error")
+                and not r.get("joint_wh_has_gap", True)
+                and r.get("joint_wh_label_valid", False)
+            ]
+            wh_abs = [e["abs_error_wh"] for e in wh_errs if e.get("abs_error_wh") is not None]
+            covs = [r["joint_wh_coverage_ratio"] for r in h_rows if r.get("joint_wh_coverage_ratio") is not None]
+            gaps_n = sum(1 for r in h_rows if r.get("joint_wh_has_gap"))
+            by_horizon[f"{h_min}m"] = {
+                "n_settled": len(h_rows),
+                "n_factual_hold": len(f_rows),
+                "n_intervened_excluded": sum(1 for r in h_rows if r["intervened"]),
+                "zones": z_summary,
+                "total_wh_mae": round(sum(wh_abs) / len(wh_abs), 2) if wh_abs else None,
+                "mean_joint_coverage_ratio": round(sum(covs) / len(covs), 4) if covs else None,
+                "coverage_gap_count": gaps_n,
+                "has_coverage_gap": gaps_n > 0 or (len(h_rows) == 0),
+            }
+        summary = {
+            "status": outward_status,
+            "reason": fail_reason,
+            "stale": bool(is_stale),
+            "health_state": health_state,
+            "versions": versions,
+            "window_counts": {
+                "settled_total": len(rows),
+                "factual_hold": sum(1 for r in rows if not r["intervened"]),
+                "intervened_excluded": sum(1 for r in rows if r["intervened"]),
+                "counterfactual_unexecuted": sum(
+                    1 for r in rows if r["recommended_execution_status"] == "counterfactual_unexecuted"
+                ),
+                "coverage_gap_count": sum(1 for r in rows if r["joint_wh_has_gap"]),
+            },
+            "window_factual_scores": by_horizon,
+        }
+        err_out = status_error or health_error
+        if err_out is not None:
+            summary["error"] = err_out
+        watermark = {
+            **source_watermark(rows, "horizon_end_ts", acquired, start, end),
+            "status": summary["status"],
+            "reason": fail_reason,
+            "stale": bool(is_stale),
+            "health_state": health_state,
+            "generated_at_utc": iso_token(status_raw.get("generated_at_utc")),
+            "health_at_utc": iso_token(health_raw.get("at_utc")),
+            "status_age_seconds": round(max(0.0, age_vs_now), 1) if age_vs_now is not None else None,
+            "skipped_malformed_rows": skipped_malformed_rows,
+        }
+        if err_out is not None:
+            watermark["error"] = err_out
+        return rows, summary, watermark
+    except Exception as error:
+        err_name = type(error).__name__
+        return (
+            [],
+            {"status": "unavailable", "error": err_name},
+            {"acquired_at": iso(acquired), "status": "unavailable", "error": err_name, "window_from": start, "window_to": end},
+        )
+
+
+def collect(root, start, end, runtime, key, *, previous_archive=None, neural_shadow_dir=None):
     captured = time()
     audit_floor = end-86400
     folder = root/"pilot-data"
@@ -660,6 +968,23 @@ def collect(root, start, end, runtime, key, *, previous_archive=None):
         reconciled = sum((Counter(row["statistics"]["controller_errors"]) for row in periods), Counter())
         if totals["controller_errors"] != reconciled:
             raise ValueError("Controller errors must reconcile across deployment windows")
+    if neural_shadow_dir is not None:
+        try:
+            ns_rows, ns_summary, ns_mark = read_neural_shadow(neural_shadow_dir, start, end, schema)
+        except Exception as error:
+            err_name = type(error).__name__
+            ns_rows = []
+            ns_summary = {"status": "unavailable", "error": err_name}
+            ns_mark = {
+                "acquired_at": iso(captured),
+                "status": "unavailable",
+                "error": err_name,
+                "window_from": start,
+                "window_to": end,
+            }
+        raw["neural-shadow-scores"] = ns_rows
+        summary["neural_shadow"] = ns_summary
+        marks["neural_shadow"] = ns_mark
     return {"captured_at":captured,"runtime":runtime,"raw":raw,"status":{"last_completed_cycle":latest,**status},
             "effective":schema.configuration(rooms,topology,policy),"configurations":versions,"summary":summary,"watermarks":marks,
             "private_values":[k for k in schema.aliases if "." in k]}

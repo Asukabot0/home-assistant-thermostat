@@ -19,3 +19,9 @@ __pycache__/
 /home-assistant/shadow/.release
 /home-assistant/release-backups/
 /home-assistant/shadow/topology.json
+/home-assistant/neural-shadow-data/
+/home-assistant/neural-shadow-models/
+/home-assistant/neural_shadow/config.json
+*.pt
+*.npz
+

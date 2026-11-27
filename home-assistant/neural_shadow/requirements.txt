@@ -1,0 +1,5 @@
+# CPU-only PyTorch recommended for inference and training on host/Docker:
+#   pip install --index-url https://download.pytorch.org/whl/cpu "torch>=2.5,<2.8"
+#   pip install "numpy>=1.26,<3.0"
+numpy>=1.26,<3.0
+torch>=2.5,<2.8

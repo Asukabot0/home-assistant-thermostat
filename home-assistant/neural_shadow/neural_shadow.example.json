@@ -1,0 +1,34 @@
+{
+  "schema": 1,
+  "description": "Independent neural-network thermostat shadow runtime configuration (read-only inputs, zero actuation path).",
+  "inputs": {
+    "rooms_file": "/opt/shadow-config/rooms.json",
+    "topology_file": "/opt/shadow-config/topology.json",
+    "policy_file": "/opt/shadow-config/house_policy.json",
+    "ha_config_dir": "/ha-readonly",
+    "shadow_data_dir": "/shadow-data-ro",
+    "pilot_data_dir": "/pilot-data-ro"
+  },
+  "model": {
+    "artifact_dir": "/models",
+    "checkpoint_name": "thermostat_shadow_gru.pt",
+    "expected_feature_version": "ns-feat-v1",
+    "expected_arch_version": "ns-gru-v1"
+  },
+  "outputs": {
+    "state_dir": "/state",
+    "output_dir": "/output"
+  },
+  "runtime": {
+    "poll_interval_seconds": 300,
+    "cycle_timeout_seconds": 25,
+    "history_minutes": 180,
+    "step_minutes": 5,
+    "horizons_minutes": [15, 30, 60],
+    "settle_window_seconds": 300,
+    "min_wh_label_coverage": 1.0,
+    "max_uncertainty_c": 0.8,
+    "ood_temp_margin_c": 3.0,
+    "ood_outdoor_margin_c": 5.0
+  }
+}
