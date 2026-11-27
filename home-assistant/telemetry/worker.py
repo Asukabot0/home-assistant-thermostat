@@ -14,8 +14,9 @@ import subprocess
 from tempfile import NamedTemporaryFile
 from time import sleep, time
 from urllib.request import Request, urlopen
+from zipfile import ZipFile
 
-from evidence import BEIJING, audit_rows, bundle, collect, iso, json_bytes, load_json, stamp, verify_zip, write_zip
+from evidence import BEIJING, audit_rows, bundle, collect, iso, json_bytes, load_json, observed_versions, stamp, verify_zip, write_zip
 
 
 HOUR = 3600
@@ -168,7 +169,8 @@ class GitHub:
         old=self.api("/contents/"+filename+"?ref=telemetry",optional=True)
         ordered=sorted(records,key=lambda v:(v["end"],v["revision"],v["kind"]))
         public=[{"from_utc":iso(v["start"]),"to_utc":iso(v["end"]),"from_beijing":iso(v["start"],BEIJING),
-                 "to_beijing":iso(v["end"],BEIJING),**{k:v.get(k) for k in ("kind","revision","commit","url","sha256","upload_status","supersedes")}}
+                 "to_beijing":iso(v["end"],BEIJING),**{k:v.get(k) for k in ("kind","revision","url","sha256","upload_status","supersedes")},
+                 "capture_commit":v["commit"], "observed_versions":v.get("observed_versions",[])}
                 for v in ordered[-192:]]
         data=json_bytes({"schema":1,"latest":public[-1] if public else None,"packages":public})
         if old and base64.b64decode(old["content"])==data:
@@ -220,12 +222,21 @@ def perform(config, directory, state, gh, now):
     current=runtime(config,root,now)
     release=current["startup"]
     commit=release["commit"]
-    cursor=state.setdefault("cursor",int(release["at"])//HOUR*HOUR)
+    # On initial installation also schedule the complete hour preceding the
+    # current clock hour. It remains tagged with its actual historical release.
+    state.setdefault("cursor",min(int(release["at"])//HOUR*HOUR,int(now)//HOUR*HOUR-HOUR))
+    for record in state["uploaded"]:
+        path_to_zip=spool/record["file"]
+        if "observed_versions" not in record and path_to_zip.is_file():
+            verify_zip(path_to_zip,record["sha256"])
+            with ZipFile(path_to_zip) as archive:
+                record["observed_versions"]=observed_versions(json.loads(archive.read("summary.json")))
     # Resend staged operations first. Network errors retain the archive and
     # neither discard that window nor move its durable cursor.
     if state.get("pending"):
         send_pending(directory,state,gh)
-    if not state.get("initial_verified"):
+    release_key=[commit,release["config_sha256"]]
+    if state.get("initial_verified")!=release_key:
         end=max(int(release["at"])+1,int(now))
         if end > now:
             end=now
@@ -277,7 +288,9 @@ def package(config,directory,state,gh,current,window,kind,revision_only=False):
     os.replace(temp,target)
     state["pending"]={"file":filename,"sha256":digest,"logical_sha256":manifest["logical_sha256"],
                       "start":start,"end":end,"kind":kind,"revision":revision,"supersedes":last["url"] if last else None,
-                      "advance":kind=="hourly" and not revision_only,"commit":current["startup"]["commit"],"upload_status":"queued"}
+                      "advance":kind=="hourly" and not revision_only,"commit":current["startup"]["commit"],
+                      "config_sha256":current["startup"]["config_sha256"],"observed_versions":manifest["observed_versions"],
+                      "upload_status":"queued"}
     atomic(path,state)
     send_pending(directory,state,gh)
 
@@ -295,7 +308,7 @@ def send_pending(directory,state,gh):
     if record["advance"]:
         state["cursor"]=max(state["cursor"],record["end"])
     if record["kind"]=="state":
-        state["initial_verified"]=True
+        state["initial_verified"]=[record["commit"],record.get("config_sha256")]
     state["pending"]=None
     atomic(directory/"queue.json",state)
     print(json.dumps({"event":"uploaded","window_end":iso(record["end"]),"sha256":record["sha256"],"url":record["url"]}),flush=True)

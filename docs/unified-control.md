@@ -62,4 +62,4 @@ stateDiagram-v2
 
 `work/install_telemetry.py` 在 macOS 安装 `local.codex.home-assistant.thermostat-telemetry`。每小时第 5 分钟运行，时间窗用 UTC 计算并映射北京时间。安装后从同一入口立即上传状态包。该用户服务随 Docker Desktop 登录环境运行，睡眠或关机漏跑后以游标补齐。任务状态和日志位于 `~/Library/Application Support/HomeAssistantThermostat/telemetry/`。停止可执行 `launchctl bootout gui/$(id -u)/local.codex.home-assistant.thermostat-telemetry`，并用 `launchctl disable` 持久停用。
 
-采集器只读，独立 SQLite 查询事务包含已提交的 WAL，跨库分别记录采集时刻和水位。游标在下载验证 ZIP、逐文件 SHA 和远端索引完成后推进。失败在队列留下包和窗口，使用互斥锁、限时及有限退避。最近已上传窗口重新对账接收晚到的数据；修订作为不同附件链接。状态包与小时包的范围在 manifest 明列。只在确认上传后清理本地任务副本。GitHub 用 `telemetry-` 日期预发布件及 `telemetry-index.json` 索引，遇不可变 Release 使用独立日期窗口附件。认证由安装用户已有 GitHub CLI 凭据提供，白名单及本地 HMAC 对来源、设备和区域匿名化。首包及小时包均不以短窗口推断长期节电或恒温改善。
+采集器只读，独立 SQLite 查询事务包含已提交的 WAL，跨库分别记录采集时刻和水位。游标在下载验证 ZIP、逐文件 SHA 和远端索引完成后推进。失败在队列留下包和窗口，使用互斥锁、限时及有限退避。最近已上传窗口重新对账接收晚到的数据；修订作为不同附件链接。状态包与小时包的范围在 manifest 明列。索引分别列出采集时提交与观测窗口内的版本，补传旧窗口保留其真实部署归属。只在确认上传后清理本地任务副本。GitHub 用 `telemetry-` 日期预发布件及 `telemetry-index.json` 索引，遇不可变 Release 使用独立日期窗口附件。认证由安装用户已有 GitHub CLI 凭据提供，白名单及本地 HMAC 对来源、设备和区域匿名化。首包及小时包均不以短窗口推断长期节电或恒温改善。

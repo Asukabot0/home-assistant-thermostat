@@ -607,6 +607,12 @@ def collect(root, start, end, runtime, key):
             "private_values":[k for k in schema.aliases if "." in k]}
 
 
+def observed_versions(stats):
+    return [{"from_utc":iso(row["start"]),"to_utc":iso(row["end"]),
+             **{k:(row.get("version") or {}).get(k) for k in ("commit","config_sha256","code_sha256")}}
+            for row in stats.get("by_version", ())]
+
+
 def bundle(window, kind, snapshot, prior, previous_revision):
     observed = snapshot["raw"]
     logical = sha256(json_bytes(observed)).hexdigest()
@@ -620,6 +626,7 @@ def bundle(window, kind, snapshot, prior, previous_revision):
                 "version":snapshot["runtime"],"observation_version":snapshot["effective"]["observation_version"],
                 "sources":snapshot["watermarks"],"coverage":{k:snapshot["summary"]["window"][k] for k in ("joint_coverage_pct","joint_temperature_minutes","minute_coverage")},
                 "preceding_package":prior,"supersedes":previous_revision,"logical_sha256":logical,
+                "observed_versions":observed_versions(snapshot["summary"]),
                 "files":{k:sha256(v).hexdigest() for k,v in files.items()},
                 "evidence_note":"Temperature and meter reports are observations. Device echoes are proxy confirmation. SQLite sources use separate read transactions."}
     files["manifest.json"]=json_bytes(manifest)

@@ -1,4 +1,5 @@
 """Check evidence integrity, privacy, bounded integrations and durable delivery."""
+import base64
 import json
 from pathlib import Path
 import sqlite3
@@ -71,6 +72,19 @@ class TelemetryTests(unittest.TestCase):
                 worker.send_pending(root,state,gh)
             self.assertIsNone(state["pending"])
             self.assertEqual(json.loads((root/"queue.json").read_bytes())["cursor"],3600)
+
+    def test_index_distinguishes_capture_commit_from_historical_window_versions(self):
+        service=worker.GitHub({"gh":"fixture","repo":"owner/repo"})
+        service.api=Mock(side_effect=[{"ref":"refs/heads/telemetry"},None,{}])
+        old="a"*40
+        new="b"*40
+        span={"start":0,"end":3600,"version":{"commit":old}}
+        service.index([{"kind":"hourly","revision":1,"start":0,"end":3600,"commit":new,
+                        "observed_versions":evidence.observed_versions({"by_version":[span]})}],new)
+        payload=service.api.call_args.kwargs["body"]
+        row=json.loads(base64.b64decode(payload["content"]))["latest"]
+        self.assertEqual(row["capture_commit"],new)
+        self.assertEqual(row["observed_versions"][0]["commit"],old)
 
     def test_schedule_uses_complete_utc_hours_and_waits_until_five(self):
         self.assertEqual(worker.last_full_end(3600+299),0)
