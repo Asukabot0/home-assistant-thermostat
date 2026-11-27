@@ -809,6 +809,14 @@ class NeuralShadowRegressionTests(unittest.TestCase):
             with self.assertRaises(ModelVersionMismatchError):
                 load_checkpoint(ckpt, expected_site=site2, expected_spec=self.spec, strict=True)
 
+            # Modified power meter binding or verified_off_power ceiling -> config_fingerprint changes -> mismatch
+            rooms_p = deepcopy(self.site.raw_rooms)
+            rooms_p["bedroom"]["verified_off_power"] = {"entity": rooms_p["bedroom"]["power"], "ceiling_w": 35.0}
+            site_p = build_site_config(rooms_p, self.site.raw_topology, self.site.policy)
+            self.assertNotEqual(site_p.config_fingerprint, self.site.config_fingerprint)
+            with self.assertRaises(ModelVersionMismatchError):
+                load_checkpoint(ckpt, expected_site=site_p, expected_spec=self.spec, strict=True)
+
             # Short dataset -> INSUFFICIENT_DATA
             short_hist = generate_synthetic_history(self.site, hours=10.0, seed=5)
             short_ds = build_dataset(short_hist)

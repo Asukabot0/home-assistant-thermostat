@@ -30,18 +30,5 @@
     "max_uncertainty_c": 0.8,
     "ood_temp_margin_c": 3.0,
     "ood_outdoor_margin_c": 5.0
-  },
-  "readiness_gates": {
-    "min_real_history_hours": 72.0,
-    "min_train_samples": 400,
-    "min_val_samples": 120,
-    "min_test_samples": 120,
-    "min_unique_temp_reports_per_zone": 150,
-    "min_mean_power_coverage": 0.75,
-    "min_action_events_total": 30,
-    "min_active_mode_samples": 60,
-    "min_pi80_coverage": 0.65,
-    "max_pi80_coverage": 0.95,
-    "min_action_response_temp_c": 0.03
   }
 }

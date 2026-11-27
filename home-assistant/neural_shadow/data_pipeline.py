@@ -1421,7 +1421,7 @@ def ingest_canonical_snapshot(snapshot_dir: Path) -> CanonicalHistory:
     ]
     return _finalize_canonical(
         site=site,
-        data_origin=str(meta.get("data_origin", DataOrigin.REAL.value)),
+        data_origin=str(meta.get("data_origin") or "unknown"),
         source_description=str(meta.get("source_description", "snapshot")),
         raw_temp=raw_temp,
         raw_env=raw_env,

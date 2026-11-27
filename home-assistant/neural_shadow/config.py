@@ -279,7 +279,18 @@ def build_site_config(
         "observation_version": configured["observation_version"],
         "topology_fingerprint": configured["fingerprint"],
         "zones": [(z.name, z.primary_sensor, z.primary_entity) for z in zones],
-        "actuators": [(a.name, a.home_zone, sorted(a.influences.items()), a.soft_limits) for a in actuators],
+        "actuators": [
+            (
+                a.name,
+                a.home_zone,
+                sorted(a.influences.items()),
+                a.soft_limits,
+                a.power_entity,
+                a.power_fallback,
+                a.verified_off_ceiling_w,
+            )
+            for a in actuators
+        ],
         "env": [(e.name, e.enabled) for e in env_sensors],
     }
     return SiteConfig(

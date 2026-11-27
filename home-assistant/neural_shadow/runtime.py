@@ -2,7 +2,7 @@
 
 Strict isolation guarantees:
 - Zero actuation path (no HTTP clients, no HA service calls, no write access to pilot/HA dirs).
-- Immutable sealing BEFORE label settlement (tamper-evident seal_sha256).
+- Immutable sealing BEFORE label settlement (integrity-checked SHA-256 digest `seal_sha256`).
 - Strict factual vs counterfactual separation and mid-horizon intervention detection.
 - Full exception and timeout isolation so failures only affect shadow outputs.
 """
