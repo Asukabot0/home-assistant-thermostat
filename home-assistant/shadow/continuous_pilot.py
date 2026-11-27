@@ -140,12 +140,14 @@ def settle(state, live, now, *, trial=True):
                 if TOPOLOGY is None and action["kind"] == "temperature" and action.get("target_at_send") is not None and mode in ACTIVE:
                     state.setdefault("last_mode_setting", {}).setdefault(room, {})[mode] = {
                         "target": action["target_at_send"], "value": setpoint, "at": action["proxy_at"]}
-                if action["purpose"] == "energy_off":
+                if action["purpose"] in {"energy_off", "handoff_off"}:
                     if TOPOLOGY is None and action.get("target_at_send") is not None and numeric(action["before"][1]) is not None:
                         state.setdefault("last_mode_setting", {}).setdefault(room, {})[action["before"][0]] = {
                             "target": action["target_at_send"], "value": action["before"][1], "at": action["proxy_at"]}
                     state.setdefault("parked", {})[room] = {"off_at": action["proxy_at"],
                         "mode": action["before"][0], "started_at": action["before_mode_at"]}
+                    if action["purpose"] == "handoff_off":
+                        state["parked"][room]["handoff"] = True
                 elif action["purpose"] == "energy_start":
                     state.setdefault("parked", {}).pop(room, None)
                 batch = state.get("transitions", {}).get(group(room))
@@ -321,7 +323,7 @@ def assess(live, state, now, advise_room=room_advice, *, trial=True, isolated=()
             or trace["gentle"]["reason"] in {"inside_ideal_band", "peer_comfort_risk", "returning_to_ideal"}))
         if TOPOLOGY is not None:
             binding = member.get("control") or {}
-            invalid = (zone_name != trace["owner"] or binding.get("definition") != TOPOLOGY["fingerprint"]
+            invalid = (zone_name != trace["owner"] or binding.get("definition") != TOPOLOGY["action_versions"][room]
                        or binding.get("source_version") != zone["source_version"] or binding.get("target") != zone["target"]
                        or not zone["qualified"] or zone["direction"] != mode or room not in trace["feasible"].get(zone_name, ()))
             target = zone["target"]
@@ -465,7 +467,7 @@ def display_progress(message, details, trace, selection=None):
         publish(message, details)
         return
     control = {key: trace.get(key) for key in ("topology", "definition", "zones", "environment", "need", "owner",
-                                               "lead", "risks", "candidates", "rejections", "pending_rooms", "unmet")}
+                                               "lead", "risks", "candidates", "rejections", "pending_rooms", "unmet", "handoff", "conflict", "yielding_blocks", "elected")}
     control.update(at=time(), selected=selection)
     publish(message, details, control=control)
 
@@ -514,7 +516,7 @@ def cycle(call):
     checked, confirmed = assess(refreshed, state, time(), trial=trial, isolated=isolated, trace=verification,
                                 inputs=refreshed_inputs, paused=paused)
     scope_key = lambda t: tuple((t.get("action_scopes", {}).get(room) or {}).get(k)
-                                for k in ("zone", "target", "definition", "source_version"))
+                                for k in ("zone", "target", "definition", "source_version", "handoff_at", "handoff_phase"))
     if selection != confirmed or scope_key(trace) != scope_key(verification) or read_permit(time()) != permit:
         if selection == confirmed:
             ended = cancel_gentle(state, time(), "permit_inactive")

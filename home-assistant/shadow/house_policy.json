@@ -34,6 +34,7 @@
   "tracking_report_span_seconds": 600,
   "tracking_history_seconds": 3600,
   "tracking_gap_seconds": 1200,
+  "recovery_settle_seconds": 600,
   "maintain_confirmation_seconds": 1200,
   "effect_sample_wait_seconds": 600,
   "effect_max_seconds": 2400,

@@ -61,8 +61,15 @@ def final_gate(candidate, now, live, readings, connected, state, configurations,
             return "无效运行模式"
         stronger = (kind == "mode" and value in ACTIVE or kind == "temperature" and
                     purpose != "initial_safety_easing" and increases_output(mode, setpoint, value))
+        plan = trace.get("handoff")
+        if purpose in {"handoff_reduce", "handoff_off"}:
+            phase = "reduce" if purpose == "handoff_reduce" else "exit"
+            if not plan or plan["blocker"] != room or plan["phase"] != phase or plan["owner"] != trace["owner"]:
+                return "协调退出阶段不再有效"
         if stronger:
-            from zone_control import opposing_allowed
+            from zone_control import exit_wait, opposing_allowed
+            if (plan and plan["phase"] != "serve" or exit_wait(room,value if kind=="mode" else mode,now,live,readings,state,policy)):
+                return "等待相反设备实测低耗和退出后反馈"
             scope = trace["action_scopes"].get(room)
             zone = trace["zones"].get(scope["zone"]) if scope else None
             direction = value if kind == "mode" else mode

@@ -17,15 +17,16 @@ from zoneinfo import ZoneInfo
 UTC = timezone.utc
 BEIJING = ZoneInfo("Asia/Shanghai")
 MAX_POWER_GAP = 120
+SUMMARY_REVISION = 2
 AUDIT_FIELDS = "at event commit config_sha256 code_sha256 outcome assessment verification proposed final rooms command_at status error stack http observation_version observation_fingerprint"
-DECISION_FIELDS = "need normal_need lead gentle topology definition owner demand_order feasible zones environment output_evidence risks equipment action_scopes observations_after candidates rejections invalidated_initial unmet energy_scores recent_effects uncertain_zones"
-ZONE_FIELDS = "primary primary_reading inputs constraints measured target at quality trend paused intent reason direction duration report_span reports qualified error evidence_from source_version source key"
+DECISION_FIELDS = "need normal_need lead gentle topology definition owner demand_order feasible zones environment output_evidence risks equipment action_scopes observations_after candidates rejections invalidated_initial unmet energy_scores recent_effects uncertain_zones handoff conflict yielding_blocks elected"
+ZONE_FIELDS = "primary primary_reading inputs constraints measured target at quality trend paused intent reason direction duration report_span reports qualified error evidence_from source_version source key recovery_active recovery_evidence settling_reports settling_span recovery_completed_at observation_definition"
 ROOM_FIELDS = "room_c target_c mode_reported setpoint_reported power_w ready temperature_age_s power_age_s temperature_report_at power_report_at temperature_source power_context power_bands power_evidence_at status zone zone_intent zone_reason zone_target_c zone_temperature_c house_need prediction_10m_c trend_valid cold_seconds warm_seconds cold_confirmed warm_confirmed"
 COMMAND_FIELDS = "room kind value before sent_at status purpose transaction target_at_send expected before_room_c before_watts before_mode_at followup physical_verified proxy_at relay_at http control"
 SHADOW_FIELDS = "power_evidence_status observed_at power_report_at power_report_w watts low_power_cutoff reversal_low_cutoff low_power_seconds above_low_seconds above_high_seconds power_evidence measured target temperature_report_at temperature_source reported_mode from_setpoint source_fresh outdoor model model_at release_commit policy_revision learning_error"
 SAMPLE_FIELDS = "room tick measured desired reported adapter_mode watts outdoor temp_report quality"
 NESTED = set((ZONE_FIELDS + " " + ROOM_FIELDS + " " + DECISION_FIELDS + " " + COMMAND_FIELDS +
-    " mode started_at off_at mode_started_at phase members ready_at id target zone source last_report bands threshold floor since seconds context low high above_low learning count delta uncertainty from to value report_span reports fresh interval_seconds watt_hours useful improvement thermal_delta start_c end_c ended_at covered_seconds weather_c served_zone last_increase own_command zone_report power_at deviation projected_adverse point influence temperature_report_at power_report_at room_age_s power_age_s reported watts room_c temperature_c definition before_c unit episode_count at code_sha256 config_sha256 step mode provenance local zone_reason time start finish enabled until reason virtual_mode context sensors limits centers_w edges_w counts samples span_minutes fit file function line status expires expected started last_power context_changed old new phases targets 5 15").split())
+    " mode started_at off_at mode_started_at phase members ready_at id target zone source last_report bands threshold floor since seconds context low high above_low learning count delta uncertainty from to value report_span reports fresh interval_seconds watt_hours useful improvement thermal_delta start_c end_c ended_at covered_seconds weather_c served_zone last_increase own_command zone_report power_at deviation projected_adverse point influence temperature_report_at power_report_at room_age_s power_age_s reported watts room_c temperature_c definition before_c unit episode_count at code_sha256 config_sha256 step mode provenance local zone_reason time start finish enabled until reason virtual_mode context sensors limits centers_w edges_w counts samples span_minutes fit file function line status expires expected started last_power context_changed old new phases targets owner receiver blocker blocker_definition blocker_version selected_at handoff_at handoff_phase learning_version 5 15").split())
 WORDS = re.compile(r"^[a-z][a-z0-9_]{0,55}$")
 HEXDIGEST = re.compile(r"^(?:[0-9a-f]{40}|[0-9a-f]{64})$")
 SAFE_CHINESE = re.compile(r"^[\u3400-\u9fff\s、，。；：﹕（）±°℃0-9.≤≥+−-]{1,100}$")
@@ -98,7 +99,7 @@ class PublicSchema:
             if value in self.aliases:
                 return self.aliases[value]
             if field in {"commit", "release_commit", "config_sha256", "code_sha256", "definition",
-                         "observation_fingerprint", "source_version"} and HEXDIGEST.fullmatch(value):
+                         "observation_fingerprint", "source_version", "observation_definition", "blocker_version", "blocker_definition", "learning_version"} and HEXDIGEST.fullmatch(value):
                 return value
             if stamp(value) is not None and re.match(r"^\d{4}-\d{2}-\d{2}T", value):
                 return value
@@ -123,6 +124,10 @@ class PublicSchema:
         for key in ("assessment", "verification"):
             if data.get(key):
                 result[key] = self.record(data[key], DECISION_FIELDS)
+                for field in ("unmet", "yielding_blocks"):
+                    if data[key].get(field):
+                        result[key][field] = {self.aliases[name]:self.convert(reason,"reason")
+                                              for name,reason in data[key][field].items() if name in self.aliases}
         if data.get("rooms"):
             result["rooms"] = {self.aliases[k]: self.record(v, ROOM_FIELDS) for k,v in data["rooms"].items() if k in self.aliases}
         if data.get("stack"):
@@ -195,7 +200,10 @@ def audit_rows(folder, start, end):
     for path in folder.glob("startup-*.json"):
         if not re.fullmatch(r"startup-\d+",path.stem):
             continue
-        raw=load_json(path)
+        try:
+            raw=load_json(path)
+        except (OSError, ValueError):
+            continue
         if raw["at"]<end:
             rows[(raw["at"],"startup",None,None)]=raw
     # The startup file and log are the same event with different emission times.
@@ -271,8 +279,15 @@ def source_watermark(rows, field, acquired, expected_start, end):
             "rows": len(rows), "window_from": expected_start, "window_to": end}
 
 
-def read_databases(root, start, end, rooms, topology, schema):
+def read_databases(root, start, end, rooms, topology, schema, *, previous=()):
     chunks, marks = {}, {}
+    bindings = [config for config in rooms.values()]
+    room_names = set(rooms)
+    sensors = list(topology.get("sensors", {}).values())
+    for version in previous:
+        bindings.extend(version["rooms"].values())
+        room_names.update(version["rooms"])
+        sensors.extend(version["topology"].get("sensors", {}).values())
     configure = root/"config"
     configs = [("samples", configure/".storage/room_climate_control.sqlite3"),
                ("shadow", root/"shadow-data/shadow.sqlite3"), ("recorder", configure/"home-assistant_v2.db")]
@@ -282,26 +297,26 @@ def read_databases(root, start, end, rooms, topology, schema):
             with readonly(path) as db:
                 if name == "samples":
                     rows = db.execute("SELECT * FROM samples WHERE tick>=? AND tick<? ORDER BY tick,room", (start-60,end)).fetchall()
-                    output = [schema.record(dict(r), SAMPLE_FIELDS) for r in rows if r["room"] in rooms]
+                    output = [schema.record(dict(r), SAMPLE_FIELDS) for r in rows if r["room"] in room_names]
                     chunks["room-samples"] = output
                     marks[name] = source_watermark(output,"tick",acquired,start,end)
                 elif name == "shadow":
                     rows = db.execute("SELECT room,tick,value FROM decisions WHERE tick>=? AND tick<? ORDER BY tick,room", (start-120,end))
-                    output = [dict(schema.record(json.loads(v), SHADOW_FIELDS), room=schema.aliases[r], tick=t) for r,t,v in rows if r in rooms]
+                    output = [dict(schema.record(json.loads(v), SHADOW_FIELDS), room=schema.aliases[r], tick=t) for r,t,v in rows if r in room_names]
                     chunks["shadow-decisions"] = output
                     marks[name] = source_watermark(output,"tick",acquired,start,end)
-                    meters = {v["power"] for v in rooms.values()}
+                    meters = {v["power"] for v in bindings}
                     chunks["power-reports"] = [{"source":schema.aliases[s], "observer_epoch":e, "report_at":t, "watts":w,
                         "id":schema.id("power_report",(s,e,t))} for s,e,t,w in db.execute(
                         "SELECT source,observer_epoch,report_at,watts FROM power_reports WHERE report_at BETWEEN ? AND ? ORDER BY report_at,source,observer_epoch",
                         (start-120,end+120)) if s in meters]
                     chunks["power-models"] = [dict(room=schema.aliases[r], trained=t, status=s, model=schema.convert(json.loads(m)) if m else None)
-                      for r,t,s,m in db.execute("SELECT room,trained,status,model FROM power_models WHERE trained BETWEEN ? AND ? ORDER BY trained,room",(start-3600,end)) if r in rooms]
+                      for r,t,s,m in db.execute("SELECT room,trained,status,model FROM power_models WHERE trained BETWEEN ? AND ? ORDER BY trained,room",(start-3600,end)) if r in room_names]
                     marks["power_ledger"] = source_watermark(chunks["power-reports"], "report_at",acquired,start,end)
                 else:
-                    entities = {f"climate.{r}_room_thermostat" for r in rooms}
-                    entities.update(v[k] for v in rooms.values() for k in ("temperature","power","adapter") if k in v)
-                    entities.update(s["entity"] for s in topology.get("sensors", {}).values() if s.get("enabled",True) and "entity" in s)
+                    entities = {f"climate.{r}_room_thermostat" for r in room_names}
+                    entities.update(v[k] for v in bindings for k in ("temperature","power","adapter") if k in v)
+                    entities.update(s["entity"] for s in sensors if s.get("enabled",True) and "entity" in s)
                     output = []
                     for entity in sorted(entities):
                         rows = db.execute("""SELECT s.state_id,s.state,s.last_changed_ts,s.last_updated_ts,s.last_reported_ts,a.shared_attrs
@@ -319,7 +334,7 @@ def read_databases(root, start, end, rooms, topology, schema):
                                                fields={k: schema.convert(v,k) for k,v in fields.items()}))
                     chunks["recorder-states"] = sorted(output, key=lambda x: (x["updated_at"], x["id"]))
                     marks[name] = source_watermark(output,"updated_at",acquired,start,end)
-        except (sqlite3.Error, FileNotFoundError) as error:
+        except (sqlite3.Error, OSError, ValueError) as error:
             marks[name] = {"acquired_at":iso(acquired),"error":type(error).__name__,"missing":[start,end]}
     return chunks, marks
 
@@ -344,28 +359,25 @@ def independent_minutes(audit, topology, schema, versions=None):
             continue
         values = {}
         definition = (versions or {}).get(row.get("config_sha256"),topology)
-        for zone, spec in definition.get("zones", {}).items():
-            alias = schema.aliases[zone]
-            info = row.get("assessment", {}).get("zones", {}).get(alias)
-            if info:
-                raw = info["primary_reading"]
-                if raw["quality"] == "fresh" and info["target"] is not None:
-                    values[alias] = {"temperature": raw["value"], "target": info["target"], "report_at": raw["at"],
-                                     "source": raw.get("source"), "paused": info["paused"]}
-            else:
-                # Legacy audit has equipment samples. Map only each configured
-                # independent primary to an actuator sample, never its auxiliaries.
+        reported_zones = row.get("assessment", {}).get("zones", {})
+        for alias, info in reported_zones.items():
+            raw = info.get("primary_reading", {})
+            if raw.get("quality") == "fresh" and info.get("target") is not None:
+                values[alias] = {"temperature":raw["value"],"target":info["target"],"report_at":raw["at"],
+                                 "source":raw.get("source"),"paused":info.get("paused")}
+        if not reported_zones:
+            for zone, spec in definition.get("zones", {}).items():
                 unit = definition["sensors"][spec["primary"]].get("from_actuator")
                 legacy = row["rooms"].get(schema.aliases.get(unit), {})
                 if legacy.get("room_c") is not None and legacy.get("target_c") is not None and legacy.get("temperature_age_s", 1e9) <= 1200:
-                    values[alias] = {"temperature":legacy["room_c"],"target":legacy["target_c"],
-                                     "report_at":legacy.get("temperature_report_at"),"source":schema.aliases[spec["primary"]]}
+                    values[schema.aliases[zone]] = {"temperature":legacy["room_c"],"target":legacy["target_c"],
+                                    "report_at":legacy.get("temperature_report_at"),"source":schema.aliases[spec["primary"]]}
         minute = int(row["at"])//60*60
-        frames[minute] = {"tick": minute, "at": row["at"], "zones": values, "commit": row.get("commit"),
+        frames[minute,row.get("commit"),row.get("config_sha256")] = {"tick": minute, "at": row["at"], "zones": values, "commit": row.get("commit"),
                           "config_sha256": row.get("config_sha256"),
                           "controllable": {k: bool(v.get("ready")) for k,v in row["rooms"].items()},
                           "uncontrollable_reasons": {k: v.get("status") for k,v in row["rooms"].items() if not v.get("ready")}}
-    return [frames[k] for k in sorted(frames)]
+    return sorted(frames.values(),key=lambda f:f["at"])
 
 
 def reports(frames, schema, audit=()):
@@ -447,8 +459,8 @@ def power_ranges(reports, start, end):
 
 def summarize(frames, power, meter_by_unit, zones, commands, audit, start, end, band):
     expected = end-start
-    real_frames = [f for f in frames if start <= f["tick"] < end]
-    complete = [f for f in real_frames if all(z in f["zones"] for z in zones)]
+    real_frames = list({f["tick"]: f for f in frames if start <= f["at"] < end}.values())
+    complete = [f for f in real_frames if zones and all(z in f["zones"] for z in zones)]
     simultaneous = {str(limit): (100*sum(all(abs(f["zones"][z]["temperature"]-f["zones"][z]["target"])<=limit+1e-6 for z in zones)
                                   for f in complete)/len(complete) if complete else None) for limit in (band, 0.5, 0.7)}
     ranges = {unit: power_ranges([row for row in power if row["source"]==source], start,end) for unit,source in meter_by_unit.items()}
@@ -456,7 +468,7 @@ def summarize(frames, power, meter_by_unit, zones, commands, audit, start, end, 
     edge_events = defaultdict(list)
     for unit, intervals in ranges.items():
         covered = sum(b-a for a,b,_ in intervals)
-        meters[unit] = {"kwh":sum((b-a)*v for a,b,v in intervals)/3600000,
+        meters[unit] = {"kwh":sum((b-a)*v for a,b,v in intervals)/3600000 if covered else None,
                         "covered_seconds":covered,"coverage_pct":100*covered/expected}
         for a,b,v in intervals:
             if a < b:
@@ -497,15 +509,22 @@ def summarize(frames, power, meter_by_unit, zones, commands, audit, start, end, 
                 acts["setpoint_proxy"] += 1
             else:
                 acts["stop_proxy" if mode=="off" else "start_proxy"] += 1
+    controller_gaps = gaps((r["at"] for r in audit if r["event"] in {"cycle","cycle_error"}),start,end,60)
+    observed_audit = any(start<=r["at"]<end and r["event"] != "startup" for r in audit)
+    error_counts = Counter(r["event"] for r in audit if start<=r["at"]<end and r["event"].endswith("error"))
     return {"duration_seconds":expected, "zones":{z:temp_stats(real_frames,z,band) for z in zones},
             "joint_temperature_minutes":len(complete), "joint_temperature_pct":simultaneous,
             "minute_coverage": {"observed":len(real_frames),"expected_seconds":expected,
                                "missing":gaps((f["at"] for f in real_frames),start,end,60)},
-            "metered":meters, "joint_kwh":total/3600000,"joint_coverage_pct":100*coverage/expected,
+            "metered":meters, "joint_kwh":total/3600000 if coverage else None,"joint_coverage_pct":100*coverage/expected,
+            "joint_energy_status":"covered" if coverage>=expected-1e-6 else "partial" if coverage else "unknown",
             "joint_covered_seconds":coverage,"actuation_counts":dict(acts),
             "uncontrollable_observed_minutes":{k:sum(not f["controllable"].get(k,False) for f in real_frames) for k in meter_by_unit},
             "uncontrollable_reasons":{k:dict(Counter(f["uncontrollable_reasons"][k] for f in real_frames if k in f["uncontrollable_reasons"])) for k in meter_by_unit},
-            "controller_errors":dict(Counter(r["event"] for r in audit if start<=r["at"]<end and r["event"].endswith("error")))}
+            "controller_errors":dict(error_counts),
+            "controller_error_total":sum(error_counts.values()) if observed_audit and not controller_gaps else None,
+            "controller_error_coverage": {"status":"complete" if observed_audit and not controller_gaps else
+                    "partial" if observed_audit else "unknown", "missing":controller_gaps}}
 
 
 def release_groups(audit, frames, power, meter_by_unit, zones, commands, start, end, band, specs=None):
@@ -529,45 +548,78 @@ def release_groups(audit, frames, power, meter_by_unit, zones, commands, start, 
         sites=(specs or {}).get((v or {}).get("config_sha256"),{})
         refs=list(sites["zones"]) if sites else zones
         limits=sites["policy"].get("tracking_band",band) if sites else band
-        results.append({"start":a,"end":b,"version":v,
-                        "statistics":summarize(frames,power,meter_by_unit,refs,commands,audit,a,b,limits)})
+        meters={unit:bind["power"] for unit,bind in sites["bindings"].items()} if sites else meter_by_unit
+        results.append({"start":a,"end":b,"version":v,"configuration_status":"known" if sites else "unknown",
+                        "statistics":summarize(frames,power,meters,refs,commands,audit,a,b,limits)})
     return results
 
 
-def collect(root, start, end, runtime, key):
+def collect(root, start, end, runtime, key, *, previous_archive=None):
     captured = time()
-    room_path = root/"shadow/rooms.json"
-    rooms = load_json(room_path)
-    topology = load_json(root/"shadow/topology.json")
-    policy = load_json(root/"shadow/house_policy.json")
-    schema = PublicSchema(key,rooms,topology)
     audit_floor = end-86400
     folder = root/"pilot-data"
-    full_raw = audit_rows(folder,audit_floor,end)
-    versions={}
-    definitions={}
+    marks = {}
+    try:
+        full_raw = audit_rows(folder,audit_floor,end)
+        current_audit = audit_rows(folder,captured-300,captured+1)
+    except OSError as error:
+        marks["audit_read"] = {"status":"unknown","error":type(error).__name__}
+        full_raw, current_audit = [], []
+    stored = {}
     for ref in {r.get("config_sha256") for r in full_raw}:
-        if ref and HEXDIGEST.fullmatch(ref) and (path:=folder/f"configuration-{ref}.json").is_file():
-            old=load_json(path)
-            old_schema=PublicSchema(key,old["rooms"],old["topology"])
-            schema.aliases.update({k:v for k,v in old_schema.aliases.items() if k not in schema.aliases})
-            definitions[ref]=old["topology"]
-            versions[ref]=schema.configuration(old["rooms"],old["topology"],old["policy"])
+        if not ref or not HEXDIGEST.fullmatch(ref):
+            continue
+        try:
+            stored[ref] = load_json(folder/f"configuration-{ref}.json")
+        except (OSError, ValueError):
+            continue
+    try:
+        rooms, topology, policy = (load_json(root/"shadow"/name) for name in ("rooms.json","topology.json","house_policy.json"))
+        configuration_status="available"
+    except (OSError,ValueError):
+        fallback = next((stored[r["config_sha256"]] for r in reversed(full_raw) if r.get("config_sha256") in stored),None)
+        rooms, topology, policy = (fallback[k] for k in ("rooms","topology","policy")) if fallback else ({},{},{})
+        configuration_status="historical_fallback" if fallback else "unknown"
+    schema = PublicSchema(key,rooms,topology)
+    for old in stored.values():
+        old_schema=PublicSchema(key,old["rooms"],old["topology"])
+        schema.aliases.update({k:v for k,v in old_schema.aliases.items() if k not in schema.aliases})
+    definitions={ref:old["topology"] for ref,old in stored.items()}
+    versions={ref:schema.configuration(old["rooms"],old["topology"],old["policy"]) for ref,old in stored.items()}
+    marks["config"]={"status":configuration_status}
     raw_audit = [schema.audit(row) for row in full_raw]
-    current_audit = audit_rows(folder,captured-300,captured+1)
+    if previous_archive:
+        existing = {r["id"]:r for r in previous_archive.get("audit",())}
+        existing.update({r["id"]:r for r in raw_audit})
+        raw_audit=sorted(existing.values(),key=lambda r:r["at"])
+        versions={**previous_archive.get("versions",{}),**versions}
+        marks["verified_prior_archive"]={"status":"used","sha256":previous_archive["sha256"]}
     latest = next((schema.audit(r) for r in reversed(current_audit) if r.get("event")=="cycle"),None)
-    commands, status = read_journal(folder,audit_floor,end,captured,schema)
-    receipts = live_receipts(folder,start,end,schema)
-    chunks, marks = read_databases(root,audit_floor,end,rooms,topology,schema)
+    try:
+        commands, status = read_journal(folder,audit_floor,end,captured,schema)
+    except (OSError,ValueError,KeyError) as error:
+        marks["journal"]={"status":"unknown","error":type(error).__name__}
+        commands,status=[],{}
+    try:
+        receipts = live_receipts(folder,start,end,schema)
+    except (OSError,ValueError) as error:
+        marks["receipts"]={"status":"unknown","error":type(error).__name__}
+        receipts=[]
+    chunks, database_marks = read_databases(root,audit_floor,end,rooms,topology,schema,previous=stored.values())
+    marks.update(database_marks)
     frames = independent_minutes(raw_audit,topology,schema,definitions)
-    zones = [schema.aliases[k] for k in topology["zones"]]
+    zones = [schema.aliases[k] for k in topology.get("zones",{})]
+    if not zones:
+        zones = sorted({zone for f in frames for zone in f["zones"]})
     meters = {schema.aliases[k]:schema.aliases[c["power"]] for k,c in rooms.items()}
-    power = chunks.get("power-reports",[])
+    permitted_meters = {(unit,binding["power"]) for spec in versions.values() for unit,binding in spec["bindings"].items()}
+    permitted_meters.update(meters.items())
+    power = [*(previous_archive or {}).get("power",()),*chunks.get("power-reports",[])]
     # Controller polls preserve reports even when the shadow database lags.
     for row in raw_audit:
         for unit, v in row.get("rooms", {}).items():
             context, report = v.get("power_context"),v.get("power_report_at")
-            if unit in meters and context and context[0]==meters[unit] and report is not None and report<=end+120:
+            if context and (unit,context[0]) in permitted_meters and report is not None and report<=end+120:
                 power.append({"source":context[0],"observer_epoch":context[1],"report_at":report,"watts":v.get("power_w"),
                               "id":schema.id("power_report",(context[0],context[1],report)),"seen_in":"live"})
     merged = {}
@@ -595,13 +647,19 @@ def collect(root, start, end, runtime, key):
         marks[name]["missing_by_unit"]={u:gaps((r["tick"] for r in raw.get(key,[]) if r["room"]==u),start,end,60) for u in meters}
     marks["power_report_stream"]={u:gaps((r["report_at"] for r in raw["power-reports"] if r["source"]==s and r["watts"] is not None),start,end,120)
                                   for u,s in meters.items()}
-    band = policy["tracking_band"]
-    available = max(audit_floor,min((r["at"] for r in raw_audit if r.get("event")=="cycle"),default=start))
-    reusable = [r for r in raw_audit if r.get("event")=="startup"]
+    band = policy.get("tracking_band",0.3)
+    first_event = min((r["at"] for r in raw_audit if r.get("event")!="startup"),default=start)
+    available = max(audit_floor,min(start,first_event))
     summary = {"window":summarize(frames,power,meters,zones,commands,raw_audit,start,end,band),
-               "by_version":release_groups(reusable,frames,power,meters,zones,commands,start,end,band,versions),
+               "by_version":release_groups(raw_audit,frames,power,meters,zones,commands,start,end,band,versions),
                "rolling_24h":{"actual_from":available,"end":end,"elapsed_seconds":end-available,
-                 "by_version":release_groups(reusable,frames,power,meters,zones,commands,available,end,band)}}
+                 "by_version":release_groups(raw_audit,frames,power,meters,zones,commands,available,end,band,versions)}}
+    summary["rolling_24h"]["overall"] = summarize(frames,power,meters,zones,commands,raw_audit,available,end,band)
+    for totals, periods in ((summary["window"],summary["by_version"]),
+                            (summary["rolling_24h"]["overall"],summary["rolling_24h"]["by_version"])):
+        reconciled = sum((Counter(row["statistics"]["controller_errors"]) for row in periods), Counter())
+        if totals["controller_errors"] != reconciled:
+            raise ValueError("Controller errors must reconcile across deployment windows")
     return {"captured_at":captured,"runtime":runtime,"raw":raw,"status":{"last_completed_cycle":latest,**status},
             "effective":schema.configuration(rooms,topology,policy),"configurations":versions,"summary":summary,"watermarks":marks,
             "private_values":[k for k in schema.aliases if "." in k]}
@@ -615,13 +673,14 @@ def observed_versions(stats):
 
 def bundle(window, kind, snapshot, prior, previous_revision):
     observed = snapshot["raw"]
-    logical = sha256(json_bytes(observed)).hexdigest()
+    logical_inputs = {k:v for k,v in observed.items() if k!="runtime-probe"}
+    logical = sha256(json_bytes([SUMMARY_REVISION,logical_inputs,snapshot["summary"]])).hexdigest()
     files = {"current-state.json":json_bytes(snapshot["status"]), "effective-config.json":json_bytes(snapshot["effective"]),
              "summary.json":json_bytes(snapshot["summary"]),
              "configuration-versions.json":json_bytes(snapshot.get("configurations",{}))}
     files.update({f"raw/{name}.jsonl":b"".join(json_bytes(r) for r in rows) for name,rows in observed.items()})
     start,end=window
-    manifest = {"schema":1,"kind":kind,"from_utc":iso(start),"to_utc":iso(end),"from_beijing":iso(start,BEIJING),
+    manifest = {"schema":1,"summary_revision":SUMMARY_REVISION,"kind":kind,"from_utc":iso(start),"to_utc":iso(end),"from_beijing":iso(start,BEIJING),
                 "to_beijing":iso(end,BEIJING),"capture_utc":iso(snapshot["captured_at"]),"original_source_timezone":"Asia/Tokyo",
                 "version":snapshot["runtime"],"observation_version":snapshot["effective"]["observation_version"],
                 "sources":snapshot["watermarks"],"coverage":{k:snapshot["summary"]["window"][k] for k in ("joint_coverage_pct","joint_temperature_minutes","minute_coverage")},

@@ -16,7 +16,8 @@ from time import sleep, time
 from urllib.request import Request, urlopen
 from zipfile import ZipFile
 
-from evidence import BEIJING, audit_rows, bundle, collect, iso, json_bytes, load_json, observed_versions, stamp, verify_zip, write_zip
+from evidence import (BEIJING, SUMMARY_REVISION, audit_rows, bundle, collect, iso, json_bytes, load_json,
+                      observed_versions, stamp, verify_zip, write_zip)
 
 
 HOUR = 3600
@@ -66,22 +67,50 @@ def command(args, *, payload=None, optional_404=False, timeout=28):
     return p.stdout
 
 
-def runtime(config, root, now):
-    containers = (config["pilot_container"], config["shadow_container"])
-    docker = config["docker"]
-    result = {}
-    for label, name in zip(("pilot","shadow"), containers):
-        actual = json.loads(command([docker,"exec",name,"python","-B","-c",RUNTIME_PROGRAM],timeout=12))
+def container_runtime(docker, name):
+    try:
         raw = command([docker,"inspect","-f","{{.State.StartedAt}} {{.RestartCount}} {{.State.Running}}",name],timeout=10)
         started, restarts, running = raw.decode().split()
-        result[label] = {**actual,"container_started_at":started,"restart_count":int(restarts),"running":running=="true"}
-    rows = audit_rows(root/"pilot-data",now-300,now+1)
-    startup = next((r for r in reversed(rows) if r.get("event")=="startup"), None)
-    if (not startup or not re.fullmatch(r"[0-9a-f]{40}", startup.get("commit") or "") or
-            any(not entry["running"] or any(entry[key]!=startup[key] for key in ("code_sha256","config_sha256")) for entry in result.values())):
-        raise RuntimeFailure("startup_hash_or_service_mismatch")
-    return {"startup":{k:startup.get(k) for k in ("commit","code_sha256","config_sha256","observation_version","observation_fingerprint","at")},
-            "deployed_utc":iso(startup["at"]),"files_match_startup":True,**result}
+        details = {"container_started_at":started,"restart_count":int(restarts),"running":running=="true"}
+    except (RemoteFailure, ValueError):
+        return {"status":"unknown","reason":"container_inspection_unavailable"}
+    if not details["running"]:
+        return dict(details,status="stopped",reason="container_not_running")
+    try:
+        actual = json.loads(command([docker,"exec",name,"python","-B","-c",RUNTIME_PROGRAM],timeout=12))
+    except (RemoteFailure, ValueError):
+        return dict(details,status="unknown",reason="runtime_hash_unavailable")
+    return dict(details,**actual,status="unverified")
+
+
+def runtime(config, root, now):
+    """Report health independently from whether saved evidence can be delivered."""
+    results = {label:container_runtime(config["docker"],config[label+"_container"]) for label in ("pilot","shadow")}
+    try:
+        rows = audit_rows(root/"pilot-data",now-300,now+1)
+    except OSError:
+        rows = []
+    last = next((r for r in reversed(rows) if r.get("event") == "startup"),None)
+    pilot_started = stamp(results["pilot"].get("container_started_at"))
+    startup = last if (last and pilot_started is not None and last["at"] >= pilot_started-1
+                       and re.fullmatch(r"[0-9a-f]{40}",last.get("commit") or "")) else None
+    problems = [] if startup else ["startup_missing_for_current_process"]
+    for label, details in results.items():
+        if details["status"] != "unverified":
+            problems.append(label+"_"+details["status"])
+        elif startup is None:
+            details.update(status="unknown",reason="startup_not_matched")
+        elif any(details.get(k) != startup.get(k) for k in ("config_sha256","code_sha256")):
+            details.update(status="mismatch",reason="hash_mismatch")
+            problems.append(label+"_mismatch")
+        else:
+            details["status"] = "verified"
+    status = "verified" if not problems else "mismatch" if any(d["status"]=="mismatch" for d in results.values()) else "unknown"
+    keys = ("commit","code_sha256","config_sha256","observation_version","observation_fingerprint","at")
+    return {"status":status,"problems":problems,"startup":{k:startup.get(k) for k in keys} if startup else None,
+            "last_recorded_startup":{k:last.get(k) for k in keys} if last else None,
+            "deployed_utc":iso(startup["at"]) if startup else None,
+            "files_match_startup":status=="verified",**results}
 
 
 def runtime_events(config, start, end):
@@ -125,6 +154,14 @@ class GitHub:
     def release(self, tag):
         return self.api("/releases/tags/"+tag,optional=True)
 
+    def release_anchor(self, commit):
+        if commit and re.fullmatch(r"[0-9a-f]{40}",commit):
+            return commit
+        sha=self.api("/git/ref/heads/main")["object"]["sha"]
+        if not re.fullmatch(r"[0-9a-f]{40}",sha):
+            raise RemoteFailure("release_anchor_unavailable")
+        return sha
+
     def upload(self, path, record, commit):
         date=datetime.fromtimestamp(record["start"],BEIJING).strftime("%Y%m%d")
         daily="telemetry-"+date
@@ -134,7 +171,7 @@ class GitHub:
             tag=daily+"-"+path.stem.removeprefix("evidence-")
             release=self.release(tag)
         if release is None:
-            args=[self.gh,"release","create",tag,str(path),"--repo",self.repo,"--target",commit,"--title",
+            args=[self.gh,"release","create",tag,str(path),"--repo",self.repo,"--target",self.release_anchor(commit),"--title",
                   "Thermostat evidence · "+date+" (Beijing)","--notes",
                   "De-identified thermostat evidence. Find windows and checksums in the telemetry branch index.","--prerelease","--latest=false"]
             command(args,timeout=55)
@@ -164,13 +201,14 @@ class GitHub:
     def index(self, records, commit):
         ref=self.api("/git/ref/heads/telemetry",optional=True)
         if ref is None:
-            self.api("/git/refs",method="POST",body={"ref":"refs/heads/telemetry","sha":commit})
+            self.api("/git/refs",method="POST",body={"ref":"refs/heads/telemetry","sha":self.release_anchor(commit)})
         filename="telemetry-index.json"
         old=self.api("/contents/"+filename+"?ref=telemetry",optional=True)
         ordered=sorted(records,key=lambda v:(v["end"],v["revision"],v["kind"]))
         public=[{"from_utc":iso(v["start"]),"to_utc":iso(v["end"]),"from_beijing":iso(v["start"],BEIJING),
                  "to_beijing":iso(v["end"],BEIJING),**{k:v.get(k) for k in ("kind","revision","url","sha256","upload_status","supersedes")},
-                 "capture_commit":v["commit"], "observed_versions":v.get("observed_versions",[])}
+                 "capture_commit":v["commit"], "capture_status":v.get("capture_status","verified" if v["commit"] else "unknown"),
+                 "summary_revision":v.get("summary_revision",1), "observed_versions":v.get("observed_versions",[])}
                 for v in ordered[-192:]]
         data=json_bytes({"schema":1,"latest":public[-1] if public else None,"packages":public})
         if old and base64.b64decode(old["content"])==data:
@@ -216,31 +254,32 @@ def prune(folder, state, now, budget):
 
 
 def perform(config, directory, state, gh, now):
+    # A previous fsynced package is self-contained. Retry it before looking at
+    # Docker, current config, or any of the sources of the original evidence.
+    if state.get("pending"):
+        send_pending(directory,state,gh)
     root=Path(config["production"])
     path=directory/"queue.json"
     spool=directory/"spool"
     current=runtime(config,root,now)
-    release=current["startup"]
-    commit=release["commit"]
-    # On initial installation also schedule the complete hour preceding the
-    # current clock hour. It remains tagged with its actual historical release.
-    state.setdefault("cursor",min(int(release["at"])//HOUR*HOUR,int(now)//HOUR*HOUR-HOUR))
+    release=current.get("startup") or {}
+    current_at=release.get("at",now)
+    state.setdefault("cursor",min(int(current_at)//HOUR*HOUR,int(now)//HOUR*HOUR-HOUR))
+    state["runtime_status"]={"status":current["status"],"problems":current["problems"],"at":iso(now)}
     for record in state["uploaded"]:
         path_to_zip=spool/record["file"]
         if "observed_versions" not in record and path_to_zip.is_file():
             verify_zip(path_to_zip,record["sha256"])
             with ZipFile(path_to_zip) as archive:
                 record["observed_versions"]=observed_versions(json.loads(archive.read("summary.json")))
-    # Resend staged operations first. Network errors retain the archive and
-    # neither discard that window nor move its durable cursor.
-    if state.get("pending"):
-        send_pending(directory,state,gh)
-    release_key=[commit,release["config_sha256"]]
-    if state.get("initial_verified")!=release_key:
-        end=max(int(release["at"])+1,int(now))
-        if end > now:
-            end=now
-        package(config,directory,state,gh,current,(release["at"],max(release["at"]+0.001,end)),"state")
+    atomic(path,state)
+    if current["status"] == "verified":
+        release_key=[release["commit"],release["config_sha256"]]
+        if state.get("initial_verified")!=release_key:
+            package(config,directory,state,gh,current,(current_at,max(current_at+0.001,now)),"state")
+        state.pop("last_fault",None)
+    elif state.get("last_fault") != current["problems"]:
+        package(config,directory,state,gh,current,(now-300,now),"diagnostic")
     cursor=state["cursor"]
     limit=last_full_end(now)
     for _ in range(MAX_BACKFILL):
@@ -248,13 +287,31 @@ def perform(config, directory, state, gh, now):
             break
         package(config,directory,state,gh,current,(cursor,cursor+HOUR),"hourly")
         cursor=state["cursor"]
+    latest = {(r["start"],r["end"],r["kind"]):r for r in state["uploaded"]}
+    # Reissue affected summaries once, including previous state packages.
+    # A missing prior archive remains a coverage gap, even on a reissue.
+    outdated=[window for window,r in latest.items() if r.get("summary_revision",1)<SUMMARY_REVISION]
+    for start,end,kind in sorted(outdated,key=lambda w:w[1])[:MAX_BACKFILL]:
+        package(config,directory,state,gh,current,(start,end),kind,revision_only=True)
     for end in (limit-offset*HOUR for offset in range(1,REVISE_HOURS+1)):
-        if any(r["kind"]=="hourly" and r["end"]==end for r in state["uploaded"]):
-            package(config,directory,state,gh,current,(end-HOUR,end),"hourly",revision_only=True)
+        window=(end-HOUR,end,"hourly")
+        if window in latest and window not in outdated:
+            package(config,directory,state,gh,current,window[:2],window[2],revision_only=True)
     prune(spool,state,now,config["local_bytes"])
     state["last_error"]=None
     state["last_check"]=iso(now)
     atomic(path,state)
+
+
+def prior_reports(spool, record):
+    if not record or not (path:=spool/record["file"]).is_file():
+        return None
+    verify_zip(path,record["sha256"])
+    with ZipFile(path) as arc:
+        def lines(name):
+            return [json.loads(line) for line in arc.read(f"raw/{name}.jsonl").splitlines()] if f"raw/{name}.jsonl" in arc.namelist() else []
+        return {"audit":lines("live-audit"),"power":lines("power-reports"),"sha256":record["sha256"],
+                "versions":json.loads(arc.read("configuration-versions.json")) if "configuration-versions.json" in arc.namelist() else {}}
 
 
 def package(config,directory,state,gh,current,window,kind,revision_only=False):
@@ -263,7 +320,11 @@ def package(config,directory,state,gh,current,window,kind,revision_only=False):
     start,end=window
     prior=next((x for x in reversed(state["uploaded"]) if x["end"]<=start),None) or next(iter(reversed(state["uploaded"])),None)
     last=next((x for x in reversed(state["uploaded"]) if (x["start"],x["end"],x["kind"])==(start,end,kind)),None)
-    snapshot=collect(Path(config["production"]),start,end,current,config["anonymization_key"])
+    # Keep earlier verified raw observations available across Recorder retention.
+    prior_archive=prior_reports(spool,last)
+    snapshot=collect(Path(config["production"]),start,end,current,config["anonymization_key"],previous_archive=prior_archive)
+    snapshot["raw"]["runtime-probe"]=[{"at":snapshot["captured_at"],"event":"runtime_probe",
+                                      "status":current["status"],"problems":current["problems"]}]
     try:
         mark, events=runtime_events(config,start,end)
     except (OSError, subprocess.TimeoutExpired):
@@ -286,10 +347,13 @@ def package(config,directory,state,gh,current,window,kind,revision_only=False):
     digest=sha256(temp.read_bytes()).hexdigest()
     verify_zip(temp,digest)
     os.replace(temp,target)
+    verified = current.get("startup") if current["status"] == "verified" else None
     state["pending"]={"file":filename,"sha256":digest,"logical_sha256":manifest["logical_sha256"],
                       "start":start,"end":end,"kind":kind,"revision":revision,"supersedes":last["url"] if last else None,
-                      "advance":kind=="hourly" and not revision_only,"commit":current["startup"]["commit"],
-                      "config_sha256":current["startup"]["config_sha256"],"observed_versions":manifest["observed_versions"],
+                      "advance":kind=="hourly" and not revision_only,"commit":(verified or {}).get("commit"),
+                      "config_sha256":(verified or {}).get("config_sha256"),"observed_versions":manifest["observed_versions"],
+                      "capture_status":current["status"],"summary_revision":SUMMARY_REVISION,"revision_only":revision_only,
+                      "runtime_problems":current["problems"],
                       "upload_status":"queued"}
     atomic(path,state)
     send_pending(directory,state,gh)
@@ -307,19 +371,21 @@ def send_pending(directory,state,gh):
     state["last_success"]=record["verified_at"]
     if record["advance"]:
         state["cursor"]=max(state["cursor"],record["end"])
-    if record["kind"]=="state":
+    if record["kind"]=="state" and not record.get("revision_only"):
         state["initial_verified"]=[record["commit"],record.get("config_sha256")]
+    if record["kind"]=="diagnostic" and not record.get("revision_only"):
+        state["last_fault"]=record.get("runtime_problems")
     state["pending"]=None
     atomic(directory/"queue.json",state)
     print(json.dumps({"event":"uploaded","window_end":iso(record["end"]),"sha256":record["sha256"],"url":record["url"]}),flush=True)
 
 
 def status(directory,state,now):
-    latest=(state["uploaded"][-1] if state["uploaded"] else None)
+    latest=max(state["uploaded"],key=lambda r:(r["end"],r.get("revision",1)),default=None)
     stop=last_full_end(now)
     cursor=state.get("cursor",stop)
     atomic(directory/"status.json",{"last_success":state.get("last_success"),"last_error":state.get("last_error"),
-            "last_check":state.get("last_check"),"pending":state.get("pending"),"backfill_from_utc":iso(cursor),
+            "last_check":state.get("last_check"),"pending":state.get("pending"),"runtime_status":state.get("runtime_status"),"backfill_from_utc":iso(cursor),
             "backfill_completed_hour_count":max(0,(stop-cursor)//HOUR),"next_due_utc":iso(next_time(now)),
             "next_due_beijing":iso(next_time(now),BEIJING),"latest_upload":latest})
 

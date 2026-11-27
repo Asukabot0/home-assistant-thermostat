@@ -71,9 +71,31 @@ def configure(definition, rooms):
         if a == b or a not in zones or b not in zones or pair in links or not 0 <= coupling <= 1:
             raise ValueError("Invalid zone connection")
         links[pair] = coupling
-    # Old observations are valid only within the exact same definitions,
-    # including mapped entities, weights and indirect device influence.
-    return dict(definition, fingerprint=fingerprint([definition, sources]), sources=sources, links=links)
+    zone_versions = {}
+    for name, zone in zones.items():
+        fusion = zone.get("fusion", "primary")
+        selected = [item for item in zone.get("sensors", ()) if item in sources and
+                    (sensors[item]["role"] == "constraint" or fusion == "weighted")]
+        sensor_definitions = {item: [sources[item], {k: v for k, v in sensors[item].items() if k != "enabled"}]
+                              for item in [zone["primary"], *selected]}
+        zone_versions[name] = fingerprint([name, zone["primary"], fusion, zone["target"], zone.get("pause_entity"),
+                                           zone.get("observation_version"), sensor_definitions])
+    action_versions = {}
+    learning_versions = {}
+    opposing = definition.get("opposite_operation", {})
+    environment = {name: (sources[name], sensor) for name, sensor in sensors.items()
+                   if name in sources and sensor["role"] == "environment"}
+    for room, unit in actuators.items():
+        affected = set(unit["influences"])
+        relevant_links = [(pair, value) for pair, value in sorted(links.items()) if affected.intersection(pair)]
+        relevant_zones = affected | {name for pair, _ in relevant_links for name in pair}
+        binding = {k: v for k, v in rooms[room].items() if k not in {"name", "reference", "temperature"}}
+        action_versions[room] = fingerprint([unit, binding, opposing, relevant_links,
+                                             {key:zone_versions[key] for key in relevant_zones}])
+        learning_versions[room] = fingerprint([unit, binding, zone_versions[unit["zone"]], environment])
+    # The installation fingerprint is retained for audit and upgrade migration.
+    return dict(definition, fingerprint=fingerprint([definition, sources]), sources=sources, links=links,
+                zone_versions=zone_versions, action_versions=action_versions, learning_versions=learning_versions)
 
 
 def safe_state(request, entity):

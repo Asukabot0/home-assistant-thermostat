@@ -44,6 +44,10 @@ class TelemetryTests(unittest.TestCase):
         snap["captured_at"]=65
         second,_=evidence.bundle((0,60),"state",snap,None,None)
         self.assertEqual(first["logical_sha256"],second["logical_sha256"])
+        snap["summary"]["window"]["controller_errors"] = {"cycle_error": 1}
+        fixed,_=evidence.bundle((0,60),"state",snap,None,"verified-previous.zip")
+        self.assertNotEqual(first["logical_sha256"],fixed["logical_sha256"])
+        self.assertEqual(fixed["supersedes"],"verified-previous.zip")
         with TemporaryDirectory() as tmp:
             file=Path(tmp)/"artifact.zip"
             evidence.write_zip(file,files)
@@ -90,6 +94,79 @@ class TelemetryTests(unittest.TestCase):
         self.assertEqual(worker.last_full_end(3600+299),0)
         self.assertEqual(worker.last_full_end(3600+300),3600)
         self.assertEqual(worker.next_time(3600+300),7200+300)
+
+    def test_collector_reconciles_errors_in_each_version_and_rolling_window(self):
+        with TemporaryDirectory() as tmp:
+            root=Path(tmp)
+            (root/"pilot-data").mkdir()
+            (root/"shadow").mkdir()
+            fixture={"rooms":{},"topology":{"sensors":{},"zones":{}},"policy":{"tracking_band":0.3}}
+            for file,key in (("rooms.json","rooms"),("topology.json","topology"),("house_policy.json","policy")):
+                (root/"shadow"/file).write_text(json.dumps(fixture[key]))
+            a,b="a"*64,"b"*64
+            first=dict(fixture,policy={"tracking_band":0.4})
+            for ref,data in ((a,first),(b,fixture)):
+                (root/"pilot-data"/f"configuration-{ref}.json").write_text(json.dumps(data))
+            timepoints=[(60,"startup",a),(65,"cycle_error",a),(125,"evidence_error",a),
+                        (160,"startup",b),(160,"startup_error",b),(170,"cycle_error",b)]
+            data=[{"event":e,"at":t,"commit":v[:40],"config_sha256":v,
+                   "error":"OperationalError" if e.endswith("error") else None} for t,e,v in timepoints]
+            (root/"pilot-data/live-audit.jsonl").write_bytes(b"".join(evidence.json_bytes(x) for x in data))
+            snap=evidence.collect(root,61,240,{"status":"unknown"},"a"*64)
+        stat=snap["summary"]
+        totals={"cycle_error":2,"evidence_error":1,"startup_error":1}
+        self.assertEqual(stat["window"]["controller_errors"],totals)
+        for section in (stat,stat["rolling_24h"]):
+            first,second=section["by_version"]
+            self.assertEqual(first["statistics"]["controller_errors"],{"cycle_error":1,"evidence_error":1})
+            self.assertEqual(second["statistics"]["controller_errors"],{"cycle_error":1,"startup_error":1})
+            self.assertIn("0.4",first["statistics"]["joint_temperature_pct"])
+            self.assertIn("0.3",second["statistics"]["joint_temperature_pct"])
+        self.assertEqual(stat["rolling_24h"]["overall"]["controller_errors"],totals)
+        self.assertIsNone(stat["window"]["joint_kwh"])
+        self.assertIsNone(stat["window"]["controller_error_total"])
+
+    def test_unhealthy_runtime_collects_available_audit_even_if_configuration_is_missing(self):
+        with TemporaryDirectory() as tmp:
+            root=Path(tmp)
+            (root/"pilot-data").mkdir()
+            (root/"pilot-data/live-audit.jsonl").write_bytes(evidence.json_bytes({"event":"cycle_error","error":"OSError","at":100}))
+            data=evidence.collect(root,61,240,{"status":"unknown","problems":["pilot_stopped"]},"a"*64)
+            manifest,files=evidence.bundle((61,240),"diagnostic",data,None,None)
+        self.assertEqual(data["watermarks"]["config"]["status"],"unknown")
+        self.assertEqual(manifest["version"]["status"],"unknown")
+        self.assertIn(b"cycle_error",files["raw/live-audit.jsonl"])
+        self.assertIsNone(data["summary"]["window"]["joint_kwh"])
+
+    def test_pending_delivery_precedes_stopped_or_mismatched_runtime(self):
+        for problem in ("pilot_stopped","shadow_mismatch","startup_missing_for_current_process"):
+            with self.subTest(problem=problem), TemporaryDirectory() as tmp:
+                root=Path(tmp)
+                (root/"spool").mkdir()
+                record={"file":"prior.zip","start":0,"end":3600,"kind":"hourly","sha256":"fixture","commit":"a"*40,"advance":True,
+                        "summary_revision":evidence.SUMMARY_REVISION}
+                state={"pending":record,"uploaded":[],"cursor":0}
+                gh=Mock()
+                gh.upload.return_value={"verified_at":"ok","url":"https://github.com/fixture"}
+                def observe(*args):
+                    self.assertIsNone(state["pending"])
+                    self.assertEqual(state["cursor"],3600)
+                    self.assertEqual(gh.upload.call_count,1)
+                    return {"status":"mismatch" if "mismatch" in problem else "unknown","problems":[problem],"startup":None}
+                with patch.object(worker,"verify_zip"), patch.object(worker,"runtime",side_effect=observe), patch.object(worker,"package") as package:
+                    worker.perform({"production":str(root),"local_bytes":1000},root,state,gh,3900)
+                self.assertEqual(state["runtime_status"]["problems"],[problem])
+                self.assertEqual(package.call_args_list[0].args[-1],"diagnostic")
+
+    def test_runtime_classifies_stopped_hash_mismatch_and_missing_startup(self):
+        config={"docker":"docker","pilot_container":"pilot","shadow_container":"shadow"}
+        running={"status":"unverified","running":True,"container_started_at":evidence.iso(100),
+                 "code_sha256":"a"*64,"config_sha256":"b"*64}
+        start={"event":"startup","at":101,"commit":"c"*40,"code_sha256":"a"*64,"config_sha256":"b"*64}
+        for pilot,shadow,rows,expected in ((running,{"status":"stopped","running":False},[start],"unknown"),
+            (running,dict(running,code_sha256="d"*64),[start],"mismatch"),(running,running,[],"unknown")):
+            with self.subTest(expected=expected), patch.object(worker,"container_runtime",side_effect=[dict(pilot),dict(shadow)]), patch.object(worker,"audit_rows",return_value=rows):
+                self.assertEqual(worker.runtime(config,Path("."),140)["status"],expected)
 
     def test_public_projection_preserves_zone_and_removes_unrelated_fields(self):
         topo={"zones":{"area_private":{"primary":"s"}},"sensors":{"s":{"entity":"sensor.private"}}}

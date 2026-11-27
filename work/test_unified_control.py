@@ -170,7 +170,111 @@ class UnifiedCycleTests(unittest.TestCase):
         cfg=deepcopy(example)
         cfg["observation_version"]="config-switch"
         observations(configure(cfg,rooms),live,inputs,memory,[],set(),self.h.now+50)
-        self.assertEqual(memory["trackers"]["beta"]["changed_at"],self.h.now+50)
+        self.assertEqual(memory["trackers"]["beta"]["changed_at"],self.h.now)
+        cfg["sensors"]["lounge_auxiliary"]["weight"]=0.6
+        observations(configure(cfg,rooms),live,inputs,memory,[],set(),self.h.now+70)
+        self.assertEqual(memory["trackers"]["beta"]["changed_at"],self.h.now+70)
+        self.assertEqual(memory["trackers"]["alpha"]["changed_at"],self.h.now)
+
+    def test_opposed_real_cycle_yields_then_observes_and_serves_each_zone(self):
+        self.scene(bed=("heat",22,23.4,300),lounge=("cool",25,24.6,300),study=("off",25,24.6,8))
+        reduced=self.qualify()
+        self.assertEqual([(a["room"],a["value"],a["purpose"]) for a in reduced["commands"]],[("bedroom",21,"handoff_reduce")])
+        self.run_cycle(20,cache=("bedroom","living","study"))
+        self.assertEqual(self.trace()["handoff"]["phase"],"verify_reduction")
+        self.assertEqual(len(self.h.calls),1)
+        stopping=self.run_cycle(600)
+        self.assertEqual(stopping["commands"][-1]["purpose"],"handoff_off")
+        self.assertEqual(stopping["commands"][-1]["value"],"off")
+        # Simulate an echo with continued 300 W. It gives no authority to
+        # apply a stronger cooling instruction, even after the time guard.
+        self.run_cycle(20,cache=("bedroom","living","study"))
+        proving=self.run_cycle(600)
+        self.assertEqual(len(self.h.calls),2)
+        self.assertEqual(proving["commands"][-1]["status"],"proxy_echo")
+        self.assertEqual(self.trace()["handoff"]["phase"],"verify_exit")
+        self.h.live["bedroom"]["adapter"]["power"]=8
+        self.h.now+=600
+        self.run_cycle()
+        for _ in range(12):
+            for room,row in self.h.live.items():
+                row["adapter"]["power"]=8 if row["adapter"]["mode"]=="off" else 300
+            end=self.run_cycle(600)
+        self.assertTrue(any(a["room"]=="living" and a["purpose"]=="zone_strengthen" and a["status"]=="proxy_echo" for a in end["commands"]))
+        self.assertTrue(any(a["room"]=="living" and a["purpose"]=="handoff_off" and a["status"]=="proxy_echo" for a in end["commands"]))
+        self.assertTrue(any(a["room"]=="bedroom" and a["value"]=="heat" and a["status"]=="proxy_echo" for a in end["commands"]))
+        self.assertEqual(end["holds"],{})
+        self.assertFalse(any(a["room"]=="bedroom" and a["value"]=="cool" for a in end["commands"]))
+
+    def test_conflict_explains_comfort_limit_with_two_unmet_demands(self):
+        self.scene(bed=("heat",22,23.1,300),lounge=("cool",25,24.9,300))
+        self.qualify()
+        self.assertEqual(self.h.calls,[])
+        self.assertEqual(self.trace()["unmet"],{"lounge":"no_comfort_safe_assignment","sleep":"no_comfort_safe_assignment"})
+        last=next(x.kwargs for x in reversed(self.audit.call_args_list) if x.args==("cycle",) and "rooms" in x.kwargs)
+        self.assertEqual(last["rooms"]["bedroom"]["status"],"no_comfort_safe_assignment")
+
+    def test_heat_and_cool_recovery_survive_single_boundary_report_and_restart(self):
+        for mode, outside, boundary, relapse, settled, setting in (
+            ("heat",23.4,23.7,23.6,23.9,22),("cool",24.6,24.3,24.4,24.1,25)
+        ):
+            with self.subTest(mode=mode):
+                self.h.journal.unlink(missing_ok=True)
+                self.h.calls.clear()
+                self.scene(bed=(mode,setting,outside,8))
+                state=self.qualify()
+                self.assertEqual(state["commands"][-1]["purpose"],"zone_strengthen")
+                self.run_cycle(620,bed=boundary)
+                before=self.trace()["zones"]["sleep"]
+                self.assertTrue(before["recovery_active"])
+                self.assertFalse(before["qualified"])
+                self.assertEqual(before["settling_reports"],1)
+                persisted=json.loads(self.h.journal.read_bytes())["closed_loop"]["trackers"]["sleep"]["recovery"]
+                self.assertEqual(before["evidence_from"],persisted["since"])
+                self.run_cycle(610,bed=boundary,cache=("bedroom",))
+                self.assertEqual(self.trace()["zones"]["sleep"]["settling_reports"],1)
+                self.assertEqual(len(self.h.calls),1)
+                self.run_cycle(60,bed=relapse)
+                self.assertEqual(len(self.h.calls),2)
+                self.assertEqual(self.trace()["zones"]["sleep"]["evidence_from"],persisted["since"])
+                self.run_cycle(600,bed=settled)
+                self.assertTrue(self.trace()["zones"]["sleep"]["recovery_active"])
+                self.run_cycle(600,bed=settled)
+                self.assertFalse(self.trace()["zones"]["sleep"]["recovery_active"])
+                self.assertEqual(self.trace()["zones"]["sleep"]["intent"],"maintain")
+
+    def test_stale_stream_and_new_target_do_not_reuse_old_recovery(self):
+        self.scene()
+        self.qualify()
+        self.run_cycle(1210,cache=("bedroom",))
+        self.assertFalse(self.trace()["zones"]["sleep"]["qualified"])
+        self.run_cycle(20)
+        old=self.h.live["bedroom"]["signature"]
+        self.h.live["bedroom"]["signature"]=(*old[:4],25,*old[5:])
+        self.run_cycle(600)
+        self.assertFalse(self.trace()["zones"]["sleep"]["recovery_active"])
+        self.assertEqual(len(self.h.calls),1)
+
+    def test_unused_disabled_sensor_preserves_journal_and_observation_dependencies(self):
+        self.scene()
+        self.qualify()
+        before=self.run_cycle(20,cache=("bedroom","living","study"))
+        obs=before["closed_loop"]["trackers"]
+        definition=json.loads(EXAMPLE.read_bytes())
+        definition["sensors"]["unused"]={"enabled":False,"role":"auxiliary","entity":"sensor.does_not_exist"}
+        after_topo=configure(definition,pilot.ROOMS)
+        self.assertEqual(self.topology["action_versions"],after_topo["action_versions"])
+        old_sources={key:v["identity"] for key,v in obs.items()}
+        memory={"setpoint":24,"target":24,"source_version":old_sources["sleep"],
+                "learning_version":self.topology["learning_versions"]["bedroom"]}
+        before["closed_loop"]["maintenance"]={"bedroom":{"heat":memory}}
+        self.h.journal.write_text(json.dumps(before))
+        with patch.object(pilot,"TOPOLOGY",after_topo):
+            after=self.run_cycle(20,cache=("bedroom","living","study"))
+        self.assertEqual(after["closed_loop"]["trackers"],obs)
+        self.assertEqual(after["closed_loop"]["maintenance"]["bedroom"]["heat"],memory)
+        self.assertEqual(after["baselines"],before["baselines"])
+        self.assertEqual(len(after["commands"]),len(before["commands"]))
 
     def test_real_sqlite_row_learning_episode(self):
         db=self.h.db

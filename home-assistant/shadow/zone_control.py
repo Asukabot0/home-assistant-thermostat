@@ -32,9 +32,12 @@ def add_points(row, observation, identity, now, policy):
         row.update(identity=identity, changed_at=now, points=[])
     points = row["points"]
     at = observation["at"]
-    if points and now-points[-1][0] > policy["tracking_gap_seconds"]:
+    endpoint = at if observation["quality"] == "fresh" and points and at > points[-1][0] else now
+    if points and endpoint-points[-1][0] > policy["tracking_gap_seconds"]:
         points.clear()
-    if (observation["quality"] == "fresh" and (not points or at > points[-1][0])):
+        row.pop("recovery", None)
+        row["changed_at"] = endpoint
+    if observation["quality"] == "fresh" and (not points or at > points[-1][0]):
         points.append([at, observation["value"]])
     points[:] = [p for p in points if p[0] >= now-policy["tracking_history_seconds"]]
     return points
@@ -42,15 +45,34 @@ def add_points(row, observation, identity, now, policy):
 
 def track(row, observation, target, estimate, paused, now, policy):
     measured = observation["value"]
+    episode = row.get("recovery") or {}
     result = {"measured": measured, "target": target, "at": observation["at"], "quality": observation["quality"],
               "trend": estimate, "paused": paused, "intent": "limited", "reason": "data_missing",
-              "direction": None, "duration": 0, "report_span": 0, "reports": 0, "qualified": False}
+              "direction": episode.get("direction"), "duration": 0, "report_span": 0, "reports": 0,
+              "qualified": False, "recovery_active": bool(episode), "settling_reports": 0, "settling_span": 0}
     if target is None or observation["quality"] != "fresh":
         return result
     error = target-measured
     band = policy["tracking_band"]
     result["error"] = error
     if abs(error) <= band+TEMP_EPSILON:
+        if episode:
+            inside = []
+            for at, value in reversed(row["points"]):
+                if at <= episode["last_outside"] or abs(value-target) > band+TEMP_EPSILON:
+                    break
+                inside.append(at)
+            span = inside[0]-inside[-1] if inside else 0
+            result.update(settling_reports=len(inside), settling_span=span, duration=now-episode["since"],
+                          evidence_from=episode["since"], intent="observe" if not paused else "limited",
+                          reason="verify_stable_recovery" if not paused else "zone_paused")
+            projected = measured+(estimate["delta"] if estimate else 0)
+            moving_out = (estimate is not None and abs(estimate["delta"])-estimate["uncertainty"] >= policy["minimum_progress_c"]
+                          and abs(projected-target) > band+TEMP_EPSILON)
+            if len(inside) < 2 or span < policy["recovery_settle_seconds"] or moving_out:
+                return result
+            row.pop("recovery", None)
+            result.update(direction=None, recovery_active=False, recovery_completed_at=inside[0])
         result.update(intent="maintain" if not paused else "limited", reason="near_target" if not paused else "zone_paused")
         return result
     mode = "heat" if error > 0 else "cool"
@@ -65,16 +87,29 @@ def track(row, observation, target, estimate, paused, now, policy):
     duration = now-outside[-1] if outside else 0
     enough = (len(outside) >= 2 and duration >= policy["tracking_dwell_seconds"]
               and span >= policy["tracking_report_span_seconds"])
+    if episode.get("direction") != mode:
+        row.pop("recovery", None)
+        episode = {}
+    if enough and not episode and not paused:
+        episode = {"direction":mode, "since":outside[-1], "report_span":span, "reports":len(outside),
+                   "last_outside":outside[0]}
+        row["recovery"] = episode
+    if episode and outside:
+        episode["last_outside"] = max(episode["last_outside"], outside[0])
+    if episode:
+        duration = now-episode["since"]
     returning = (estimate is not None and sign*estimate["delta"]-estimate["uncertainty"]
                  >= max(policy["minimum_progress_c"], (abs(error)-band)*policy["forecast_seconds"]/policy["recovery_horizon_seconds"]))
     result.update(direction=mode, duration=duration, report_span=span, reports=len(outside),
-                  evidence_from=outside[-1] if outside else None, qualified=enough and not returning and not paused,
-                  intent="limited" if paused else "recover" if enough and not returning else "observe",
-                  reason="zone_paused" if paused else "returning" if returning else "confirmed_bias" if enough else "waiting_reports_or_dwell")
+                  evidence_from=episode["since"] if episode else outside[-1] if outside else None,
+                  recovery_active=bool(episode), recovery_evidence={k:episode[k] for k in ("report_span", "reports")} if episode else None,
+                  qualified=bool(episode and outside and not returning and not paused),
+                  intent="limited" if paused else "recover" if episode and not returning else "observe",
+                  reason="zone_paused" if paused else "returning" if returning else "confirmed_bias" if episode else "waiting_reports_or_dwell")
     return result
 
 
-def setting_effect(actions, context, now, observations, topology, state, policy, readings):
+def setting_effect(actions, now, observations, topology, state, policy, readings):
     """Bind observed outcomes to a serialized action, target and observation definition."""
     seen = state.setdefault("effects", {})
     cutoff = now-86400
@@ -85,7 +120,8 @@ def setting_effect(actions, context, now, observations, topology, state, policy,
         age = now-at
         key = str(action["sent_at"])
         if (scope is None or key in seen or age < policy["effect_sample_wait_seconds"]
-                or age > policy["effect_max_seconds"] or scope["definition"] != context):
+                or age > policy["effect_max_seconds"] or scope["definition"] != topology["action_versions"][action["room"]]
+                or scope.get("learning_version") != topology["learning_versions"][action["room"]]):
             continue
         zone, mode = scope["zone"], scope["mode"]
         after = observations.get(zone)
@@ -107,17 +143,18 @@ def setting_effect(actions, context, now, observations, topology, state, policy,
                          "thermal_delta": direction*(after["measured"]-scope["before_c"]),
                          "command_at": action["sent_at"], "proxy_at": at, "kind": action["kind"],
                          "watt_hours": 1000*kwh, "covered_seconds": covered, "interval_seconds": after["at"]-at,
-                         "weather_c": scope.get("weather_c"), "source_version": after["source_version"]}
+                         "weather_c": scope.get("weather_c"), "source_version": after["source_version"],
+                         "learning_version": topology["learning_versions"][action["room"]]}
 
 
 def observations(topology, live, inputs, state, actions, paused, now, policy=POLICY, *, readings=None):
     by_sensor = {key: sensor_reading(s, live, inputs, now) for key, s in topology["sensors"].items()
                  if s.get("enabled", True)}
-    context = topology["fingerprint"]
-    if state.get("definition") != context:
-        state.clear()
-        state["definition"] = context
+    previous = state.get("definition")
+    state["definition"] = topology["fingerprint"]
     trackers = state.setdefault("trackers", {})
+    for removed in trackers.keys()-topology["zones"].keys():
+        del trackers[removed]
     out = {}
     for key, zone in topology["zones"].items():
         primary = by_sensor[zone["primary"]]
@@ -133,17 +170,40 @@ def observations(topology, live, inputs, state, actions, paused, now, policy=POL
         target = zone_target(zone, live, inputs)
         switched = inputs.get(zone.get("pause_entity"), {}).get("state")
         is_paused = key in paused or bool(zone.get("pause_entity") and switched != "off")
-        identity = fingerprint([context, ref["source"], target, is_paused])
+        definition = topology["zone_versions"][key]
+        identity = fingerprint([definition, ref["source"], target, is_paused])
         memory = trackers.setdefault(key, {})
+        if memory and "zone_version" not in memory and previous == topology["fingerprint"]:
+            legacy = fingerprint([previous, ref["source"], target, is_paused])
+            if memory["identity"] == legacy:
+                memory["identity"] = identity
+                for room, modes in state.get("maintenance", {}).items():
+                    if topology["actuators"].get(room, {}).get("zone") == key:
+                        for entry in modes.values():
+                            if entry["source_version"] == legacy:
+                                entry.update(source_version=identity, learning_version=topology["learning_versions"][room])
+                for entry in state.get("effects", {}).values():
+                    if entry["zone"] == key and entry["source_version"] == legacy and entry["unit"] in topology["actuators"]:
+                        entry.update(source_version=identity, learning_version=topology["learning_versions"][entry["unit"]])
         points = add_points(memory, ref, identity, now, policy)
+        memory["zone_version"] = definition
         changed = max((a["proxy_at"] for a in actions if key in topology["actuators"][a["room"]]["influences"]), default=0)
         forecast = trend(points, max(changed, memory["changed_at"]), now, policy) if ref["quality"] == "fresh" else None
         result = track(memory, ref, target, forecast, is_paused, now, policy)
-        result.update(source_version=identity, source=ref["source"], primary=zone["primary"],
+        result.update(source_version=identity, observation_definition=definition, source=ref["source"], primary=zone["primary"],
                       primary_reading=primary, inputs=sensors,
                       constraints={k: s for k, s in sensors.items() if topology["sensors"][k]["role"] == "constraint"})
         out[key] = result
-    setting_effect(actions, context, now, out, topology, state, policy, readings or {})
+    for room, modes in list(state.get("maintenance", {}).items()):
+        home = topology["actuators"].get(room, {}).get("zone")
+        state["maintenance"][room] = {mode:entry for mode,entry in modes.items() if home in out
+            and entry.get("learning_version") == topology["learning_versions"][room]
+            and entry["source_version"] == out[home]["source_version"]}
+    if "effects" in state:
+        state["effects"] = {key: entry for key,entry in state["effects"].items() if entry["zone"] in out
+            and entry["source_version"] == out[entry["zone"]]["source_version"]
+            and entry.get("learning_version") == topology["learning_versions"].get(entry["unit"])}
+    setting_effect(actions, now, out, topology, state, policy, readings or {})
     environment = {k: v for k, v in by_sensor.items() if topology["sensors"][k]["role"] == "environment"}
     return out, environment
 
@@ -207,11 +267,12 @@ def is_strengthening(action):
 
 def allocation_scope(room, zone, zones, environment, topology):
     return {"unit": room, "zone": zone, "target": zones[zone]["target"], "source_version": zones[zone]["source_version"],
-            "definition": topology["fingerprint"], "at": zones[zone]["at"], "before_c": zones[zone]["measured"],
+            "definition": topology["action_versions"][room], "learning_version": topology["learning_versions"][room],
+            "at": zones[zone]["at"], "before_c": zones[zone]["measured"],
             "weather_c": next((v["value"] for v in environment.values() if v["quality"] == "fresh"), None)}
 
 
-def maintain_setting(now, room, mode, setting, zone, local, readings, other_output, policy):
+def maintain_setting(now, room, mode, setting, zone, local, readings, other_output, policy, learning_version):
     if other_output or zone["intent"] != "maintain" or zone["trend"] is None:
         return
     points = local["trackers"][zone["key"]]["points"]
@@ -226,7 +287,7 @@ def maintain_setting(now, room, mode, setting, zone, local, readings, other_outp
             and abs(zone["trend"]["delta"]) <= policy["minimum_progress_c"]):
         local.setdefault("maintenance", {}).setdefault(room, {})[mode] = {
             "setpoint": setting, "target": zone["target"], "source_version": zone["source_version"],
-            "at": recent[-1][0], "observed_seconds": recent[-1][0]-recent[0][0]}
+            "at": recent[-1][0], "observed_seconds": recent[-1][0]-recent[0][0], "learning_version":learning_version}
 
 
 def comparison_rank(options, zone, mode, environment, local, policy):
@@ -241,6 +302,136 @@ def comparison_rank(options, zone, mode, environment, local, policy):
         if len(samples) >= policy["effect_samples_min"]:
             scores[room] = median(e["watt_hours"]/e["improvement"] for e in samples)
     return scores if len(scores) >= 2 else {}
+
+
+def quiet_power(now, live, shadow, duration, *, after=None):
+    proof = shadow.get("power_evidence") or {}
+    low = proof.get("bands", {}).get("low", {})
+    watts = numeric(live["adapter"]["power"])
+    cutoff = shadow.get("reversal_low_cutoff")
+    if (not current_power_evidence(now, live, shadow) or watts is None or cutoff is None or watts >= cutoff
+            or (since := low.get("since")) is None):
+        return False
+    return proof["last_report"]-max(since, after or since) >= duration
+
+
+def exit_wait(room, direction, now, live, readings, state, policy):
+    """An opposite stop echo alone does not free the next mode to strengthen."""
+    return any(peer != room and peer in live and live[peer]["adapter"]["mode"] == "off"
+               and parked.get("handoff") and parked["mode"] != direction
+               and ((live[room].get("temperature_report_at") or 0) <= parked["off_at"]
+                    or (live[peer].get("temperature_report_at") or 0) <= parked["off_at"]
+                    or not quiet_power(now,live[peer],readings.get(peer,{}),policy["lower_output_observe_seconds"],
+                                       after=parked["off_at"]))
+               for peer, parked in state["parked"].items())
+
+
+def yielding_safe(zone, direction, policy):
+    # Consider deterioration in the direction the yielding unit is currently
+    # counteracting. A genuine opposite demand may wait only inside comfort.
+    if zone["paused"] or zone["quality"] != "fresh" or zone["target"] is None:
+        return False
+    deficit = DIRECTION[direction]*(zone["target"]-zone["measured"])
+    forecast = zone["trend"]
+    risk = max(0, -DIRECTION[direction]*forecast["delta"]+forecast["uncertainty"]) if forecast else 0
+    return deficit+risk < policy["comfort_band"]-TEMP_EPSILON
+
+
+def conflict_options(demands, modes, live, readings, feasible, zones, output, control_ready, topology, configurations, parked, now, policy):
+    options, blocked = {}, {}
+    units = topology["actuators"]
+    for zone in demands:
+        direction = zones[zone]["direction"]
+        blocked[zone] = "opposing_output_cannot_yield"
+        for room in sorted(feasible[zone], key=lambda r:(units[r]["zone"] != zone, modes[r] != direction,
+                                                        units[r].get("priority",0), r)):
+            mode, setting = modes[room], numeric(live[room]["adapter"]["setpoint"])
+            if not (mode == direction and setting is not None and automatic_setpoint(setting, DIRECTION[mode],
+                        configurations[room]["soft_limits"][mode]) is not None or
+                    mode == "off" and room in parked):
+                continue
+            blockers = [r for r, m in modes.items() if r != room and m not in {direction, "off", "fan_only"}
+                        and not opposing_allowed(room, zone, r, modes, zones, topology, output)]
+            if any(modes[r] not in ACTIVE or not control_ready.get(r) or r not in readings or
+                   readings[r].get("reversal_low_cutoff") is None or
+                   not current_power_evidence(now,live[r],readings[r]) or
+                   not yielding_safe(zones[units[r]["zone"]],modes[r],policy) for r in blockers):
+                continue
+            options[zone] = (room, sorted(blockers))
+            blocked.pop(zone)
+            break
+        if not feasible[zone]:
+            blocked[zone] = "no_comfort_safe_assignment"
+    return options, blocked
+
+
+def contest_owner(demands, options, local, actions, zones, now, policy):
+    served = {key: max((a["proxy_at"] for a in actions if a.get("control",{}).get("zone") == key
+                        and is_strengthening(a) and a["proxy_at"] >= (zones[key]["evidence_from"] or 0)), default=0)
+              for key in options}
+    owner = local.get("owner")
+    plan = local.get("handoff")
+    if owner in options:
+        elected_at = local.get("selected_at",0)
+        turn = min((a["proxy_at"] for a in actions if a.get("control",{}).get("zone") == owner and
+                    is_strengthening(a) and a["proxy_at"] >= elected_at),default=elected_at)
+        if (plan and plan["owner"] == owner) or now-turn < policy["peer_fairness_wait_seconds"]:
+            return owner
+    if owner in options and len(options) > 1 and not served.get(owner):
+        # The selected area already had a feasible opportunity. Yield the
+        # next arbitration slot if it produced no successful increase.
+        return next(key for key in demands if key in options and key != owner)
+    return min(options, key=lambda k: (abs(zones[k]["error"]) <= policy["comfort_band"]+TEMP_EPSILON,
+                                       max(zones[k]["evidence_from"] or 0, served[k]), demands.index(k)), default=None)
+
+
+def handoff_step(owner, choice, zones, modes, live, readings, actions, ready, topology, local, now, policy):
+    plan = local.get("handoff")
+    room = choice[0] if choice else None
+    blockers = choice[1] if choice else []
+    direction = zones[owner]["direction"] if owner is not None else None
+    # A plan keys off the actual observation and equipment dependencies.
+    binding = topology["action_versions"][room] if room is not None else None
+    if plan and (plan["owner"] != owner or plan["receiver"] != room or plan["direction"] != direction or
+                 plan["definition"] != binding or plan["source_version"] != zones[owner]["source_version"] or
+                 plan["blocker"] not in modes or plan["blocker_definition"] != topology["action_versions"][plan["blocker"]] or
+                 plan["blocker_version"] != zones[topology["actuators"][plan["blocker"]]["zone"]]["source_version"]):
+        plan = None
+        local.pop("handoff",None)
+    if plan is None and blockers:
+        blocker = blockers[0]
+        plan = {"owner":owner,"receiver":room,"blocker":blocker,"direction":direction,"selected_at":now,
+                "definition":binding,"source_version":zones[owner]["source_version"],
+                "blocker_definition":topology["action_versions"][blocker],
+                "blocker_version":zones[topology["actuators"][blocker]["zone"]]["source_version"]}
+        local["handoff"] = plan
+    if plan is None:
+        return None
+    blocker = plan["blocker"]
+    off = next((a for a in reversed(actions) if a["room"] == blocker and a["purpose"] == "handoff_off" and
+                a.get("control",{}).get("handoff_at") == plan["selected_at"]),None)
+    reduce = next((a for a in reversed(actions) if a["room"] == blocker and a["purpose"] == "handoff_reduce" and
+                   a.get("control",{}).get("handoff_at") == plan["selected_at"]),None)
+    peer_zone = zones[topology["actuators"][blocker]["zone"]]
+    if off:
+        if (not quiet_power(now,live[blocker],readings.get(blocker,{}),policy["lower_output_observe_seconds"],after=off["proxy_at"]) or
+                modes[blocker]!="off" or not all(response_ready(now,z,off,policy["reduction_wait_seconds"])
+                                                 for z in (zones[owner],peer_zone))):
+            return dict(plan,phase="verify_exit",reason="observe_both_sensors_and_low_power_after_off")
+        local.pop("handoff",None)
+        if blockers:
+            return handoff_step(owner,choice,zones,modes,live,readings,actions,ready,topology,local,now,policy)
+        return dict(plan,phase="serve",reason="exit_verified")
+    if blocker not in blockers:
+        local.pop("handoff",None)
+        return None
+    if not ready.get(blocker):
+        return dict(plan,phase="limited",reason="yielding_equipment_locked")
+    if reduce and not all(response_ready(now,z,reduce,policy["reduction_wait_seconds"]) for z in (zones[owner],peer_zone)):
+        return dict(plan,phase="verify_reduction",reason="observe_both_sensors_after_reduction")
+    if reduce or quiet_power(now,live[blocker],readings.get(blocker,{}),policy["lower_output_observe_seconds"]):
+        return dict(plan,phase="exit",reason="reduced_or_proven_dormant_opposition")
+    return dict(plan,phase="reduce",reason="yield_one_bounded_step")
 
 
 def coordinate(live, readings, ready, state, now, configurations, connected, topology, inputs, paused, trace,
@@ -266,28 +457,39 @@ def coordinate(live, readings, ready, state, now, configurations, connected, top
     control_ready = ready if control_ready is None else control_ready
     feasible = {key: [r for r in sorted(connected) if control_ready.get(r) and key in units[r]["influences"] and key not in uncertain
                        and zones[units[r]["zone"]]["quality"] == "fresh" and not zones[units[r]["zone"]]["paused"]
+                       and not (units[r]["zone"] != key and zones[units[r]["zone"]]["recovery_active"]
+                                and zones[units[r]["zone"]]["direction"] != zones[key]["direction"])
                        and zones[key]["direction"] in live[r]["adapter"]["modes"]
                        and not any(x["reason"] != "peer_near_boundary" for x in peer_risk(r, key, zones[key]["direction"], zones, topology, policy))]
                 for key in demands}
-    owner = next((key for key in demands if feasible[key]), None)
-    need = zones[owner]["direction"] if owner is not None else "hold" if all(z["quality"] == "fresh" for z in zones.values()) else "unknown"
+    contest = len({zones[key]["direction"] for key in demands}) > 1
+    blocked = {}
     contender = local.get("owner")
-    if owner and contender in demands and feasible[contender] and zones[contender]["direction"] != need:
-        head, previous = zones[owner], zones[contender]
-        if (abs(head["error"]) <= policy["comfort_band"]+TEMP_EPSILON
-                and now-local.get("selected_at", 0) < duration and abs(head["error"]) < abs(previous["error"])+.3):
-            owner, need = contender, previous["direction"]
+    if contest:
+        options, blocked = conflict_options(demands,modes,live,readings,feasible,zones,output,control_ready,topology,
+                                            configurations,state["parked"],now,policy)
+        owner = contest_owner(demands,options,local,actions,zones,now,policy)
+        handoff = handoff_step(owner,options.get(owner),zones,modes,live,readings,actions,ready,topology,local,now,policy)
+        elected = options[owner][0] if owner is not None else None
+    else:
+        owner = next((key for key in demands if feasible[key]),None)
+        # Once an off is in the journal its low-power gate remains in force,
+        # even when the two-sided intent no longer qualifies for this plan.
+        local.pop("handoff",None)
+        handoff = elected = None
+    need = zones[owner]["direction"] if owner is not None else "hold" if all(z["quality"] == "fresh" for z in zones.values()) else "unknown"
     energy_scores = comparison_rank(feasible[owner], zones[owner], need, environment, local, policy) if owner else {}
     if owner != contender:
         local.update(owner=owner, selected_at=now)
     trace.update(topology=topology["observation_version"], definition=topology["fingerprint"], zones=zones,
                  environment=environment, owner=owner, demand_order=demands, feasible=feasible, output_evidence=output,
                  risks={}, equipment={}, observations_after={}, action_scopes=scopes, energy_scores=energy_scores,
-                 recent_effects=list(local.get("effects", {}).values())[-8:], uncertain_zones=sorted(uncertain))
+                 recent_effects=list(local.get("effects", {}).values())[-8:], uncertain_zones=sorted(uncertain),
+                 handoff=handoff, conflict=contest, yielding_blocks=blocked, elected=elected)
     for key in demands:
         if key != owner:
             zones[key].update(intent="limited", reason="unconfirmed_influencing_equipment" if key in uncertain else
-                              "conflicting_priority" if feasible[key] else "no_safe_equipment")
+                              blocked.get(key, "conflicting_priority" if feasible[key] else "no_safe_equipment"))
     for room in sorted(connected):
         unit = units[room]
         home = unit["zone"]
@@ -313,17 +515,43 @@ def coordinate(live, readings, ready, state, now, configurations, connected, top
         risks = peer_risk(room, serve, need if need in ACTIVE else mode, zones, topology, policy) if mode in ACTIVE or need in ACTIVE else []
         trace["risks"][room] = risks
         active_risk = peer_risk(room, home, mode, zones, topology, policy) if mode in ACTIVE else []
-        red_risk = any(r["reason"] == "peer_comfort_risk" for r in active_risk)
+        own_critical_need = (mode in ACTIVE and local_zone.get("error") is not None and
+                             DIRECTION[mode]*local_zone["error"] >= policy["comfort_band"]-TEMP_EPSILON)
+        red_risk = any(r["reason"] == "peer_comfort_risk" for r in active_risk) and not own_critical_need
         opposite = {peer for peer, m in modes.items() if peer != room and m not in {"off", "fan_only", need}
                     and not opposing_allowed(room, serve, peer, modes, zones, topology, output)}
         own_wait = response_ready(now, zone, own, policy["feedback_wait_seconds"])
         up_wait = response_ready(now, zone, last_up, policy["feedback_wait_seconds"])
-        can_strengthen = (owner == serve and room in feasible.get(serve, ()) and not opposite and own_wait and up_wait)
+        handoff_wait = (handoff is not None and handoff["phase"] != "serve"
+                        or need in ACTIVE and exit_wait(room,need,now,live,readings,state,policy))
+        can_strengthen = (owner == serve and room in feasible.get(serve, ()) and not opposite and own_wait and up_wait
+                          and not handoff_wait and (elected is None or room == elected))
         if last_up is not None and not up_wait and owner == serve:
             zone["intent"] = "observe"
         priority = unit.get("priority", 0)
         rank = (int(home != serve), round(energy_scores.get(room, float("inf")), 4),
                 priority, -unit["influences"][serve])
+        if handoff and room == handoff["blocker"] and handoff["phase"] != "serve":
+            reasons[room] = handoff["reason"]
+            # Bind each candidate to the local observation of the yielding
+            # equipment as well as the elected plan kept in the trace.
+            scopes[room] = allocation_scope(room,home,zones,environment,topology)
+            scopes[room].update(mode=mode,power_context=power.get("context"),handoff_at=handoff["selected_at"],
+                                handoff_phase=handoff["phase"])
+            if handoff["phase"] == "exit":
+                candidates.append((0,rank,room,"mode","off","handoff_off"))
+            elif handoff["phase"] == "reduce" and mode in ACTIVE and setting is not None and output.get(room):
+                if response_ready(now,local_zone,own,policy["reduction_wait_seconds"]):
+                    step = automatic_setpoint(setting,-DIRECTION[mode]*policy["ordinary_step"],configurations[room]["soft_limits"][mode])
+                    if step is None:
+                        handoff.update(phase="exit",reason="yield_at_safe_boundary")
+                        scopes[room]["handoff_phase"] = "exit"
+                        candidates.append((0,rank,room,"mode","off","handoff_off"))
+                    else:
+                        candidates.append((1,rank,room,"temperature",step,"handoff_reduce"))
+                else:
+                    reasons[room]="verify_previous_yielding_action"
+            continue
         if mode == "off":
             live_same = [r for r in feasible.get(serve, ()) if modes[r] == need and r != room]
             if live_same:
@@ -344,7 +572,7 @@ def coordinate(live, readings, ready, state, now, configurations, connected, top
                 candidates.append((3, rank, room, "mode", need, "energy_start"))
                 reasons[room] = "start_for_confirmed_zone_error"
             else:
-                reasons[room] = "wait_opposite_or_observation" if opposite or not own_wait or not up_wait else "no_admissible_start"
+                reasons[room] = "wait_opposite_or_observation" if opposite or handoff_wait or not own_wait or not up_wait else "no_admissible_start"
             continue
         if mode not in ACTIVE or setting is None:
             continue
@@ -367,10 +595,10 @@ def coordinate(live, readings, ready, state, now, configurations, connected, top
                      and any(output[p] and p != room and modes[p] == mode and units[p]["zone"] == home for p in output))
         reducing = direct or red_risk or expected > policy["tracking_band"]+TEMP_EPSILON or blocks_needed or redundant
         low = power.get("bands", {}).get("low", {})
-        quiet = current_power_evidence(now, live[room], row) and low.get("seconds", 0) >= policy["lower_output_observe_seconds"]
+        quiet = quiet_power(now, live[room], row, policy["lower_output_observe_seconds"])
         eased = own is not None and own["kind"] == "temperature" and not is_strengthening(own)
         return_after = response_ready(now, local_zone, own, policy["reduction_wait_seconds"])
-        if own and quiet and DIRECTION.get(mode) and low.get("since") is not None and low["since"] > own["proxy_at"]:
+        if own and quiet and low["since"] > own["proxy_at"]:
             return_after = return_after or now-own["proxy_at"] >= policy["reduction_wait_seconds"]
         if reducing:
             if local_zone["intent"] == "maintain":
@@ -402,11 +630,17 @@ def coordinate(live, readings, ready, state, now, configurations, connected, top
                 candidates.append((4, rank, room, "temperature", proposed, "zone_strengthen"))
                 reasons[room] = "bounded_zone_correction"
                 continue
-        reasons[room] = "observe_local_response" if not own_wait or not up_wait else "hold_effective_setting"
+        reasons[room] = (blocked.get(home,"unmet_conflicting_demand") if contest and owner is None and local_zone["recovery_active"] else
+                         "wait_coordinated_exit" if (handoff_wait or opposite) and zone["recovery_active"] else
+                         "unmet_conflicting_demand" if contest and any(zones[k]["direction"] == mode for k in demands) else
+                         "observe_local_response" if not own_wait or not up_wait else "hold_effective_setting")
         row = dict(row, operation_since=max(live[room]["adapter"]["last_mode_change"], own["proxy_at"] if own else 0))
         maintain_setting(now, room, mode, setting, local_zone, local, row,
-                         any(output[other] and other != room and home in units[other]["influences"] for other in output), policy)
-    trace["unmet"] = {key: zones[key]["reason"] for key in demands if key != owner or not candidates}
+                         any(output[other] and other != room and home in units[other]["influences"] for other in output), policy,
+                         topology["learning_versions"][room])
+    scheduled = {scopes[item[2]]["zone"] for item in candidates if item[-1] in {"zone_strengthen","energy_start"}}
+    trace["unmet"] = {key: ("handoff_pending" if handoff and key == owner else zones[key]["reason"])
+                      for key in demands if key not in scheduled}
     trace["need"] = need
     trace["normal_need"] = need
     trace["gentle"] = {"state": "replaced_by_zone_tracking"}
