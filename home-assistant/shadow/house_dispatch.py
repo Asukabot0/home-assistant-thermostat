@@ -67,7 +67,7 @@ def final_gate(candidate, now, live, readings, connected, state, configurations,
             if not plan or plan["blocker"] != room or plan["phase"] != phase or plan["owner"] != trace["owner"]:
                 return "协调退出阶段不再有效"
         if stronger:
-            from zone_control import exit_wait, opposing_allowed
+            from zone_control import allows_assistance, exit_wait, opposing_allowed
             if (plan and plan["phase"] != "serve" or exit_wait(room,value if kind=="mode" else mode,now,live,readings,state,policy)):
                 return "等待相反设备实测低耗和退出后反馈"
             scope = trace["action_scopes"].get(room)
@@ -76,6 +76,8 @@ def final_gate(candidate, now, live, readings, connected, state, configurations,
             if (not zone or not zone["qualified"] or zone["paused"] or zone["direction"] != direction
                     or scope["zone"] != trace["owner"] or room not in trace["feasible"].get(scope["zone"], ())):
                 return "区域需求或作用范围已变化"
+            if scope["zone"] != home and not allows_assistance(local, direction):
+                return "本区无已确认同向需求，暂停跨区加码"
             modes = {unit: live[unit]["adapter"]["mode"] for unit in connected}
             if any(m not in {direction, "off", "fan_only"} and not opposing_allowed(
                     room, scope["zone"], unit, modes, trace["zones"], topology, trace["output_evidence"])

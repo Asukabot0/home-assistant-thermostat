@@ -24,7 +24,7 @@ from pilot_gate import ROOMS, matching_feedback, room_advice, room_feedback
 from service import CONFIG, encode, local
 from live_evidence import attach as attach_power
 from topology import extra_inputs, read_topology
-from zone_control import coordinate as coordinate_zones, learned_initial
+from zone_control import allows_assistance, coordinate as coordinate_zones, learned_initial
 
 
 PERMIT = DATA_DIR / "continuous-permit.json"
@@ -323,10 +323,12 @@ def assess(live, state, now, advise_room=room_advice, *, trial=True, isolated=()
             or trace["gentle"]["reason"] in {"inside_ideal_band", "peer_comfort_risk", "returning_to_ideal"}))
         if TOPOLOGY is not None:
             binding = member.get("control") or {}
+            local = trace["zones"][home]
             invalid = (zone_name != trace["owner"] or binding.get("definition") != TOPOLOGY["action_versions"][room]
                        or binding.get("source_version") != zone["source_version"] or binding.get("target") != zone["target"]
-                       or not zone["qualified"] or zone["direction"] != mode or room not in trace["feasible"].get(zone_name, ()))
-            target = zone["target"]
+                       or not zone["qualified"] or zone["direction"] != mode or room not in trace["feasible"].get(zone_name, ())
+                       or (zone_name != home and not allows_assistance(local, mode)))
+            target = local["target"]
         if invalid:
             if not member.get("initial_invalidated") or member["target"] != target:
                 invalidated.append(room)
@@ -394,8 +396,9 @@ def assess(live, state, now, advise_room=room_advice, *, trial=True, isolated=()
             if (zone is None or zone_name != trace["owner"] or not zone["qualified"]
                     or zone["source_version"] != binding.get("source_version") or zone["target"] != binding.get("target")):
                 continue
-            initial = learned_initial(room, mode, zone, state["closed_loop"], ROOMS[room]["soft_limits"][mode])
-            target = zone["target"]
+            home_zone = trace["zones"][TOPOLOGY["actuators"][room]["zone"]]
+            initial = learned_initial(room, mode, home_zone, state["closed_loop"], ROOMS[room]["soft_limits"][mode])
+            target = home_zone["target"]
             trace["feasible"].setdefault(zone_name, []).append(room)
             trace["action_scopes"][room] = dict(binding, before_c=zone["measured"], at=zone["at"])
         else:

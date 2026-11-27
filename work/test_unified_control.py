@@ -103,6 +103,139 @@ class UnifiedCycleTests(unittest.TestCase):
         self.assertFalse(any(a[1].get("temperature",0)>22 for a in self.h.calls))
         self.assertEqual(trace["zones"]["sleep"]["intent"],"limited")
 
+    def test_auxiliary_strengthening_preserves_home_tracking_boundary(self):
+        for mode, bedroom_temperature, living_temperature in (
+            ("cool", 22.7, 24.4), ("heat", 23.3, 23.6)
+        ):
+            with self.subTest(mode=mode):
+                self.h.journal.unlink(missing_ok=True)
+                self.h.calls.clear()
+                self.scene(bed=(mode, 23, bedroom_temperature, 402),
+                           lounge=("off", 24, living_temperature, 8),
+                           study=("off", 24, living_temperature, 8))
+                bedroom = self.h.live["bedroom"]
+                signature = bedroom["signature"]
+                bedroom["signature"] = (*signature[:4], 23, *signature[5:])
+                self.h.update_state(manual_holds={"living": "fixture", "study": "fixture"})
+
+                self.qualify()
+
+                trace = self.trace()
+                self.assertTrue(trace["zones"]["lounge"]["qualified"])
+                self.assertEqual(trace["zones"]["lounge"]["direction"], mode)
+                self.assertNotIn("bedroom", trace["feasible"]["lounge"])
+                self.assertEqual(self.h.calls, [])
+
+    def test_auxiliary_start_requires_home_recovery(self):
+        self.scene(bed=("off", 25, 24.0, 8), lounge=("off", 24, 24.6, 8), study=("off", 24, 24.6, 8))
+        self.h.update_state(manual_holds={"living": "fixture", "study": "fixture"})
+
+        self.qualify()
+
+        trace = self.trace()
+        self.assertEqual(trace["zones"]["sleep"]["intent"], "maintain")
+        self.assertTrue(trace["zones"]["lounge"]["qualified"])
+        self.assertNotIn("bedroom", trace["feasible"]["lounge"])
+        self.assertEqual(self.h.calls, [])
+
+    def test_auxiliary_initial_uses_home_target_and_requires_continuing_recovery(self):
+        for measured, initial in ((23.4, 23), (22.7, None)):
+            with self.subTest(measured=measured):
+                self.h.journal.unlink(missing_ok=True)
+                self.h.calls.clear()
+                self.scene(bed=("off", 25, 23.4, 8), lounge=("off", 24, 24.6, 8),
+                           study=("off", 24, 24.6, 8))
+                bedroom = self.h.live["bedroom"]
+                signature = bedroom["signature"]
+                bedroom["signature"] = (*signature[:4], 23, *signature[5:])
+                self.h.update_state(manual_holds={"living": "fixture", "study": "fixture"})
+
+                started = self.qualify()
+                self.assertEqual([(a["room"], a["value"], a["purpose"]) for a in started["commands"]],
+                                 [("bedroom", "cool", "energy_start")])
+                self.assertEqual(started["commands"][0]["control"]["zone"], "lounge")
+
+                guarded = self.run_cycle(60, bed=measured)
+
+                self.assertEqual(guarded["commands"][0]["status"], "proxy_echo")
+                if initial is None:
+                    self.assertEqual(self.trace()["invalidated_initial"], ["bedroom"])
+                    self.assertNotIn("bedroom", guarded["transitions"])
+                    self.assertEqual(len(self.h.calls), 1)
+                else:
+                    self.assertEqual((guarded["commands"][-1]["purpose"], guarded["commands"][-1]["value"]),
+                                     ("reversal_initial", initial))
+
+    def test_auxiliary_strengthening_waits_for_own_temperature_report(self):
+        self.scene(bed=("cool", 24, 24.4, 402), lounge=("off", 24, 24.6, 8), study=("off", 24, 24.6, 8))
+        self.h.update_state(manual_holds={"living": "fixture", "study": "fixture"})
+        first = self.qualify()
+        self.assertEqual(len(self.h.calls), 1)
+        self.assertEqual((first["commands"][-1]["purpose"], first["commands"][-1]["control"]["zone"]),
+                         ("zone_strengthen", "lounge"))
+
+        self.run_cycle(620, cache=("bedroom",))
+
+        self.assertTrue(self.trace()["zones"]["sleep"]["qualified"])
+        self.assertEqual(len(self.h.calls), 1)
+
+        updated = self.run_cycle(60)
+        self.assertEqual(len(self.h.calls), 2)
+        self.assertEqual((updated["commands"][-1]["purpose"], updated["commands"][-1]["value"]),
+                         ("zone_strengthen", 22))
+
+    def test_comfort_overrun_stops_with_fresh_pre_easing_report(self):
+        for mode, setting, previous, measured in (("cool", 23, 22, 22.0), ("heat", 24, 25, 25.0)):
+            with self.subTest(mode=mode):
+                self.h.journal.unlink(missing_ok=True)
+                self.h.calls.clear()
+                self.scene(bed=(mode, setting, measured, 538))
+                bedroom = self.h.live["bedroom"]
+                target = 23 if mode == "cool" else 24
+                signature = bedroom["signature"]
+                bedroom["signature"] = (*signature[:4], target, *signature[5:])
+                self.h.recent_adjustment("bedroom", previous, ago=5)
+                report_at = bedroom["temperature_report_at"]
+
+                sent = self.run_cycle(cache=("bedroom",))
+
+                self.assertEqual(report_at, self.trace()["zones"]["sleep"]["at"])
+                self.assertLess(report_at, sent["commands"][0]["proxy_at"])
+                self.assertEqual(self.h.calls, [("services/climate/set_hvac_mode", {
+                    "entity_id": pilot.ROOMS["bedroom"]["adapter"], "hvac_mode": "off"
+                })])
+                self.assertEqual((sent["commands"][-1]["purpose"], sent["commands"][-1]["status"]),
+                                 ("energy_off", "accepted"))
+                settled = self.run_cycle(20, cache=("bedroom",))
+                self.assertEqual(settled["commands"][-1]["status"], "proxy_echo")
+                self.assertEqual(len(self.h.calls), 1)
+
+    def test_comfort_overrun_respects_minimum_runtime_and_current_observations(self):
+        for case in ("minimum_runtime", "stale_temperature", "before_mode_change", "stale_power"):
+            with self.subTest(case=case):
+                self.h.journal.unlink(missing_ok=True)
+                self.h.calls.clear()
+                self.scene(bed=("cool", 24, 23.0, 538))
+                bedroom = self.h.live["bedroom"]
+                self.h.recent_adjustment("bedroom", 23, ago=5)
+                if case == "minimum_runtime":
+                    bedroom["adapter"]["last_mode_change"] = self.h.now - 100
+                elif case == "stale_temperature":
+                    bedroom["temperature_report_at"] = self.h.now - 1201
+                elif case == "before_mode_change":
+                    bedroom["adapter"]["last_mode_change"] = self.h.now - 930
+                    bedroom["temperature_report_at"] = self.h.now - 950
+                self.h.observe("bedroom", new_report=False)
+                if case == "stale_power":
+                    bedroom["adapter"]["from_power_s"] = 121
+
+                self.h.snapshot()
+
+                self.assertEqual(self.h.calls, [])
+                if case == "minimum_runtime":
+                    self.assertIn([["bedroom", "mode", "off", "energy_off"], "等待本机最短运行时间"],
+                                  self.trace()["rejections"])
+
     def test_start_inherited_setting_is_safe_and_target_change_keeps_confirmed_mode(self):
         self.scene(bed=("off",22,23.4,8))
         launched=self.qualify()

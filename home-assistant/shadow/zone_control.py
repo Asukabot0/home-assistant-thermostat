@@ -219,6 +219,11 @@ def learned_initial(room, mode, zone, state, limits, policy=POLICY):
     return max(bounds[0], min(bounds[1], chosen))
 
 
+def allows_assistance(home_zone, mode):
+    return (home_zone["quality"] == "fresh" and not home_zone["paused"]
+            and home_zone["qualified"] and home_zone["direction"] == mode)
+
+
 def peer_risk(room, zone_key, mode, zones, topology, policy):
     direction = DIRECTION[mode]
     unit = topology["actuators"][room]
@@ -457,8 +462,8 @@ def coordinate(live, readings, ready, state, now, configurations, connected, top
     control_ready = ready if control_ready is None else control_ready
     feasible = {key: [r for r in sorted(connected) if control_ready.get(r) and key in units[r]["influences"] and key not in uncertain
                        and zones[units[r]["zone"]]["quality"] == "fresh" and not zones[units[r]["zone"]]["paused"]
-                       and not (units[r]["zone"] != key and zones[units[r]["zone"]]["recovery_active"]
-                                and zones[units[r]["zone"]]["direction"] != zones[key]["direction"])
+                       and (units[r]["zone"] == key or allows_assistance(
+                           zones[units[r]["zone"]], zones[key]["direction"]))
                        and zones[key]["direction"] in live[r]["adapter"]["modes"]
                        and not any(x["reason"] != "peer_near_boundary" for x in peer_risk(r, key, zones[key]["direction"], zones, topology, policy))]
                 for key in demands}
@@ -520,7 +525,7 @@ def coordinate(live, readings, ready, state, now, configurations, connected, top
         red_risk = any(r["reason"] == "peer_comfort_risk" for r in active_risk) and not own_critical_need
         opposite = {peer for peer, m in modes.items() if peer != room and m not in {"off", "fan_only", need}
                     and not opposing_allowed(room, serve, peer, modes, zones, topology, output)}
-        own_wait = response_ready(now, zone, own, policy["feedback_wait_seconds"])
+        own_wait = response_ready(now, local_zone, own, policy["feedback_wait_seconds"])
         up_wait = response_ready(now, zone, last_up, policy["feedback_wait_seconds"])
         handoff_wait = (handoff is not None and handoff["phase"] != "serve"
                         or need in ACTIVE and exit_wait(room,need,now,live,readings,state,policy))
@@ -581,6 +586,11 @@ def coordinate(live, readings, ready, state, now, configurations, connected, top
             continue
         direction = DIRECTION[mode]
         current_excess = direction*(local_zone["measured"]-local_zone["target"])
+        if (current_excess > policy["comfort_band"] + TEMP_EPSILON and output[room]
+                and local_zone["at"] > live[room]["adapter"]["last_mode_change"]):
+            candidates.append((0, rank, room, "mode", "off", "energy_off"))
+            reasons[room] = "exit_local_comfort_overrun"
+            continue
         local_prediction = local_zone["trend"]
         expected = (current_excess+direction*local_prediction["delta"]-local_prediction["uncertainty"]
                     if local_prediction else current_excess)
@@ -593,7 +603,10 @@ def coordinate(live, readings, ready, state, now, configurations, connected, top
         redundant = (owner is None and priority > 0 and local_zone["intent"] == "maintain" and local_prediction
                      and abs(local_prediction["delta"])+local_prediction["uncertainty"] <= policy["minimum_progress_c"]
                      and any(output[p] and p != room and modes[p] == mode and units[p]["zone"] == home for p in output))
-        reducing = direct or red_risk or expected > policy["tracking_band"]+TEMP_EPSILON or blocks_needed or redundant
+        previous_zone = (own.get("control") or {}).get("zone", home) if own else home
+        assistance_limited = previous_zone != home and current_excess >= policy["tracking_band"] - TEMP_EPSILON
+        reducing = (direct or red_risk or assistance_limited or expected > policy["tracking_band"]+TEMP_EPSILON
+                    or blocks_needed or redundant)
         low = power.get("bands", {}).get("low", {})
         quiet = quiet_power(now, live[room], row, policy["lower_output_observe_seconds"])
         eased = own is not None and own["kind"] == "temperature" and not is_strengthening(own)
@@ -615,7 +628,8 @@ def coordinate(live, readings, ready, state, now, configurations, connected, top
                 reasons[room] = "exit_dormant_opposition" if quiet else "exit_contrary_or_risky_output"
             elif output[room] and proposed is not None:
                 candidates.append((1, rank, room, "temperature", proposed, "zone_reduce"))
-                reasons[room] = "high_power_overrun" if direct else "reduce_projected_or_neighbor_overrun"
+                reasons[room] = ("high_power_overrun" if direct else "reduce_at_assistance_limit" if assistance_limited
+                                 else "reduce_projected_or_neighbor_overrun")
             else:
                 reasons[room] = "wait_verified_output_or_off_proof"
             continue
