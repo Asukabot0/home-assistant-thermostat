@@ -657,7 +657,13 @@ def read_neural_shadow(folder, start, end, schema):
                     "bias_c": round(sum(sgn_e) / len(sgn_e), 4) if sgn_e else None,
                     "pi80_coverage": round(sum(cov_e) / len(cov_e), 4) if cov_e else None,
                 }
-            wh_errs = [r["factual_hold_wh_error"] for r in f_rows if r.get("factual_hold_wh_error")]
+            wh_errs = [
+                r["factual_hold_wh_error"]
+                for r in f_rows
+                if r.get("factual_hold_wh_error")
+                and not r.get("joint_wh_has_gap", True)
+                and r.get("joint_wh_label_valid", False)
+            ]
             wh_abs = [e["abs_error_wh"] for e in wh_errs if e.get("abs_error_wh") is not None]
             covs = [r["joint_wh_coverage_ratio"] for r in h_rows if r.get("joint_wh_coverage_ratio") is not None]
             gaps_n = sum(1 for r in h_rows if r.get("joint_wh_has_gap"))

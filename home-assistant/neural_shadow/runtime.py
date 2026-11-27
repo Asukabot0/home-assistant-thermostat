@@ -491,7 +491,9 @@ class ShadowRuntime:
                                     "within_pi80": bool(abs(err) <= Z_80 * float(p_sigma) + 1e-9),
                                 }
 
-                    # Power integration across [cutoff_ts, horizon_end] with explicit coverage & gaps
+                    # Power integration across [cutoff_ts, horizon_end]: require complete coverage
+                    # (has_gap == False) so missing metering intervals are NEVER scored as 0 Wh.
+                    effective_min_cov = max(float(self.cfg.min_wh_label_coverage), 1.0 - 1e-6)
                     actual_units_wh: dict[str, Any] = {}
                     all_units_valid = True
                     tot_wh_sum = 0.0
@@ -499,15 +501,16 @@ class ShadowRuntime:
                     for u in self.spec.unit_names:
                         pslice = index.power_slice(u, cutoff_ts, horizon_end)
                         pint = integrate_power_interval(pslice, cutoff_ts, horizon_end)
-                        u_valid = pint.wh is not None and pint.coverage_ratio >= self.cfg.min_wh_label_coverage
+                        full_wh = pint.full_interval_wh
+                        u_valid = full_wh is not None and pint.coverage_ratio >= effective_min_cov
                         min_cov = min(min_cov, pint.coverage_ratio)
                         if u_valid:
-                            assert pint.wh is not None
-                            tot_wh_sum += pint.wh
+                            assert full_wh is not None
+                            tot_wh_sum += full_wh
                         else:
                             all_units_valid = False
                         actual_units_wh[u] = {
-                            "wh": round(pint.wh, 3) if u_valid and pint.wh is not None else None,
+                            "wh": round(full_wh, 3) if u_valid and full_wh is not None else None,
                             "covered_wh_raw": round(pint.wh, 3) if pint.wh is not None else None,
                             "coverage_ratio": round(pint.coverage_ratio, 4),
                             "gap_seconds": round(pint.gap_seconds, 1),

@@ -26,7 +26,7 @@
     "step_minutes": 5,
     "horizons_minutes": [15, 30, 60],
     "settle_window_seconds": 300,
-    "min_wh_label_coverage": 0.85,
+    "min_wh_label_coverage": 1.0,
     "max_uncertainty_c": 0.8,
     "ood_temp_margin_c": 3.0,
     "ood_outdoor_margin_c": 5.0

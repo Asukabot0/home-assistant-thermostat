@@ -31,6 +31,7 @@ from . import (
 from .config import load_default_example_config, load_site_config_from_files
 from .data_pipeline import (
     CanonicalHistory,
+    DEFAULT_MIN_WH_COVERAGE,
     build_dataset,
     ingest_canonical_snapshot,
     ingest_evidence_archives,
@@ -192,7 +193,7 @@ def _build_runtime_from_config(cfg_path: Path) -> tuple[ShadowRuntime, Any]:
         step_minutes=int(rt.get("step_minutes", STEP_MINUTES)),
         horizons_minutes=tuple(int(h) for h in rt.get("horizons_minutes", HORIZONS_MINUTES)),
         settle_window_seconds=float(rt.get("settle_window_seconds", 300.0)),
-        min_wh_label_coverage=float(rt.get("min_wh_label_coverage", 0.85)),
+        min_wh_label_coverage=float(rt.get("min_wh_label_coverage", DEFAULT_MIN_WH_COVERAGE)),
         cycle_timeout_seconds=float(rt.get("cycle_timeout_seconds", 25.0)),
         scoring_policy=scoring_policy,
     )
@@ -336,7 +337,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_build.add_argument("--history-minutes", type=int, default=DEFAULT_HISTORY_MINUTES)
     p_build.add_argument("--step-minutes", type=int, default=STEP_MINUTES)
     p_build.add_argument("--horizons", nargs="+", type=int, default=list(HORIZONS_MINUTES))
-    p_build.add_argument("--min-wh-coverage", type=float, default=0.85)
+    p_build.add_argument("--min-wh-coverage", type=float, default=DEFAULT_MIN_WH_COVERAGE)
     p_build.add_argument("--seed", type=int, default=42)
     p_build.set_defaults(func=_cmd_data_build)
 

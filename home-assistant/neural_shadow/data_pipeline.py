@@ -51,7 +51,7 @@ from .config import (
 
 MAX_POWER_GAP_SECONDS = 120.0
 DEFAULT_SETTLE_WINDOW_SECONDS = 300.0
-DEFAULT_MIN_WH_COVERAGE = 0.85
+DEFAULT_MIN_WH_COVERAGE = 1.0
 MODE_LIST = ("off", "heat", "cool")
 
 
@@ -175,13 +175,20 @@ class ActionEvent:
 class PowerIntegration:
     """Covered electrical energy integration over [start, end] with explicit gap reporting."""
 
-    wh: float | None  # None when covered_seconds == 0 (never falsely 0.0!)
+    wh: float | None  # Covered-only integral; None when covered_seconds == 0 (never falsely 0.0!)
     covered_seconds: float
     expected_seconds: float
     coverage_ratio: float
     gap_seconds: float
     has_gap: bool
     n_intervals: int
+
+    @property
+    def full_interval_wh(self) -> float | None:
+        """Full-interval Wh ONLY when metering coverage is complete (no gaps); None on any gap."""
+        if self.wh is None or self.has_gap:
+            return None
+        return self.wh
 
 
 @dataclass
@@ -2310,7 +2317,9 @@ def build_dataset(
                     y_td[z_idx, h_idx] = float(fut.value_c - t0_temp)
                     y_tv[z_idx, h_idx] = True
 
-            # Power labels (3 units + total) with explicit coverage & gap check
+            # Power labels (3 units + total): require complete coverage (has_gap == False)
+            # so missing intervals are NEVER silently treated as 0 Wh.
+            effective_min_cov = max(float(min_wh_coverage), 1.0 - 1e-6)
             unit_whs_valid = True
             total_wh_acc = 0.0
             min_cov = 1.0
@@ -2319,10 +2328,11 @@ def build_dataset(
                 pint = integrate_power_interval(pslice, t0, t0 + h_s)
                 y_ucov[u_idx, h_idx] = float(pint.coverage_ratio)
                 min_cov = min(min_cov, pint.coverage_ratio)
-                if pint.wh is not None and pint.coverage_ratio >= min_wh_coverage:
-                    y_uwh[u_idx, h_idx] = float(pint.wh)
+                full_wh = pint.full_interval_wh
+                if full_wh is not None and pint.coverage_ratio >= effective_min_cov:
+                    y_uwh[u_idx, h_idx] = float(full_wh)
                     y_uval[u_idx, h_idx] = True
-                    total_wh_acc += float(pint.wh)
+                    total_wh_acc += float(full_wh)
                 else:
                     unit_whs_valid = False
             y_tcov[h_idx] = float(min_cov)
@@ -2456,7 +2466,8 @@ def build_dataset(
         "mode_sample_counts": dict(mode_counts),
         "quality_counts": history.quality_counts,
         "config_versions": history.config_versions,
-        "min_wh_coverage": min_wh_coverage,
+        "min_wh_coverage": max(float(min_wh_coverage), 1.0),
+        "require_complete_wh_coverage": True,
         "settle_window_seconds": settle_window_s,
         "data_sha256": data_digest,
     }

@@ -378,6 +378,93 @@ class NeuralShadowRegressionTests(unittest.TestCase):
             self.assertTrue(sealed["declined"])
             self.assertTrue(any("missing_zone_observation:sleep" in r for r in sealed["decline_reasons"]))
 
+    # B1 regression: partial electrical coverage (>= 0.85) must NEVER be scored as full-interval Wh
+    def test_b1_partial_power_coverage_masked_not_zero_filled(self):
+        base = 1_800_000_000.0
+        cutoff_gap = base + 120 * 60.0  # [cutoff_gap, cutoff_gap + 900] has a 130s gap on bedroom
+        cutoff_full = base + 180 * 60.0  # [cutoff_full, cutoff_full + 900] has 100% coverage
+        hist = _make_clean_history(self.site, base_ts=base, minutes=260)
+
+        # Replace bedroom power stream with constant 1000W and a single 130s reporting gap inside [cutoff_gap, cutoff_gap + 900]
+        bed_entity = self.site.actuator_by_name("bedroom").power_entity
+        bed_power = []
+        t = base
+        while t <= base + 260 * 60.0:
+            # Skip report at cutoff_gap + 360 and emit next at cutoff_gap + 430 -> 130s gap [300, 430]
+            if abs(t - (cutoff_gap + 360.0)) < 1e-6:
+                t += 60.0
+                continue
+            if abs(t - (cutoff_gap + 420.0)) < 1e-6:
+                bed_power.append(PowerReport("bedroom", bed_entity, "ep1", cutoff_gap + 430.0, 1000.0))
+                t += 60.0
+                continue
+            bed_power.append(PowerReport("bedroom", bed_entity, "ep1", t, 1000.0))
+            t += 60.0
+        hist.power_reports["bedroom"] = sorted(bed_power, key=lambda r: r.report_at)
+
+        # Direct integration check: coverage ~ 770/900 = 0.8556, covered_wh ~ 213.889, full_interval_wh MUST be None
+        pint_gap = integrate_power_interval(hist.power_reports["bedroom"], cutoff_gap, cutoff_gap + 900.0)
+        self.assertAlmostEqual(pint_gap.coverage_ratio, 770.0 / 900.0, places=4)
+        self.assertTrue(pint_gap.has_gap)
+        self.assertAlmostEqual(pint_gap.gap_seconds, 130.0, places=1)
+        self.assertAlmostEqual(pint_gap.wh, 1000.0 * 770.0 / 3600.0, places=3)
+        self.assertIsNone(pint_gap.full_interval_wh)
+
+        # Complete coverage window: exact 250.0 Wh
+        pint_full = integrate_power_interval(hist.power_reports["bedroom"], cutoff_full, cutoff_full + 900.0)
+        self.assertFalse(pint_full.has_gap)
+        self.assertAlmostEqual(pint_full.coverage_ratio, 1.0, places=6)
+        self.assertAlmostEqual(pint_full.full_interval_wh, 250.0, places=3)
+
+        # Dataset labels MUST mask the 0.856-covered window even if min_wh_coverage=0.85 is requested
+        for req_cov in (1.0, 0.85):
+            ds = build_dataset(hist, min_wh_coverage=req_cov)
+            idx_gap = int(np.where(np.isclose(ds.cutoff_ts, cutoff_gap, rtol=0.0, atol=1e-3))[0][0])
+            idx_full = int(np.where(np.isclose(ds.cutoff_ts, cutoff_full, rtol=0.0, atol=1e-3))[0][0])
+            bed_u = ds.spec.unit_names.index("bedroom")
+            h15 = ds.spec.horizons_minutes.index(15)
+
+            self.assertAlmostEqual(float(ds.y_unit_cov[idx_gap, bed_u, h15]), 770.0 / 900.0, places=4)
+            self.assertFalse(bool(ds.y_unit_valid[idx_gap, bed_u, h15]))
+            self.assertTrue(np.isnan(ds.y_unit_wh[idx_gap, bed_u, h15]))
+            self.assertFalse(bool(ds.y_total_valid[idx_gap, h15]))
+            self.assertTrue(np.isnan(ds.y_total_wh[idx_gap, h15]))
+
+            self.assertTrue(bool(ds.y_unit_valid[idx_full, bed_u, h15]))
+            self.assertAlmostEqual(float(ds.y_unit_wh[idx_full, bed_u, h15]), 250.0, places=3)
+            self.assertTrue(bool(ds.y_total_valid[idx_full, h15]))
+
+        # Runtime settlement MUST also mask partial coverage (actual_total_wh=None, factual_hold_wh_error=None)
+        art = build_untrained_artifact(self.site, self.spec)
+        with TemporaryDirectory() as tmp:
+            rt = ShadowRuntime(
+                self.site,
+                ShadowRuntimeConfig(Path(tmp) / "st", Path(tmp) / "out", min_wh_label_coverage=0.85),
+                art,
+            )
+            p_gap = rt.seal_prediction(hist, cutoff_gap, sealed_at=cutoff_gap + 1.0)
+            p_full = rt.seal_prediction(hist, cutoff_full, sealed_at=cutoff_full + 1.0)
+            settled = rt.settle_predictions(hist, now_ts=cutoff_full + 4500.0)
+            by_key = {(r["prediction_id"], r["horizon_minutes"]): r for r in settled}
+
+            row_gap = by_key[(p_gap["prediction_id"], 15)]
+            self.assertTrue(row_gap["actual_units_wh"]["bedroom"]["has_gap"])
+            self.assertFalse(row_gap["actual_units_wh"]["bedroom"]["label_valid"])
+            self.assertIsNone(row_gap["actual_units_wh"]["bedroom"]["wh"])
+            self.assertAlmostEqual(row_gap["actual_units_wh"]["bedroom"]["covered_wh_raw"], 1000.0 * 770.0 / 3600.0, places=2)
+            self.assertAlmostEqual(row_gap["joint_wh_coverage_ratio"], 770.0 / 900.0, places=4)
+            self.assertTrue(row_gap["joint_wh_has_gap"])
+            self.assertFalse(row_gap["joint_wh_label_valid"])
+            self.assertIsNone(row_gap["actual_total_wh"])
+            self.assertIsNone(row_gap["factual_hold_wh_error"])
+
+            row_full = by_key[(p_full["prediction_id"], 15)]
+            self.assertFalse(row_full["joint_wh_has_gap"])
+            self.assertTrue(row_full["joint_wh_label_valid"])
+            self.assertAlmostEqual(row_full["actual_units_wh"]["bedroom"]["wh"], 250.0, places=2)
+            self.assertIsNotNone(row_full["actual_total_wh"])
+            self.assertIsNotNone(row_full["factual_hold_wh_error"])
+
     # 6. Mid-horizon action/target changes & strict factual vs counterfactual separation
     def test_mid_horizon_action_and_target_changes_and_counterfactual_separation(self):
         base = 1_800_000_000.0
