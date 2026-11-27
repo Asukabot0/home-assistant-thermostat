@@ -1,7 +1,7 @@
 """Reproducible forward-chaining training, validation calibration, and model readiness gating."""
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from hashlib import sha256
 import json
@@ -31,6 +31,9 @@ from .nn_model import (
 )
 
 
+REQUIRED_BASELINES = ("persistence", "existing_trend", "thermal_inertia_linear")
+
+
 @dataclass(frozen=True)
 class ReadinessGates:
     """Explicit gates separating insufficient_data, uncalibrated, and ready_to_use models."""
@@ -46,7 +49,15 @@ class ReadinessGates:
     min_pi80_coverage: float = 0.65
     max_pi80_coverage: float = 0.95
     min_action_response_temp_c: float = 0.03
+    max_baseline_mae_ratio: float = 1.0  # GRU must be <= best of (persistence, existing_trend, thermal_inertia_linear)
+    max_zone_abs_bias_c: float = 0.20  # Per-zone |bias| upper bound (tighter than 0.3C tracking band)
+    max_wh_baseline_mae_ratio: float = 1.0  # Total Wh MAE must be <= best of the 3 baselines
+    min_online_test_samples_per_zone: int = 20  # Non-intervened hold test samples required per zone & horizon
+    min_wh_test_samples: int = 20  # Complete-coverage Wh test samples required per horizon
     allow_synthetic_ready: bool = False  # Production default: synthetic NEVER passes ready_to_use
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
 
 
 @dataclass(frozen=True)
@@ -296,6 +307,186 @@ def _calibrate_uncertainty_on_val(
     }
 
 
+def audit_baseline_gates(
+    dataset: BuiltDataset,
+    eval_report: dict[str, Any],
+    gates: ReadinessGates,
+) -> tuple[list[str], dict[str, Any]]:
+    """Evaluate per-zone, per-horizon, bias, Wh, and online-style gates against all 3 required baselines."""
+    reasons: list[str] = []
+    horizons = [f"{h}m" for h in dataset.spec.horizons_minutes]
+    zones = list(dataset.spec.zone_names)
+    test_sec = eval_report.get("test") or {}
+    test_replay = test_sec.get("historical_replay_action_conditioned") or {}
+    test_online = test_sec.get("online_style_known_at_t0_non_intervened") or {}
+
+    def _best_baseline(section: dict[str, Any], getter) -> tuple[str | None, float | None, dict[str, float | None]]:
+        vals: dict[str, float | None] = {}
+        for bname in REQUIRED_BASELINES:
+            v = getter(section.get(bname) or {})
+            vals[bname] = float(v) if v is not None else None
+        valid = {k: v for k, v in vals.items() if v is not None}
+        if not valid:
+            return None, None, vals
+        best_k = min(valid, key=lambda k: valid[k])
+        return best_k, valid[best_k], vals
+
+    gru_replay = test_replay.get("neural_gru") or {}
+    gru_online = test_online.get("neural_gru") or {}
+    audit: dict[str, Any] = {
+        "baselines_compared": list(REQUIRED_BASELINES),
+        "replay_temp_by_zone": {},
+        "replay_wh_total": {},
+        "online_temp_by_zone": {},
+        "online_wh_total": {},
+    }
+
+    # 1. Replay per-zone x per-horizon MAE, |bias|, and PI80 calibration
+    for z in zones:
+        audit["replay_temp_by_zone"][z] = {}
+        for h_key in horizons:
+            zstats = ((gru_replay.get("temp_by_zone") or {}).get(z) or {}).get(h_key) or {}
+            n_val = int(zstats.get("n_valid") or 0)
+            g_mae = zstats.get("mae")
+            g_bias = zstats.get("bias")
+            g_pi = zstats.get("pi80_coverage")
+            best_b, best_mae, all_b = _best_baseline(
+                test_replay,
+                lambda m, _z=z, _h=h_key: ((m.get("temp_by_zone") or {}).get(_z) or {}).get(_h, {}).get("mae"),
+            )
+            cell_fails: list[str] = []
+            if n_val == 0 or g_mae is None:
+                cell_fails.append(f"replay_temp_missing_{z}_{h_key}")
+            else:
+                if best_mae is None or best_b is None:
+                    cell_fails.append(f"replay_baseline_missing_{z}_{h_key}")
+                elif float(g_mae) > best_mae * gates.max_baseline_mae_ratio + 1e-9:
+                    cell_fails.append(
+                        f"replay_mae_{z}_{h_key}:{float(g_mae):.4f}>{best_b}({best_mae:.4f})*{gates.max_baseline_mae_ratio}"
+                    )
+                if g_bias is None or abs(float(g_bias)) > gates.max_zone_abs_bias_c + 1e-9:
+                    cell_fails.append(f"replay_bias_{z}_{h_key}:{g_bias}|max={gates.max_zone_abs_bias_c}")
+                if g_pi is None or not (gates.min_pi80_coverage <= float(g_pi) <= gates.max_pi80_coverage):
+                    cell_fails.append(f"replay_pi80_{z}_{h_key}:{g_pi}")
+            reasons.extend(cell_fails)
+            audit["replay_temp_by_zone"][z][h_key] = {
+                "n_valid": n_val,
+                "gru_mae": g_mae,
+                "gru_bias": g_bias,
+                "gru_pi80": g_pi,
+                "best_baseline": best_b,
+                "best_baseline_mae": best_mae,
+                "baseline_maes": all_b,
+                "passed": len(cell_fails) == 0,
+                "failures": cell_fails,
+            }
+
+    # 2. Replay total Wh MAE vs all 3 baselines + Wh PI80 calibration (per horizon)
+    for h_key in horizons:
+        wstats = (gru_replay.get("wh_total") or {}).get(h_key) or {}
+        n_val = int(wstats.get("n_valid") or 0)
+        g_mae = wstats.get("mae")
+        g_pi = wstats.get("pi80_coverage")
+        best_b, best_mae, all_b = _best_baseline(
+            test_replay,
+            lambda m, _h=h_key: (m.get("wh_total") or {}).get(_h, {}).get("mae"),
+        )
+        cell_fails = []
+        if n_val < gates.min_wh_test_samples or g_mae is None:
+            cell_fails.append(f"replay_wh_insufficient_samples_{h_key}:n={n_val}<{gates.min_wh_test_samples}")
+        else:
+            if best_mae is None or best_b is None:
+                cell_fails.append(f"replay_wh_baseline_missing_{h_key}")
+            elif float(g_mae) > best_mae * gates.max_wh_baseline_mae_ratio + 1e-9:
+                cell_fails.append(
+                    f"replay_wh_mae_{h_key}:{float(g_mae):.2f}>{best_b}({best_mae:.2f})*{gates.max_wh_baseline_mae_ratio}"
+                )
+            if g_pi is None or not (gates.min_pi80_coverage <= float(g_pi) <= gates.max_pi80_coverage):
+                cell_fails.append(f"replay_wh_pi80_{h_key}:{g_pi}")
+        reasons.extend(cell_fails)
+        audit["replay_wh_total"][h_key] = {
+            "n_valid": n_val,
+            "gru_mae": g_mae,
+            "gru_pi80": g_pi,
+            "best_baseline": best_b,
+            "best_baseline_mae": best_mae,
+            "baseline_maes": all_b,
+            "passed": len(cell_fails) == 0,
+            "failures": cell_fails,
+        }
+
+    # 3. Online-style (known-at-t0 hold, non-intervened) per-zone x per-horizon sample count, MAE, |bias|
+    for z in zones:
+        audit["online_temp_by_zone"][z] = {}
+        for h_key in horizons:
+            zstats = ((gru_online.get("temp_by_zone") or {}).get(z) or {}).get(h_key) or {}
+            n_val = int(zstats.get("n_valid") or 0)
+            g_mae = zstats.get("mae")
+            g_bias = zstats.get("bias")
+            best_b, best_mae, all_b = _best_baseline(
+                test_online,
+                lambda m, _z=z, _h=h_key: ((m.get("temp_by_zone") or {}).get(_z) or {}).get(_h, {}).get("mae"),
+            )
+            cell_fails = []
+            if n_val < gates.min_online_test_samples_per_zone or g_mae is None:
+                cell_fails.append(
+                    f"online_insufficient_samples_{z}_{h_key}:n={n_val}<{gates.min_online_test_samples_per_zone}"
+                )
+            else:
+                if best_mae is None or best_b is None:
+                    cell_fails.append(f"online_baseline_missing_{z}_{h_key}")
+                elif float(g_mae) > best_mae * gates.max_baseline_mae_ratio + 1e-9:
+                    cell_fails.append(
+                        f"online_mae_{z}_{h_key}:{float(g_mae):.4f}>{best_b}({best_mae:.4f})*{gates.max_baseline_mae_ratio}"
+                    )
+                if g_bias is None or abs(float(g_bias)) > gates.max_zone_abs_bias_c + 1e-9:
+                    cell_fails.append(f"online_bias_{z}_{h_key}:{g_bias}|max={gates.max_zone_abs_bias_c}")
+            reasons.extend(cell_fails)
+            audit["online_temp_by_zone"][z][h_key] = {
+                "n_valid": n_val,
+                "gru_mae": g_mae,
+                "gru_bias": g_bias,
+                "best_baseline": best_b,
+                "best_baseline_mae": best_mae,
+                "baseline_maes": all_b,
+                "passed": len(cell_fails) == 0,
+                "failures": cell_fails,
+            }
+
+    # 4. Online-style total Wh MAE vs all 3 baselines
+    for h_key in horizons:
+        wstats = (gru_online.get("wh_total") or {}).get(h_key) or {}
+        n_val = int(wstats.get("n_valid") or 0)
+        g_mae = wstats.get("mae")
+        best_b, best_mae, all_b = _best_baseline(
+            test_online,
+            lambda m, _h=h_key: (m.get("wh_total") or {}).get(_h, {}).get("mae"),
+        )
+        cell_fails = []
+        if n_val < gates.min_wh_test_samples or g_mae is None:
+            cell_fails.append(f"online_wh_insufficient_samples_{h_key}:n={n_val}<{gates.min_wh_test_samples}")
+        else:
+            if best_mae is None or best_b is None:
+                cell_fails.append(f"online_wh_baseline_missing_{h_key}")
+            elif float(g_mae) > best_mae * gates.max_wh_baseline_mae_ratio + 1e-9:
+                cell_fails.append(
+                    f"online_wh_mae_{h_key}:{float(g_mae):.2f}>{best_b}({best_mae:.2f})*{gates.max_wh_baseline_mae_ratio}"
+                )
+        reasons.extend(cell_fails)
+        audit["online_wh_total"][h_key] = {
+            "n_valid": n_val,
+            "gru_mae": g_mae,
+            "best_baseline": best_b,
+            "best_baseline_mae": best_mae,
+            "baseline_maes": all_b,
+            "passed": len(cell_fails) == 0,
+            "failures": cell_fails,
+        }
+
+    audit["passed"] = len(reasons) == 0
+    return reasons, audit
+
+
 def determine_model_state(
     dataset: BuiltDataset,
     split: ForwardChainSplit,
@@ -303,7 +494,7 @@ def determine_model_state(
     eval_report: dict[str, Any],
     gates: ReadinessGates,
 ) -> tuple[ModelState, list[str]]:
-    """Classify the model lifecycle state honestly based on data sufficiency, calibration, and action response."""
+    """Classify the model lifecycle state honestly based on data sufficiency, calibration, baselines, and action response."""
     manifest = dataset.manifest
     data_origin = manifest.get("data_origin", DataOrigin.REAL.value)
     insufficiency_reasons: list[str] = []
@@ -343,32 +534,22 @@ def determine_model_state(
     if insufficiency_reasons:
         return ModelState.INSUFFICIENT_DATA, insufficiency_reasons
 
-    # Data is sufficient; check calibration, action responsiveness, and baseline sanity.
+    # Data is sufficient; check calibration, strict action responsiveness, and all baseline/bias/Wh/online gates.
     if not cal_info.get("calibrated", False):
         uncalibrated_reasons.append(str(cal_info.get("reason", "validation_calibration_incomplete")))
 
     if not action_audit.get("action_response_passed", False):
-        uncalibrated_reasons.append("action_response_sensitivity_failed")
+        failed_p = action_audit.get("failed_probes") or []
+        suffix = ":" + ",".join(failed_p) if failed_p else ""
+        uncalibrated_reasons.append(f"action_response_sensitivity_failed{suffix}")
 
-    test_replay = (eval_report.get("test") or {}).get("historical_replay_action_conditioned") or {}
-    gru_metrics = test_replay.get("neural_gru") or {}
-    pers_metrics = test_replay.get("persistence") or {}
-
-    for h_key, stats in (gru_metrics.get("temp_by_horizon") or {}).items():
-        cov = stats.get("pi80_coverage")
-        if cov is None or not (gates.min_pi80_coverage <= cov <= gates.max_pi80_coverage):
-            uncalibrated_reasons.append(f"test_pi80_coverage_{h_key}:{cov}")
-
-    # Model should not be materially worse than naive persistence on 60m temperature MAE.
-    gru_mae_60 = (gru_metrics.get("temp_by_horizon") or {}).get("60m", {}).get("mae")
-    pers_mae_60 = (pers_metrics.get("temp_by_horizon") or {}).get("60m", {}).get("mae")
-    if gru_mae_60 is not None and pers_mae_60 is not None and gru_mae_60 > pers_mae_60 * 1.05:
-        uncalibrated_reasons.append(f"gru_60m_mae_exceeds_persistence:{gru_mae_60}>{pers_mae_60}")
+    baseline_reasons, _ = audit_baseline_gates(dataset, eval_report, gates)
+    uncalibrated_reasons.extend(baseline_reasons)
 
     if uncalibrated_reasons:
         return ModelState.UNCALIBRATED, uncalibrated_reasons
 
-    return ModelState.READY_TO_USE, ["all_data_calibration_and_action_response_gates_passed"]
+    return ModelState.READY_TO_USE, ["all_data_calibration_baseline_and_action_response_gates_passed"]
 
 
 def train_and_evaluate(
@@ -405,19 +586,24 @@ def train_and_evaluate(
             readiness_reasons=[
                 f"cannot_train_split_too_small:train={split.train_idx.size},val={split.val_idx.size},test={split.test_idx.size}"
             ],
+            readiness_gates=gates.to_dict(),
+            deployment_eligible=False,
             weights_trained=False,
         )
         artifact = ModelArtifact(model=model, normalizer=None, model_state=ModelState.INSUFFICIENT_DATA, metadata=meta)
         report = {
             "model_id": artifact.model_id,
             "model_state": artifact.model_state.value,
+            "deployment_eligible": False,
             "weights_trained": False,
             "data_origin": dataset.manifest.get("data_origin"),
             "parameter_count": model.parameter_count(),
             "seed": seed,
             "training_cutoff_ts": split.train_cutoff_ts,
             "val_cutoff_ts": split.val_cutoff_ts,
+            "embargo_seconds": split.embargo_seconds,
             "readiness_reasons": meta["readiness_reasons"],
+            "readiness_gates": gates.to_dict(),
             "split_sizes": {
                 "train": int(split.train_idx.size),
                 "val": int(split.val_idx.size),
@@ -554,12 +740,23 @@ def train_and_evaluate(
 
     # Calibrate uncertainty strictly on validation split
     cal_info = _calibrate_uncertainty_on_val(artifact, dataset, split.val_idx)
-    eval_report = evaluate_all_models(artifact, dataset, split.train_idx, split.val_idx, split.test_idx)
+    eval_report = evaluate_all_models(
+        artifact,
+        dataset,
+        split.train_idx,
+        split.val_idx,
+        split.test_idx,
+        min_temp_response_c=gates.min_action_response_temp_c,
+        min_action_events=gates.min_action_events_total,
+        min_active_mode_samples=gates.min_active_mode_samples,
+    )
+    _, baseline_gate_audit = audit_baseline_gates(dataset, eval_report, gates)
     final_state, reasons = determine_model_state(dataset, split, cal_info, eval_report, gates)
 
     artifact.model_state = final_state
     artifact.metadata["model_state"] = final_state.value
     artifact.metadata["readiness_reasons"] = reasons
+    artifact.metadata["readiness_gates"] = gates.to_dict()
     artifact.metadata["calibration"] = cal_info
     artifact.metadata["deployment_eligible"] = (
         final_state == ModelState.READY_TO_USE and dataset.manifest.get("data_origin") == DataOrigin.REAL.value
@@ -570,6 +767,8 @@ def train_and_evaluate(
         "model_state": final_state.value,
         "deployment_eligible": artifact.metadata["deployment_eligible"],
         "readiness_reasons": reasons,
+        "readiness_gates": gates.to_dict(),
+        "baseline_gate_audit": baseline_gate_audit,
         "weights_trained": True,
         "seed": seed,
         "training_cutoff_ts": split.train_cutoff_ts,

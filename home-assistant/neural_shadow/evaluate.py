@@ -244,11 +244,25 @@ def evaluate_action_response(
     min_temp_response_c: float = 0.03,
     min_action_events: int = 30,
     min_active_mode_samples: int = 60,
+    min_unit_mode_samples: int = 10,
 ) -> dict[str, Any]:
-    """Verify the neural model genuinely responds to candidate actions and audit action coverage."""
+    """Verify the neural model responds in the physically correct direction across horizons.
+
+    Strict checks:
+    - Evaluates each unit x observed mode separately (requiring 100% pass across observed pairs).
+    - Probes natural evaluation samples in that mode whenever present (rather than eval[:48]).
+    - Checks V1 actual candidates (same-mode +/-1C vs hold) across ALL horizons (15/30/60m) for
+      both temperature sign and non-decreasing electrical Wh.
+    - Checks active-vs-off temperature and Wh signs across ALL horizons so inverted responses
+      (e.g. cooling hotter than off, heating colder than off, active using less Wh than off)
+      always fail.
+    """
     spec = dataset.spec
     site = dataset.site
     manifest = dataset.manifest
+    horizons = spec.horizons_minutes
+    n_k = len(horizons)
+    max_h = max(horizons)
 
     # 1. Historical action coverage audit
     total_actions = int(manifest.get("action_events_total", 0))
@@ -271,31 +285,44 @@ def evaluate_action_response(
             "action_coverage_sufficient": False,
             "action_coverage_issues": coverage_issues + ["empty_eval_split"],
             "action_response_passed": False,
+            "directional_checks_passed": 0,
+            "directional_checks_total": 0,
+            "failed_probes": ["empty_eval_split"],
             "probes": {},
             "note": "No evaluation samples available for action-response check.",
         }
 
-    # Select up to 48 representative evaluation samples
-    probe_idx = eval_indices[: min(48, eval_indices.size)]
-    xh = dataset.X_hist[probe_idx]
+    def _select_evenly(indices: np.ndarray, limit: int = 48) -> np.ndarray:
+        if indices.size <= limit:
+            return indices
+        pos = np.linspace(0, indices.size - 1, limit, dtype=np.int64)
+        return indices[pos]
+
     probe_results: dict[str, Any] = {}
-    any_significant_response = False
     directional_checks_passed = 0
     directional_checks_total = 0
+    failed_probes: list[str] = []
 
     for u_idx, uname in enumerate(spec.unit_names):
         act_map = site.actuator_by_name(uname)
         z_idx = spec.zone_names.index(act_map.home_zone)
+        dataset_off_count = sum(1 for m in dataset.metadata if m["unit_modes"].get(uname) == "off")
         unit_probes: dict[str, Any] = {}
         for mode in ("heat", "cool"):
-            # Count naturally occurring samples in this mode on eval split
-            natural_count = sum(
-                1 for idx in eval_indices if dataset.metadata[int(idx)]["unit_modes"].get(uname) == mode
+            dataset_mode_count = sum(1 for m in dataset.metadata if m["unit_modes"].get(uname) == mode)
+            natural_eval = np.asarray(
+                [int(idx) for idx in eval_indices if dataset.metadata[int(idx)]["unit_modes"].get(uname) == mode],
+                dtype=np.int64,
             )
-            base_sp = 23.0 if mode == "heat" else 24.0
-            sp_plus = min(act_map.soft_limits[mode][1], base_sp + 1.0)
-            sp_minus = max(act_map.soft_limits[mode][0], base_sp - 1.0)
+            natural_count = int(natural_eval.size)
+            mode_observed = dataset_mode_count >= min_unit_mode_samples
+            used_natural = natural_count > 0
+            probe_idx = _select_evenly(natural_eval if used_natural else eval_indices, limit=48)
+            xh = dataset.X_hist[probe_idx]
 
+            lo, hi = act_map.soft_limits[mode]
+            default_sp = 23.0 if mode == "heat" else 24.0
+            xa_hold = []
             xa_plus = []
             xa_minus = []
             xa_off = []
@@ -303,13 +330,25 @@ def evaluate_action_response(
                 meta = dataset.metadata[int(idx)]
                 modes_base = dict(meta["unit_modes"])
                 sps_base = dict(meta["unit_setpoints"])
+                raw_sp = sps_base.get(uname) if modes_base.get(uname) == mode else None
+                cand_sp = float(raw_sp) if raw_sp is not None else default_sp
+                if hi - lo >= 2.0:
+                    base_sp = float(np.clip(round(cand_sp), lo + 1.0, hi - 1.0))
+                else:
+                    base_sp = float(np.clip(round(cand_sp), lo, hi))
+                sp_plus = min(hi, base_sp + 1.0)
+                sp_minus = max(lo, base_sp - 1.0)
                 modes_base[uname] = mode
                 sps_base[uname] = base_sp
 
+                plan_h = build_step_action_plan(spec, modes_base, sps_base, unit=uname, new_mode=mode, new_setpoint=base_sp)
                 plan_p = build_step_action_plan(spec, modes_base, sps_base, unit=uname, new_mode=mode, new_setpoint=sp_plus)
                 plan_m = build_step_action_plan(spec, modes_base, sps_base, unit=uname, new_mode=mode, new_setpoint=sp_minus)
                 plan_o = build_step_action_plan(spec, modes_base, sps_base, unit=uname, new_mode="off", new_setpoint=base_sp)
 
+                xa_hold.append(
+                    build_action_sequence_tensor(spec, site, modes_base, sps_base, meta["zone_temps"], plan_h)
+                )
                 xa_plus.append(
                     build_action_sequence_tensor(spec, site, modes_base, sps_base, meta["zone_temps"], plan_p)
                 )
@@ -320,55 +359,108 @@ def evaluate_action_response(
                     build_action_sequence_tensor(spec, site, modes_base, sps_base, meta["zone_temps"], plan_o)
                 )
 
+            pred_h = predict_numpy(artifact, xh, np.stack(xa_hold, axis=0))
             pred_p = predict_numpy(artifact, xh, np.stack(xa_plus, axis=0))
             pred_m = predict_numpy(artifact, xh, np.stack(xa_minus, axis=0))
             pred_o = predict_numpy(artifact, xh, np.stack(xa_off, axis=0))
 
-            # Compare 60m temperature delta and 60m unit Wh for stronger vs weaker setting
-            # Heat stronger = sp_plus; Cool stronger = sp_minus
             if mode == "heat":
-                temp_diff = float(np.mean(pred_p["temp_delta"][:, z_idx, -1] - pred_m["temp_delta"][:, z_idx, -1]))
-                wh_diff = float(np.mean(pred_p["unit_wh"][:, u_idx, -1] - pred_m["unit_wh"][:, u_idx, -1]))
-                active_vs_off_temp = float(np.mean(pred_p["temp_delta"][:, z_idx, -1] - pred_o["temp_delta"][:, z_idx, -1]))
-                active_vs_off_wh = float(np.mean(pred_p["unit_wh"][:, u_idx, -1] - pred_o["unit_wh"][:, u_idx, -1]))
+                pred_stronger, pred_weaker = pred_p, pred_m
                 expected_temp_sign = 1.0
             else:
-                temp_diff = float(np.mean(pred_m["temp_delta"][:, z_idx, -1] - pred_p["temp_delta"][:, z_idx, -1]))
-                wh_diff = float(np.mean(pred_m["unit_wh"][:, u_idx, -1] - pred_p["unit_wh"][:, u_idx, -1]))
-                active_vs_off_temp = float(np.mean(pred_m["temp_delta"][:, z_idx, -1] - pred_o["temp_delta"][:, z_idx, -1]))
-                active_vs_off_wh = float(np.mean(pred_m["unit_wh"][:, u_idx, -1] - pred_o["unit_wh"][:, u_idx, -1]))
+                pred_stronger, pred_weaker = pred_m, pred_p
                 expected_temp_sign = -1.0
 
-            signed_temp_resp = temp_diff * expected_temp_sign
-            signed_active_resp = active_vs_off_temp * expected_temp_sign
-            # Only require directional check on modes actually observed in the dataset
-            mode_observed = (heat_samples >= 10) if mode == "heat" else (cool_samples >= 10)
-            passed_dir = (signed_temp_resp >= min_temp_response_c) or (
-                signed_active_resp >= min_temp_response_c and active_vs_off_wh > 5.0
-            )
+            by_horizon: dict[str, Any] = {}
+            probe_failures: list[str] = []
+            for k, h_min in enumerate(horizons):
+                h_key = f"{h_min}m"
+                sw_temp = float(np.mean(pred_stronger["temp_delta"][:, z_idx, k] - pred_weaker["temp_delta"][:, z_idx, k]))
+                sh_temp = float(np.mean(pred_stronger["temp_delta"][:, z_idx, k] - pred_h["temp_delta"][:, z_idx, k]))
+                hw_temp = float(np.mean(pred_h["temp_delta"][:, z_idx, k] - pred_weaker["temp_delta"][:, z_idx, k]))
+                sw_wh = float(np.mean(pred_stronger["unit_wh"][:, u_idx, k] - pred_weaker["unit_wh"][:, u_idx, k]))
+                ao_temp = float(np.mean(pred_stronger["temp_delta"][:, z_idx, k] - pred_o["temp_delta"][:, z_idx, k]))
+                ao_wh = float(np.mean(pred_stronger["unit_wh"][:, u_idx, k] - pred_o["unit_wh"][:, u_idx, k]))
+
+                signed_sw = sw_temp * expected_temp_sign
+                signed_sh = sh_temp * expected_temp_sign
+                signed_hw = hw_temp * expected_temp_sign
+                signed_ao = ao_temp * expected_temp_sign
+
+                h_fails: list[str] = []
+                # 1. V1 same-mode +/-1C temperature direction at EVERY horizon (no sign inversion or null response)
+                if k == n_k - 1:
+                    if signed_sw < min_temp_response_c:
+                        h_fails.append(f"stronger_vs_weaker_temp_{h_key}:{sw_temp:+.4f}C")
+                    if signed_sh < -1e-4:
+                        h_fails.append(f"stronger_vs_hold_temp_inverted_{h_key}:{sh_temp:+.4f}C")
+                    if signed_hw < -1e-4:
+                        h_fails.append(f"hold_vs_weaker_temp_inverted_{h_key}:{hw_temp:+.4f}C")
+                else:
+                    min_h_temp = min_temp_response_c * 0.5 if h_min >= 30 and max_h > 30 else 0.0
+                    if signed_sw < min_h_temp - 1e-6:
+                        h_fails.append(f"stronger_vs_weaker_temp_{h_key}:{sw_temp:+.4f}C")
+                    if signed_sh < -0.005:
+                        h_fails.append(f"stronger_vs_hold_temp_inverted_{h_key}:{sh_temp:+.4f}C")
+                    if signed_hw < -0.005:
+                        h_fails.append(f"hold_vs_weaker_temp_inverted_{h_key}:{hw_temp:+.4f}C")
+
+                # 2. V1 same-mode +/-1C electrical Wh must not decrease when strengthening output
+                if sw_wh < -1e-3:
+                    h_fails.append(f"stronger_vs_weaker_wh_negative_{h_key}:{sw_wh:+.2f}Wh")
+
+                # 3. Active vs Off physical sanity: NEVER inverted temperature sign or negative Wh
+                if signed_ao < -1e-4:
+                    h_fails.append(f"active_vs_off_temp_inverted_{h_key}:{ao_temp:+.4f}C")
+                if ao_wh < -1e-3:
+                    h_fails.append(f"active_vs_off_wh_negative_{h_key}:{ao_wh:+.2f}Wh")
+                if k == n_k - 1 and dataset_off_count >= min_unit_mode_samples:
+                    if signed_ao < min_temp_response_c:
+                        h_fails.append(f"active_vs_off_temp_weak_{h_key}:{ao_temp:+.4f}C")
+                    if ao_wh <= 5.0:
+                        h_fails.append(f"active_vs_off_wh_weak_{h_key}:{ao_wh:+.2f}Wh")
+
+                probe_failures.extend(h_fails)
+                by_horizon[h_key] = {
+                    "stronger_minus_weaker_temp_c": round(sw_temp, 4),
+                    "stronger_minus_hold_temp_c": round(sh_temp, 4),
+                    "hold_minus_weaker_temp_c": round(hw_temp, 4),
+                    "stronger_minus_weaker_unit_wh": round(sw_wh, 3),
+                    "active_minus_off_temp_c": round(ao_temp, 4),
+                    "active_minus_off_unit_wh": round(ao_wh, 3),
+                    "passed": len(h_fails) == 0,
+                    "failures": h_fails,
+                }
+
+            passed_dir = len(probe_failures) == 0
             if mode_observed:
                 directional_checks_total += 1
                 if passed_dir:
                     directional_checks_passed += 1
-            if abs(temp_diff) >= min_temp_response_c or abs(active_vs_off_temp) >= min_temp_response_c:
-                any_significant_response = True
+                else:
+                    failed_probes.append(f"{uname}:{mode}")
 
+            last_h = by_horizon[f"{horizons[-1]}m"]
             unit_probes[mode] = {
+                "dataset_samples_in_mode": dataset_mode_count,
+                "dataset_off_samples": dataset_off_count,
                 "natural_eval_samples_in_mode": natural_count,
+                "probe_sample_count": int(probe_idx.size),
+                "used_natural_mode_samples": used_natural,
                 "mode_observed_in_dataset": mode_observed,
-                "stronger_minus_weaker_temp_60m_c": round(temp_diff, 4),
-                "stronger_minus_weaker_unit_wh_60m": round(wh_diff, 3),
-                "active_minus_off_temp_60m_c": round(active_vs_off_temp, 4),
-                "active_minus_off_unit_wh_60m": round(active_vs_off_wh, 3),
+                "stronger_minus_weaker_temp_60m_c": last_h["stronger_minus_weaker_temp_c"],
+                "stronger_minus_weaker_unit_wh_60m": last_h["stronger_minus_weaker_unit_wh"],
+                "active_minus_off_temp_60m_c": last_h["active_minus_off_temp_c"],
+                "active_minus_off_unit_wh_60m": last_h["active_minus_off_unit_wh"],
                 "expected_temp_sign": expected_temp_sign,
+                "by_horizon": by_horizon,
                 "directional_check_passed": bool(passed_dir),
+                "failure_reasons": probe_failures,
             }
         probe_results[uname] = unit_probes
 
     action_response_passed = bool(
-        any_significant_response
-        and directional_checks_total > 0
-        and directional_checks_passed >= max(1, directional_checks_total // 2)
+        directional_checks_total > 0 and directional_checks_passed == directional_checks_total
     )
     return {
         "action_coverage_sufficient": action_coverage_sufficient,
@@ -379,6 +471,7 @@ def evaluate_action_response(
         "action_response_passed": action_response_passed,
         "directional_checks_passed": directional_checks_passed,
         "directional_checks_total": directional_checks_total,
+        "failed_probes": failed_probes,
         "probes": probe_results,
     }
 
@@ -389,6 +482,10 @@ def evaluate_all_models(
     train_idx: np.ndarray,
     val_idx: np.ndarray,
     test_idx: np.ndarray,
+    *,
+    min_temp_response_c: float = 0.03,
+    min_action_events: int = 30,
+    min_active_mode_samples: int = 60,
 ) -> dict[str, Any]:
     """Compare ThermostatShadowGRU against Persistence, ExistingTrend, and ThermalInertiaLinear."""
     spec = dataset.spec
@@ -425,7 +522,14 @@ def evaluate_all_models(
             },
         }
 
-    action_audit = evaluate_action_response(artifact, dataset, test_idx if test_idx.size > 0 else val_idx)
+    action_audit = evaluate_action_response(
+        artifact,
+        dataset,
+        test_idx if test_idx.size > 0 else val_idx,
+        min_temp_response_c=min_temp_response_c,
+        min_action_events=min_action_events,
+        min_active_mode_samples=min_active_mode_samples,
+    )
     return {
         "model_id": artifact.model_id,
         "model_state": artifact.model_state.value,

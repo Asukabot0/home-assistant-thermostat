@@ -16,7 +16,7 @@ from typing import Any
 
 import numpy as np
 
-from . import ModelState
+from . import DataOrigin, ModelState
 from .config import SiteConfig
 from .constraints import CandidateAction
 from .data_pipeline import FeatureSpec, build_action_sequence_tensor
@@ -146,6 +146,10 @@ def check_applicability_and_abstention(
 
     if artifact.model_state != ModelState.READY_TO_USE:
         reasons.append(f"model_state_not_ready:{artifact.model_state.value}")
+    if artifact.metadata.get("deployment_eligible") is False:
+        reasons.append("model_not_deployment_eligible")
+    if artifact.metadata.get("data_origin") == DataOrigin.SYNTHETIC.value:
+        reasons.append("synthetic_model_not_deployment_eligible")
     if artifact.normalizer is None:
         reasons.append("missing_feature_normalizer")
     if artifact.metadata.get("version_mismatches"):

@@ -53,6 +53,7 @@ from neural_shadow.data_pipeline import (  # noqa: E402
     ingest_production_readonly,
     integrate_power_interval,
 )
+from neural_shadow.evaluate import evaluate_action_response  # noqa: E402
 from neural_shadow.nn_model import (  # noqa: E402
     FeatureNormalizer,
     ModelArtifact,
@@ -67,6 +68,8 @@ from neural_shadow.scoring import ScoringPolicy, evaluate_and_rank_candidates, s
 from neural_shadow.synthetic import generate_synthetic_history  # noqa: E402
 from neural_shadow.train import (  # noqa: E402
     ReadinessGates,
+    audit_baseline_gates,
+    determine_model_state,
     forward_chain_split,
     forward_chain_split_dataset,
     train_and_evaluate,
@@ -810,6 +813,247 @@ class NeuralShadowRegressionTests(unittest.TestCase):
             short_ds = build_dataset(short_hist)
             short_art, _ = train_and_evaluate(short_ds, epochs=2, seed=5, gates=ReadinessGates())
             self.assertEqual(short_art.model_state, ModelState.INSUFFICIENT_DATA)
+
+    # B3 regression (part 1): action-response audit must reject inverted, null, negative-Wh, and partial-pass models
+    def test_b3_action_response_rejects_inverted_null_and_partial_pass(self):
+        from unittest.mock import patch
+
+        hist = generate_synthetic_history(self.site, hours=24.0, seed=7)
+        ds = build_dataset(hist)
+        eval_idx = np.arange(ds.cutoff_ts.size, dtype=np.int64)
+        art = build_untrained_artifact(self.site, self.spec)
+
+        # Helper building a physically consistent mock predictor that reads future action tensors directly
+        u_names = self.spec.unit_names
+        z_names = self.spec.zone_names
+        inf_mat = np.asarray(self.site.influence_matrix(), dtype=np.float32)  # [Z, U]
+
+        def _make_mock_predictor(*, invert_cool_vs_off=False, invert_heat_vs_off=False, neg_wh_unit=None, null_response=False, invert_unit_temp=None):
+            def _predict(_artifact, xh, xa, **_kwargs):
+                b = xh.shape[0]
+                n_z, n_u, n_k = len(z_names), len(u_names), len(self.spec.horizons_minutes)
+                td = np.zeros((b, n_z, n_k), dtype=np.float32)
+                uw = np.zeros((b, n_u, n_k), dtype=np.float32)
+                if not null_response:
+                    # Decode future mode & setpoint from xa[:, 0, :] (9 features per unit)
+                    for u_i, uname in enumerate(u_names):
+                        base_c = u_i * 9
+                        is_heat = xa[:, 0, base_c + 1]
+                        is_cool = xa[:, 0, base_c + 2]
+                        sp = xa[:, 0, base_c + 4]
+                        # Stronger heat = higher sp; stronger cool = lower sp
+                        heat_drive = np.maximum(0.0, sp - 20.0) * is_heat
+                        cool_drive = np.maximum(0.0, 27.0 - sp) * is_cool
+                        q_u = 0.08 * heat_drive - 0.08 * cool_drive
+                        if invert_unit_temp == uname:
+                            q_u = -q_u
+                        if invert_cool_vs_off and uname == "living":
+                            # Reproduce reviewer probe: cooling-on hotter than off (+0.91C at 60m)
+                            # while stronger cool is still colder than weaker cool
+                            q_u = np.where(is_cool > 0.5, 0.35 - 0.08 * (27.0 - sp), q_u)
+                        if invert_heat_vs_off and uname == "study":
+                            # Reproduce reviewer probe: heating-on colder than off (-0.21C at 60m)
+                            q_u = np.where(is_heat > 0.5, -0.25 + 0.04 * (sp - 20.0), q_u)
+                        w_u = 2.0 + 40.0 * heat_drive + 40.0 * cool_drive
+                        if neg_wh_unit == uname:
+                            w_u = np.maximum(1.0, 200.0 - 40.0 * heat_drive - 40.0 * cool_drive)
+                        for k, h_mult in enumerate((0.35, 0.65, 1.0)):
+                            uw[:, u_i, k] = np.maximum(0.0, w_u * h_mult)
+                            for z_i in range(n_z):
+                                td[:, z_i, k] += inf_mat[z_i, u_i] * q_u * h_mult
+                tw = uw.sum(axis=1)
+                return {
+                    "temp_delta": td,
+                    "temp_sigma": np.full((b, n_z, n_k), 0.2, dtype=np.float32),
+                    "unit_wh": uw,
+                    "unit_wh_sigma": np.full((b, n_u, n_k), 5.0, dtype=np.float32),
+                    "total_wh": tw,
+                    "total_wh_sigma": np.full((b, n_k), 10.0, dtype=np.float32),
+                }
+            return _predict
+
+        # 1. Physically consistent model passes 100% of observed probes across 15m/30m/60m
+        with patch("neural_shadow.evaluate.predict_numpy", side_effect=_make_mock_predictor()):
+            audit_ok = evaluate_action_response(art, ds, eval_idx)
+        self.assertTrue(audit_ok["action_response_passed"])
+        self.assertGreater(audit_ok["directional_checks_total"], 0)
+        self.assertEqual(audit_ok["directional_checks_passed"], audit_ok["directional_checks_total"])
+        self.assertEqual(audit_ok["failed_probes"], [])
+
+        # 2. Cooling-on hotter than off (reproducing B3 probe) MUST FAIL
+        with patch("neural_shadow.evaluate.predict_numpy", side_effect=_make_mock_predictor(invert_cool_vs_off=True)):
+            audit_cool_inv = evaluate_action_response(art, ds, eval_idx)
+        self.assertFalse(audit_cool_inv["action_response_passed"])
+        self.assertIn("living:cool", audit_cool_inv["failed_probes"])
+
+        # 3. Heating-on colder than off (reproducing B3 probe) MUST FAIL
+        with patch("neural_shadow.evaluate.predict_numpy", side_effect=_make_mock_predictor(invert_heat_vs_off=True)):
+            audit_heat_inv = evaluate_action_response(art, ds, eval_idx)
+        self.assertFalse(audit_heat_inv["action_response_passed"])
+        self.assertIn("study:heat", audit_heat_inv["failed_probes"])
+
+        # 4. Stronger setting decreasing electrical Wh MUST FAIL
+        with patch("neural_shadow.evaluate.predict_numpy", side_effect=_make_mock_predictor(neg_wh_unit="bedroom")):
+            audit_wh_inv = evaluate_action_response(art, ds, eval_idx)
+        self.assertFalse(audit_wh_inv["action_response_passed"])
+        self.assertTrue(any(p.startswith("bedroom:") for p in audit_wh_inv["failed_probes"]))
+
+        # 5. Null action response MUST FAIL
+        with patch("neural_shadow.evaluate.predict_numpy", side_effect=_make_mock_predictor(null_response=True)):
+            audit_null = evaluate_action_response(art, ds, eval_idx)
+        self.assertFalse(audit_null["action_response_passed"])
+        self.assertEqual(audit_null["directional_checks_passed"], 0)
+
+        # 6. Partial pass (even when majority of units pass, 1 failing unit fails the whole gate)
+        with patch("neural_shadow.evaluate.predict_numpy", side_effect=_make_mock_predictor(invert_unit_temp="bedroom")):
+            audit_partial = evaluate_action_response(art, ds, eval_idx)
+        self.assertFalse(audit_partial["action_response_passed"])
+        self.assertGreater(audit_partial["directional_checks_passed"], 0)
+        self.assertLess(audit_partial["directional_checks_passed"], audit_partial["directional_checks_total"])
+
+    # B3 regression (part 2): readiness gates enforce all 3 baselines, per-zone bias, Wh, online-style, and synthetic block
+    def test_b3_readiness_gates_baselines_bias_wh_online_and_lifecycle_transitions(self):
+        from unittest.mock import patch
+
+        # A. Real training on 80h synthetic data: even with allow_synthetic_ready=True, model stays UNCALIBRATED (not READY_TO_USE)
+        hist = generate_synthetic_history(self.site, hours=80.0, seed=42)
+        ds = build_dataset(hist)
+        art_uncal, rep_uncal = train_and_evaluate(
+            ds,
+            epochs=6,
+            seed=42,
+            gates=ReadinessGates(allow_synthetic_ready=True),
+        )
+        self.assertEqual(art_uncal.model_state, ModelState.UNCALIBRATED)
+        self.assertFalse(art_uncal.metadata["deployment_eligible"])
+        self.assertIn("readiness_gates", art_uncal.metadata)
+        self.assertIn("baseline_gate_audit", rep_uncal)
+
+        # Default gate (allow_synthetic_ready=False) -> INSUFFICIENT_DATA & not deployment_eligible
+        split = forward_chain_split_dataset(ds)
+        st_syn, reasons_syn = determine_model_state(
+            ds, split, rep_uncal["calibration"], rep_uncal, ReadinessGates(allow_synthetic_ready=False)
+        )
+        self.assertEqual(st_syn, ModelState.INSUFFICIENT_DATA)
+        self.assertIn("synthetic_verification_data_not_eligible_for_deployment", reasons_syn)
+
+        # B. Structured determine_model_state tests covering EVERY baseline/bias/Wh/online/synthetic gate
+        ds_real = deepcopy(ds)
+        ds_real.manifest["data_origin"] = DataOrigin.REAL.value
+        ds_real.manifest["observed_span_hours"] = 96.0
+        ds_real.manifest["unique_temp_reports_by_zone"] = {z: 500 for z in self.spec.zone_names}
+        ds_real.manifest["power_coverage_by_unit"] = {u: {"coverage_ratio": 0.99} for u in self.spec.unit_names}
+
+        def _cell(mae, bias=0.02, pi80=0.80, n=60):
+            return {"n_valid": n, "mae": mae, "bias": bias, "pi80_coverage": pi80}
+
+        def _model_block(t_mae, wh_mae, bias=0.02, pi80=0.80, n=60):
+            return {
+                "temp_by_zone": {
+                    z: {f"{h}m": _cell(t_mae, bias=bias, pi80=pi80, n=n) for h in (15, 30, 60)}
+                    for z in self.spec.zone_names
+                },
+                "temp_by_horizon": {f"{h}m": _cell(t_mae, bias=bias, pi80=pi80, n=n * 2) for h in (15, 30, 60)},
+                "wh_total": {f"{h}m": _cell(wh_mae, bias=0.0, pi80=pi80, n=n) for h in (15, 30, 60)},
+            }
+
+        good_eval = {
+            "action_response_audit": {
+                "action_coverage_sufficient": True,
+                "action_coverage_issues": [],
+                "action_response_passed": True,
+                "failed_probes": [],
+            },
+            "test": {
+                "historical_replay_action_conditioned": {
+                    "neural_gru": _model_block(0.15, 18.0),
+                    "thermal_inertia_linear": _model_block(0.20, 22.0),
+                    "existing_trend": _model_block(0.25, 30.0),
+                    "persistence": _model_block(0.22, 30.0),
+                },
+                "online_style_known_at_t0_non_intervened": {
+                    "neural_gru": _model_block(0.16, 19.0),
+                    "thermal_inertia_linear": _model_block(0.20, 23.0),
+                    "existing_trend": _model_block(0.24, 28.0),
+                    "persistence": _model_block(0.22, 28.0),
+                },
+            },
+        }
+        good_cal = {"calibrated": True}
+        gates = ReadinessGates(min_train_samples=10, min_val_samples=5, min_test_samples=5)
+
+        # Clean real report passes -> READY_TO_USE
+        st_ok, _ = determine_model_state(ds_real, split, good_cal, good_eval, gates)
+        self.assertEqual(st_ok, ModelState.READY_TO_USE)
+
+        # Synthetic data_origin NEVER passes READY_TO_USE even when every metric passes!
+        ds_syn_good = deepcopy(ds_real)
+        ds_syn_good.manifest["data_origin"] = DataOrigin.SYNTHETIC.value
+        st_syn_blocked, _ = determine_model_state(ds_syn_good, split, good_cal, good_eval, gates)
+        self.assertEqual(st_syn_blocked, ModelState.INSUFFICIENT_DATA)
+
+        # Failing thermal_inertia_linear on 1 zone at 15m (even while beating persistence at 60m) -> UNCALIBRATED
+        e_lin = deepcopy(good_eval)
+        e_lin["test"]["historical_replay_action_conditioned"]["neural_gru"]["temp_by_zone"]["lounge"]["15m"]["mae"] = 0.21
+        st_lin, r_lin = determine_model_state(ds_real, split, good_cal, e_lin, gates)
+        self.assertEqual(st_lin, ModelState.UNCALIBRATED)
+        self.assertTrue(any("replay_mae_lounge_15m" in r for r in r_lin))
+
+        # Failing existing_trend on 1 zone -> UNCALIBRATED
+        e_tr = deepcopy(good_eval)
+        e_tr["test"]["historical_replay_action_conditioned"]["existing_trend"]["temp_by_zone"]["sleep"]["30m"]["mae"] = 0.12
+        st_tr, r_tr = determine_model_state(ds_real, split, good_cal, e_tr, gates)
+        self.assertEqual(st_tr, ModelState.UNCALIBRATED)
+        self.assertTrue(any("replay_mae_sleep_30m" in r and "existing_trend" in r for r in r_tr))
+
+        # Opposite-sign per-zone bias (sleep +0.30C, lounge -0.30C; merged = 0.0C) -> UNCALIBRATED
+        e_bias = deepcopy(good_eval)
+        e_bias["test"]["historical_replay_action_conditioned"]["neural_gru"]["temp_by_zone"]["sleep"]["60m"]["bias"] = 0.30
+        e_bias["test"]["historical_replay_action_conditioned"]["neural_gru"]["temp_by_zone"]["lounge"]["60m"]["bias"] = -0.30
+        st_bias, r_bias = determine_model_state(ds_real, split, good_cal, e_bias, gates)
+        self.assertEqual(st_bias, ModelState.UNCALIBRATED)
+        self.assertTrue(any("replay_bias_sleep_60m" in r for r in r_bias))
+
+        # Wh MAE worse than baseline -> UNCALIBRATED
+        e_wh = deepcopy(good_eval)
+        e_wh["test"]["historical_replay_action_conditioned"]["neural_gru"]["wh_total"]["60m"]["mae"] = 25.0
+        st_wh, r_wh = determine_model_state(ds_real, split, good_cal, e_wh, gates)
+        self.assertEqual(st_wh, ModelState.UNCALIBRATED)
+        self.assertTrue(any("replay_wh_mae_60m" in r for r in r_wh))
+
+        # Online-style 60m n_valid=0 -> UNCALIBRATED
+        e_on0 = deepcopy(good_eval)
+        e_on0["test"]["online_style_known_at_t0_non_intervened"]["neural_gru"]["temp_by_zone"]["sleep"]["60m"]["n_valid"] = 0
+        st_on0, r_on0 = determine_model_state(ds_real, split, good_cal, e_on0, gates)
+        self.assertEqual(st_on0, ModelState.UNCALIBRATED)
+        self.assertTrue(any("online_insufficient_samples_sleep_60m" in r for r in r_on0))
+
+        # C. train_and_evaluate end-to-end reaching READY_TO_USE on real-origin dataset when gates pass
+        with TemporaryDirectory() as tmp, patch("neural_shadow.train.evaluate_all_models", return_value=good_eval):
+            art_ready, rep_ready = train_and_evaluate(
+                ds_real,
+                output_dir=Path(tmp),
+                epochs=2,
+                seed=42,
+                gates=gates,
+            )
+            self.assertEqual(art_ready.model_state, ModelState.READY_TO_USE)
+            self.assertTrue(art_ready.metadata["deployment_eligible"])
+            self.assertTrue(rep_ready["baseline_gate_audit"]["passed"])
+            reloaded = load_checkpoint(Path(tmp) / "thermostat_shadow_gru.pt", expected_site=ds_real.site, expected_spec=ds_real.spec, strict=True)
+            self.assertEqual(reloaded.model_state, ModelState.READY_TO_USE)
+
+        # D. Synthetic artifact with deployment_eligible=False is ALWAYS declined by scoring abstention
+        syn_ready_fake = deepcopy(art_uncal)
+        syn_ready_fake.model_state = ModelState.READY_TO_USE
+        syn_ready_fake.metadata["model_state"] = ModelState.READY_TO_USE.value
+        syn_ready_fake.metadata["deployment_eligible"] = False
+        syn_ready_fake.metadata["data_origin"] = DataOrigin.SYNTHETIC.value
+        with TemporaryDirectory() as tmp:
+            rt = ShadowRuntime(self.site, ShadowRuntimeConfig(Path(tmp) / "st", Path(tmp) / "out"), syn_ready_fake)
+            sealed = rt.seal_prediction(hist, float(ds.cutoff_ts[-1]))
+            self.assertTrue(sealed["declined"])
+            self.assertIn("model_not_deployment_eligible", sealed["decline_reasons"])
 
     # 8. V1 candidates hard constraints & worst-zone comfort priority (no whole-house average cancellation!)
     def test_v1_candidates_and_worst_zone_comfort_priority(self):
