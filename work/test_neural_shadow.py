@@ -789,6 +789,94 @@ class NeuralShadowRegressionTests(unittest.TestCase):
             self.assertEqual(snap_bad["summary"]["neural_shadow"]["status"], "unavailable")
             self.assertIn("window", snap_bad["summary"])
 
+    # B2 regression: well-formed JSON with wrong types / Inf / unexpected errors must NEVER break hourly export
+    def test_b2_telemetry_hook_isolates_wrong_types_and_unexpected_exceptions(self):
+        from unittest.mock import patch
+
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            prod = root / "prod"
+            (prod / "pilot-data").mkdir(parents=True)
+            (prod / "shadow").mkdir(parents=True)
+            (prod / "shadow" / "rooms.json").write_text(json.dumps(self.site.raw_rooms))
+            (prod / "shadow" / "topology.json").write_text(json.dumps(self.site.raw_topology))
+            (prod / "shadow" / "house_policy.json").write_text(json.dumps(self.site.policy))
+            start = 1_800_010_800.0
+            end = start + 3600.0
+            (prod / "pilot-data" / "live-audit.jsonl").write_text(
+                json.dumps({"event": "cycle", "at": start + 60.0, "rooms": {}}) + "\n"
+            )
+
+            # Case 1: scores.jsonl contains array line, horizon_minutes=1e999 (inf), list temp_errors, plus 1 valid line
+            d1 = root / "ns_mixed_scores"
+            d1.mkdir()
+            (d1 / "neural-shadow-status.json").write_text(
+                json.dumps(
+                    {
+                        "generated_at": end + 10.0,
+                        "generated_at_utc": datetime.fromtimestamp(end + 10.0, timezone.utc).isoformat(),
+                        "model": {"model_id": "m1", "model_state": "uncalibrated"},
+                    }
+                )
+            )
+            valid_row = {
+                "prediction_id": "p_ok",
+                "horizon_minutes": 15,
+                "cutoff_ts": start + 60.0,
+                "horizon_end_ts": start + 960.0,
+                "intervened": False,
+                "factual_settlement_kind": "factual_hold",
+                "recommended_execution_status": "declined",
+                "model_state": "uncalibrated",
+                "factual_hold_temp_errors": {
+                    "sleep": {"abs_error_c": 0.12, "signed_error_c": -0.12, "sigma_c": 0.2, "within_pi80": True}
+                },
+                "factual_hold_wh_error": None,
+                "joint_wh_coverage_ratio": 1.0,
+                "joint_wh_has_gap": False,
+                "joint_wh_label_valid": True,
+            }
+            lines = [
+                "[1, 2]",
+                '{"prediction_id": "p_inf", "horizon_minutes": 1e999, "horizon_end_ts": ' + str(start + 1000.0) + "}",
+                json.dumps({**valid_row, "prediction_id": "p_list_err", "factual_hold_temp_errors": [1, 2]}),
+                json.dumps({**valid_row, "prediction_id": "p_bad_zval", "factual_hold_temp_errors": {"sleep": [1, 2]}}),
+                json.dumps(valid_row),
+            ]
+            (d1 / "neural-shadow-scores.jsonl").write_text("\n".join(lines) + "\n")
+            snap1 = telemetry_evidence.collect(prod, start, end, {"status": "verified"}, "a" * 64, neural_shadow_dir=d1)
+            self.assertEqual(snap1["summary"]["neural_shadow"]["status"], "available")
+            # Bad lines skipped individually; valid row (and row with valid dict minus bad zval) preserved cleanly
+            self.assertGreaterEqual(len(snap1["raw"]["neural-shadow-scores"]), 1)
+            self.assertGreaterEqual(snap1["watermarks"]["neural_shadow"]["skipped_malformed_rows"], 3)
+            telemetry_evidence.bundle((start, end), "hourly", snap1, None, None)
+
+            # Case 2: status.json is a JSON array [] -> must NOT raise AttributeError
+            d2 = root / "ns_status_array"
+            d2.mkdir()
+            (d2 / "neural-shadow-status.json").write_text("[]")
+            snap2 = telemetry_evidence.collect(prod, start, end, {"status": "verified"}, "a" * 64, neural_shadow_dir=d2)
+            self.assertEqual(snap2["summary"]["neural_shadow"]["status"], "unavailable")
+            self.assertIn("window", snap2["summary"])
+            telemetry_evidence.bundle((start, end), "hourly", snap2, None, None)
+
+            # Case 3: status.model is a string -> must NOT raise AttributeError
+            d3 = root / "ns_model_str"
+            d3.mkdir()
+            (d3 / "neural-shadow-status.json").write_text(json.dumps({"model": "unexpected_string"}))
+            snap3 = telemetry_evidence.collect(prod, start, end, {"status": "verified"}, "a" * 64, neural_shadow_dir=d3)
+            self.assertEqual(snap3["summary"]["neural_shadow"]["status"], "unavailable")
+            self.assertIn("window", snap3["summary"])
+            telemetry_evidence.bundle((start, end), "hourly", snap3, None, None)
+
+            # Case 4: collect() outer boundary isolates ANY unexpected Exception from read_neural_shadow
+            with patch.object(telemetry_evidence, "read_neural_shadow", side_effect=RuntimeError("unexpected hook failure")):
+                snap4 = telemetry_evidence.collect(prod, start, end, {"status": "verified"}, "a" * 64, neural_shadow_dir=d1)
+            self.assertEqual(snap4["summary"]["neural_shadow"]["status"], "unavailable")
+            self.assertEqual(snap4["summary"]["neural_shadow"]["error"], "RuntimeError")
+            self.assertIn("window", snap4["summary"])
+            telemetry_evidence.bundle((start, end), "hourly", snap4, None, None)
+
     # 10. Static AST & Compose verification: ZERO actuation path!
     def test_no_actuation_path_static_and_compose_audit(self):
         ns_dir = REPO_ROOT / "home-assistant" / "neural_shadow"

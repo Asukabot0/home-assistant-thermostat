@@ -557,17 +557,63 @@ def release_groups(audit, frames, power, meter_by_unit, zones, commands, start, 
 def read_neural_shadow(folder, start, end, schema):
     """Read-only, exception-isolated export of neural shadow scores, gaps, and versions."""
     acquired = time()
-    folder = Path(folder)
     try:
+        folder = Path(folder)
         status_path = folder / "neural-shadow-status.json"
         scores_path = folder / "neural-shadow-scores.jsonl"
-        status_raw = load_json(status_path) if status_path.is_file() else {}
-        model_info = status_raw.get("model") or {}
+
         pub_token = lambda v: v if isinstance(v, str) and re.fullmatch(r"[a-z][a-z0-9_-]{0,55}", v) else None
+        iso_token = (
+            lambda v: v
+            if isinstance(v, str)
+            and stamp(v) is not None
+            and re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})", v)
+            else None
+        )
+
+        def safe_num(v):
+            if isinstance(v, bool):
+                return None
+            return num(v)
+
+        def safe_int(v, *, low=-10**12, high=10**12):
+            x = safe_num(v)
+            if x is None or abs(x - round(x)) > 1e-6 or not (low <= x <= high):
+                return None
+            return int(round(x))
+
+        status_raw = {}
+        status_error = None
+        if status_path.is_file():
+            try:
+                loaded_status = load_json(status_path)
+            except Exception as exc:
+                status_error = type(exc).__name__
+            else:
+                if isinstance(loaded_status, dict):
+                    status_raw = loaded_status
+                else:
+                    status_error = "InvalidStatusType"
+
+        model_raw = status_raw.get("model")
+        if model_raw is not None and not isinstance(model_raw, dict):
+            status_error = status_error or "InvalidModelType"
+            model_info = {}
+        else:
+            model_info = model_raw or {}
+
+        raw_model_id = model_info.get("model_id")
+        model_id_tok = (
+            schema.id("ns_model", raw_model_id)
+            if isinstance(raw_model_id, (str, int, float)) and not isinstance(raw_model_id, bool) and raw_model_id != ""
+            else None
+        )
         versions = {
-            "model_id": schema.id("ns_model", model_info.get("model_id")) if model_info.get("model_id") else None,
+            "model_id": model_id_tok,
             "model_state": pub_token(model_info.get("model_state")),
-            "deployment_eligible": bool(model_info.get("deployment_eligible", False)),
+            "deployment_eligible": bool(model_info.get("deployment_eligible", False))
+            if isinstance(model_info.get("deployment_eligible"), bool)
+            else False,
             "model_arch_version": pub_token(model_info.get("model_arch_version")),
             "feature_version": pub_token(model_info.get("feature_version")),
             "constraint_version": pub_token(model_info.get("constraint_version")),
@@ -575,70 +621,85 @@ def read_neural_shadow(folder, start, end, schema):
             if isinstance(model_info.get("config_fingerprint"), str)
             and HEXDIGEST.fullmatch(model_info["config_fingerprint"])
             else None,
-            "training_cutoff_utc": model_info.get("training_cutoff_utc")
-            if isinstance(model_info.get("training_cutoff_utc"), str)
-            and re.match(r"^\d{4}-\d{2}-\d{2}T", model_info["training_cutoff_utc"])
-            else None,
+            "training_cutoff_utc": iso_token(model_info.get("training_cutoff_utc")),
             "data_origin": pub_token(model_info.get("data_origin")),
-            "parameter_count": int(model_info["parameter_count"])
-            if isinstance(model_info.get("parameter_count"), int)
-            else None,
+            "parameter_count": safe_int(model_info.get("parameter_count"), low=0),
         }
+
         rows = []
+        skipped_malformed_rows = 0
         if scores_path.is_file():
-            with scores_path.open("r", encoding="utf-8") as stream:
+            with scores_path.open("r", encoding="utf-8", errors="replace") as stream:
                 for line in stream:
                     if not line.strip():
                         continue
                     try:
                         rec = json.loads(line)
-                    except json.JSONDecodeError:
+                        if not isinstance(rec, dict):
+                            skipped_malformed_rows += 1
+                            continue
+                        end_ts = safe_num(rec.get("horizon_end_ts"))
+                        if end_ts is None or not (start <= end_ts < end):
+                            continue
+                        h_min = safe_int(rec.get("horizon_minutes"), low=1, high=1440)
+                        if h_min is None:
+                            skipped_malformed_rows += 1
+                            continue
+                        zone_errs = {}
+                        raw_zone_errs = rec.get("factual_hold_temp_errors")
+                        if isinstance(raw_zone_errs, dict):
+                            for z, zval in raw_zone_errs.items():
+                                if not isinstance(z, str) or not isinstance(zval, dict):
+                                    continue
+                                z_alias = schema.aliases.get(z, schema.id("zones", z))
+                                z_out = {}
+                                for k in ("pred_delta_c", "actual_delta_c", "signed_error_c", "abs_error_c", "sigma_c", "within_pi80"):
+                                    if k not in zval:
+                                        continue
+                                    z_out[k] = bool(zval[k]) if k == "within_pi80" else safe_num(zval.get(k))
+                                zone_errs[z_alias] = z_out
+                        elif raw_zone_errs is not None:
+                            skipped_malformed_rows += 1
+                            continue
+                        wh_err_raw = rec.get("factual_hold_wh_error")
+                        wh_err = (
+                            {
+                                k: (bool(wh_err_raw[k]) if k == "within_pi80" else safe_num(wh_err_raw.get(k)))
+                                for k in ("pred_total_wh", "actual_total_wh", "signed_error_wh", "abs_error_wh", "sigma_wh", "within_pi80")
+                                if k in wh_err_raw
+                            }
+                            if isinstance(wh_err_raw, dict)
+                            else None
+                        )
+                        raw_pid = rec.get("prediction_id")
+                        pid_val = raw_pid if isinstance(raw_pid, (str, int, float)) and not isinstance(raw_pid, bool) else None
+                        rows.append(
+                            {
+                                "id": schema.id("ns_score", (pid_val, h_min)),
+                                "horizon_minutes": h_min,
+                                "cutoff_ts": safe_num(rec.get("cutoff_ts")),
+                                "horizon_end_ts": end_ts,
+                                "intervened": bool(rec.get("intervened", False)),
+                                "factual_settlement_kind": pub_token(rec.get("factual_settlement_kind")),
+                                "recommended_execution_status": pub_token(rec.get("recommended_execution_status")),
+                                "model_state": pub_token(rec.get("model_state")),
+                                "model_arch_version": pub_token(rec.get("model_arch_version")),
+                                "feature_version": pub_token(rec.get("feature_version")),
+                                "config_fingerprint": rec.get("config_fingerprint")
+                                if isinstance(rec.get("config_fingerprint"), str)
+                                and HEXDIGEST.fullmatch(rec["config_fingerprint"])
+                                else None,
+                                "training_cutoff_ts": safe_num(rec.get("training_cutoff_ts")),
+                                "factual_hold_temp_errors": zone_errs,
+                                "factual_hold_wh_error": wh_err,
+                                "joint_wh_coverage_ratio": safe_num(rec.get("joint_wh_coverage_ratio")),
+                                "joint_wh_has_gap": bool(rec.get("joint_wh_has_gap", True)),
+                                "joint_wh_label_valid": bool(rec.get("joint_wh_label_valid", False)),
+                            }
+                        )
+                    except Exception:
+                        skipped_malformed_rows += 1
                         continue
-                    end_ts = num(rec.get("horizon_end_ts"))
-                    if end_ts is None or not (start <= end_ts < end):
-                        continue
-                    zone_errs = {}
-                    for z, zval in (rec.get("factual_hold_temp_errors") or {}).items():
-                        z_alias = schema.aliases.get(z, schema.id("zones", z))
-                        zone_errs[z_alias] = {
-                            k: (bool(zval[k]) if k == "within_pi80" else num(zval.get(k)))
-                            for k in ("pred_delta_c", "actual_delta_c", "signed_error_c", "abs_error_c", "sigma_c", "within_pi80")
-                            if k in zval
-                        }
-                    wh_err_raw = rec.get("factual_hold_wh_error")
-                    wh_err = (
-                        {
-                            k: (bool(wh_err_raw[k]) if k == "within_pi80" else num(wh_err_raw.get(k)))
-                            for k in ("pred_total_wh", "actual_total_wh", "signed_error_wh", "abs_error_wh", "sigma_wh", "within_pi80")
-                            if k in wh_err_raw
-                        }
-                        if isinstance(wh_err_raw, dict)
-                        else None
-                    )
-                    rows.append(
-                        {
-                            "id": schema.id("ns_score", (rec.get("prediction_id"), rec.get("horizon_minutes"))),
-                            "horizon_minutes": int(rec["horizon_minutes"]),
-                            "cutoff_ts": num(rec.get("cutoff_ts")),
-                            "horizon_end_ts": end_ts,
-                            "intervened": bool(rec.get("intervened", False)),
-                            "factual_settlement_kind": pub_token(rec.get("factual_settlement_kind")),
-                            "recommended_execution_status": pub_token(rec.get("recommended_execution_status")),
-                            "model_state": pub_token(rec.get("model_state")),
-                            "model_arch_version": pub_token(rec.get("model_arch_version")),
-                            "feature_version": pub_token(rec.get("feature_version")),
-                            "config_fingerprint": rec.get("config_fingerprint")
-                            if isinstance(rec.get("config_fingerprint"), str)
-                            and HEXDIGEST.fullmatch(rec["config_fingerprint"])
-                            else None,
-                            "training_cutoff_ts": num(rec.get("training_cutoff_ts")),
-                            "factual_hold_temp_errors": zone_errs,
-                            "factual_hold_wh_error": wh_err,
-                            "joint_wh_coverage_ratio": num(rec.get("joint_wh_coverage_ratio")),
-                            "joint_wh_has_gap": bool(rec.get("joint_wh_has_gap", True)),
-                            "joint_wh_label_valid": bool(rec.get("joint_wh_label_valid", False)),
-                        }
-                    )
         rows.sort(key=lambda r: (r["horizon_end_ts"], r["horizon_minutes"], r["id"]))
         by_horizon = {}
         for h_min in sorted({r["horizon_minutes"] for r in rows} | {15, 30, 60}):
@@ -677,8 +738,9 @@ def read_neural_shadow(folder, start, end, schema):
                 "coverage_gap_count": gaps_n,
                 "has_coverage_gap": gaps_n > 0 or (len(h_rows) == 0),
             }
+        has_valid_source = (status_path.is_file() and status_error is None) or (scores_path.is_file() and status_error is None)
         summary = {
-            "status": "available" if status_path.is_file() or scores_path.is_file() else "unavailable",
+            "status": "available" if has_valid_source else "unavailable",
             "versions": versions,
             "window_counts": {
                 "settled_total": len(rows),
@@ -691,16 +753,18 @@ def read_neural_shadow(folder, start, end, schema):
             },
             "window_factual_scores": by_horizon,
         }
+        if status_error is not None:
+            summary["error"] = status_error
         watermark = {
             **source_watermark(rows, "horizon_end_ts", acquired, start, end),
             "status": summary["status"],
-            "generated_at_utc": status_raw.get("generated_at_utc")
-            if isinstance(status_raw.get("generated_at_utc"), str)
-            and re.match(r"^\d{4}-\d{2}-\d{2}T", status_raw["generated_at_utc"])
-            else None,
+            "generated_at_utc": iso_token(status_raw.get("generated_at_utc")),
+            "skipped_malformed_rows": skipped_malformed_rows,
         }
+        if status_error is not None:
+            watermark["error"] = status_error
         return rows, summary, watermark
-    except (OSError, ValueError, KeyError, TypeError) as error:
+    except Exception as error:
         err_name = type(error).__name__
         return (
             [],
@@ -816,7 +880,19 @@ def collect(root, start, end, runtime, key, *, previous_archive=None, neural_sha
         if totals["controller_errors"] != reconciled:
             raise ValueError("Controller errors must reconcile across deployment windows")
     if neural_shadow_dir is not None:
-        ns_rows, ns_summary, ns_mark = read_neural_shadow(neural_shadow_dir, start, end, schema)
+        try:
+            ns_rows, ns_summary, ns_mark = read_neural_shadow(neural_shadow_dir, start, end, schema)
+        except Exception as error:
+            err_name = type(error).__name__
+            ns_rows = []
+            ns_summary = {"status": "unavailable", "error": err_name}
+            ns_mark = {
+                "acquired_at": iso(captured),
+                "status": "unavailable",
+                "error": err_name,
+                "window_from": start,
+                "window_to": end,
+            }
         raw["neural-shadow-scores"] = ns_rows
         summary["neural_shadow"] = ns_summary
         marks["neural_shadow"] = ns_mark
