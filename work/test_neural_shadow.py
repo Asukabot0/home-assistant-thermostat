@@ -50,9 +50,13 @@ from neural_shadow.data_pipeline import (  # noqa: E402
     build_feature_spec,
     deduplicate_temp_reports,
     extract_history_window,
+    ingest_canonical_snapshot,
     ingest_evidence_archives,
     ingest_production_readonly,
     integrate_power_interval,
+    load_dataset,
+    merge_power_ranges,
+    save_canonical_snapshot,
 )
 from neural_shadow.evaluate import evaluate_action_response  # noqa: E402
 from neural_shadow.nn_model import (  # noqa: E402
@@ -1654,6 +1658,591 @@ class NeuralShadowRegressionTests(unittest.TestCase):
             self.assertGreater(summary["settled_horizon_count"], 0)
             for fname in ("neural-shadow-status.json", "neural-shadow-scores.jsonl", "neural-shadow-health.json", "neural-shadow-report.md"):
                 self.assertIn(fname, summary["report_files"])
+
+    # 13. Issue #2 regression: overlap tail preservation across all max_gap_s values
+    def test_issue2_overlap_preserves_unoverlapped_tail_all_max_gap_values(self):
+        base = 1_800_000_000.0
+        primary = "sensor.example_living_local_power"
+        fallback = "sensor.example_living_legacy_power"
+
+        # Case A: same-tier observer restart overlap [0, 60] (ep1, 100W) overlapped by [10, 20] (ep2, 90W)
+        # MUST keep the unoverlapped tail [20, 60] for max_gap_s == 120 AND max_gap_s != 120.
+        same_tier_reports = [
+            PowerReport("living", primary, "2026-11-27T10:00:00+00:00", base + 0.0, 100.0),
+            PowerReport("living", primary, "2026-11-27T10:00:00+00:00", base + 60.0, 100.0),
+            PowerReport("living", primary, "2026-11-27T10:00:10+00:00", base + 10.0, 90.0),
+            PowerReport("living", primary, "2026-11-27T10:00:10+00:00", base + 20.0, 90.0),
+        ]
+        expected_wh = (10.0 * 100.0 + 10.0 * 90.0 + 40.0 * 100.0) / 3600.0
+        for max_gap in (60.0, 90.0, 120.0, 180.0):
+            with self.subTest(max_gap_s=max_gap):
+                merged = merge_power_ranges(
+                    same_tier_reports,
+                    base,
+                    base + 60.0,
+                    max_gap_s=max_gap,
+                    primary_entity=primary,
+                    fallback_entity=fallback,
+                )
+                self.assertEqual(
+                    [(round(a - base, 3), round(b - base, 3), w) for a, b, w, _, _ in merged],
+                    [(0.0, 10.0, 100.0), (10.0, 20.0, 90.0), (20.0, 60.0, 100.0)],
+                )
+                pint = integrate_power_interval(
+                    same_tier_reports,
+                    base,
+                    base + 60.0,
+                    max_gap_s=max_gap,
+                    primary_entity=primary,
+                    fallback_entity=fallback,
+                )
+                self.assertFalse(pint.has_gap)
+                self.assertAlmostEqual(pint.coverage_ratio, 1.0, places=6)
+                self.assertAlmostEqual(pint.gap_seconds, 0.0, places=6)
+                self.assertAlmostEqual(pint.wh, expected_wh, places=6)
+
+        # Case B: multiple nested overlaps [0, 60] + [10, 50] + [15, 25] preserve every tail
+        nested_reports = [
+            PowerReport("living", primary, "2026-11-27T10:00:00+00:00", base + 0.0, 100.0),
+            PowerReport("living", primary, "2026-11-27T10:00:00+00:00", base + 60.0, 100.0),
+            PowerReport("living", primary, "2026-11-27T10:00:10+00:00", base + 10.0, 80.0),
+            PowerReport("living", primary, "2026-11-27T10:00:10+00:00", base + 50.0, 80.0),
+            PowerReport("living", primary, "2026-11-27T10:00:15+00:00", base + 15.0, 60.0),
+            PowerReport("living", primary, "2026-11-27T10:00:15+00:00", base + 25.0, 60.0),
+        ]
+        pint_nested = integrate_power_interval(
+            nested_reports, base, base + 60.0, max_gap_s=90.0, primary_entity=primary, fallback_entity=fallback
+        )
+        self.assertFalse(pint_nested.has_gap)
+        self.assertAlmostEqual(pint_nested.covered_seconds, 60.0, places=6)
+        self.assertAlmostEqual(
+            pint_nested.wh,
+            (10.0 * 100.0 + 5.0 * 80.0 + 10.0 * 60.0 + 25.0 * 80.0 + 10.0 * 100.0) / 3600.0,
+            places=6,
+        )
+
+        # Case C: cross-tier [0, 60] (primary:ledger, 100W) overlapped by [10, 20] (fallback:recorder, 500W)
+        # Primary MUST NOT be overwritten or tail-truncated!
+        cross_tier_reports = [
+            PowerReport("living", primary, "ep1", base + 0.0, 100.0),
+            PowerReport("living", primary, "ep1", base + 60.0, 100.0),
+            PowerReport("living", fallback, "recorder", base + 10.0, 500.0, source_role="fallback"),
+            PowerReport("living", fallback, "recorder", base + 20.0, 500.0, source_role="fallback"),
+        ]
+        for max_gap in (90.0, 120.0):
+            pint_cross = integrate_power_interval(
+                cross_tier_reports,
+                base,
+                base + 60.0,
+                max_gap_s=max_gap,
+                primary_entity=primary,
+                fallback_entity=fallback,
+            )
+            self.assertFalse(pint_cross.has_gap)
+            self.assertAlmostEqual(pint_cross.coverage_ratio, 1.0, places=6)
+            self.assertAlmostEqual(pint_cross.wh, 100.0 * 60.0 / 3600.0, places=6)
+            self.assertEqual(pint_cross.covered_by_source, {"primary:ledger": 60.0})
+
+    # 14. Issue #2 regression: Sample A/B/C style cases (no false gaps, no silent primary Wh rewrite)
+    def test_issue2_samples_abc_fallback_never_creates_gaps_or_rewrites_primary_wh(self):
+        bed_act = self.site.actuator_by_name("bedroom")
+        liv_act = self.site.actuator_by_name("living")
+        stu_act = self.site.actuator_by_name("study")
+        ep = "2026-11-26T17:38:21+00:00"
+
+        # --- Sample A style (15m = 900s): living primary:ledger 60s cadence + primary:recorder + fallback:recorder
+        # ending at +13.121s inside the first clipped primary segment [0, +23.438s] (previously lost 10.317s -> 0.9885)
+        t_a0 = 1_800_055_200.0
+        t_a1 = t_a0 + 900.0
+        sample_a_primary = [
+            PowerReport("living", liv_act.power_entity, ep, t_a0 - 36.471, 45.0),
+            PowerReport("living", liv_act.power_entity, ep, t_a0 + 23.438, 4.0),
+            PowerReport("living", liv_act.power_entity, ep, t_a0 + 83.434, 1.0),
+        ]
+        for m in range(2, 17):
+            sample_a_primary.append(PowerReport("living", liv_act.power_entity, ep, t_a0 + 23.434 + m * 60.0, 1.0))
+
+        sample_a_extra = [
+            # primary:recorder duplicate of first 3 points
+            PowerReport("living", liv_act.power_entity, "recorder", t_a0 - 36.471, 45.0),
+            PowerReport("living", liv_act.power_entity, "recorder", t_a0 + 23.438, 4.0),
+            # fallback:recorder short burst ending at +13.121s (inside [0, +23.438s]) with higher watts
+            PowerReport("living", liv_act.power_fallback, "recorder", t_a0 - 21.805, 54.07, source_role="fallback"),
+            PowerReport("living", liv_act.power_fallback, "recorder", t_a0 + 4.113, 45.06, source_role="fallback"),
+            PowerReport("living", liv_act.power_fallback, "recorder", t_a0 + 9.108, 38.62, source_role="fallback"),
+            PowerReport("living", liv_act.power_fallback, "recorder", t_a0 + 13.121, 4.29, source_role="fallback"),
+        ]
+        pint_a_pure = integrate_power_interval(
+            sample_a_primary, t_a0, t_a1, primary_entity=liv_act.power_entity, fallback_entity=liv_act.power_fallback
+        )
+        pint_a_mixed = integrate_power_interval(
+            [*sample_a_primary, *sample_a_extra],
+            t_a0,
+            t_a1,
+            primary_entity=liv_act.power_entity,
+            fallback_entity=liv_act.power_fallback,
+        )
+        self.assertFalse(pint_a_mixed.has_gap)
+        self.assertAlmostEqual(pint_a_mixed.coverage_ratio, 1.0, places=6)
+        self.assertAlmostEqual(pint_a_mixed.gap_seconds, 0.0, places=6)
+        self.assertAlmostEqual(pint_a_mixed.wh, pint_a_pure.wh, places=6)
+        self.assertAlmostEqual(pint_a_mixed.wh, 0.586461, places=5)
+        self.assertEqual(pint_a_mixed.covered_by_source, {"primary:ledger": 900.0})
+
+        # --- Sample B style (60m = 3600s):
+        # 1) bedroom & living have multiple fallback bursts inside 60s primary segments (previously lost 73s / 29s)
+        # 2) study has full primary coverage AND systematically biased (+20W) fallback bursts (previously rewrote Wh!)
+        t_b0 = 1_800_046_800.0
+        t_b1 = t_b0 + 3600.0
+        bed_primary = [
+            PowerReport("bedroom", bed_act.power_entity, ep, t_b0 - 44.0 + m * 60.0, 500.0 if 10 <= m <= 35 else 1.0)
+            for m in range(63)
+        ]
+        bed_fallback = [
+            # Short burst inside [12:16, 13:16], [20:16, 21:16], [30:16, 31:16]
+            PowerReport("bedroom", bed_act.power_fallback, "recorder", t_b0 + 12 * 60.0 - 30.0, 620.0, source_role="fallback"),
+            PowerReport("bedroom", bed_act.power_fallback, "recorder", t_b0 + 12 * 60.0 + 8.0, 580.0, source_role="fallback"),
+            PowerReport("bedroom", bed_act.power_fallback, "recorder", t_b0 + 20 * 60.0 + 20.0, 560.0, source_role="fallback"),
+            PowerReport("bedroom", bed_act.power_fallback, "recorder", t_b0 + 20 * 60.0 + 50.0, 49.0, source_role="fallback"),
+            PowerReport("bedroom", bed_act.power_fallback, "recorder", t_b0 + 30 * 60.0 + 20.0, 283.0, source_role="fallback"),
+            PowerReport("bedroom", bed_act.power_fallback, "recorder", t_b0 + 30 * 60.0 + 36.0, 27.0, source_role="fallback"),
+        ]
+        stu_primary = [
+            PowerReport("study", stu_act.power_entity, ep, t_b0 - 37.0 + m * 60.0, 450.0 if m >= 46 else 1.0)
+            for m in range(63)
+        ]
+        # Systematically offset fallback (+25W) overlapping the active study period
+        stu_fallback = [
+            PowerReport("study", stu_act.power_fallback, "recorder", t_b0 + 46 * 60.0 + s * 15.0, 475.0, source_role="fallback")
+            for s in range(56)
+        ]
+        pint_bed_pure = integrate_power_interval(
+            bed_primary, t_b0, t_b1, primary_entity=bed_act.power_entity, fallback_entity=bed_act.power_fallback
+        )
+        pint_bed_mixed = integrate_power_interval(
+            [*bed_primary, *bed_fallback],
+            t_b0,
+            t_b1,
+            primary_entity=bed_act.power_entity,
+            fallback_entity=bed_act.power_fallback,
+        )
+        self.assertFalse(pint_bed_mixed.has_gap)
+        self.assertAlmostEqual(pint_bed_mixed.gap_seconds, 0.0, places=6)
+        self.assertAlmostEqual(pint_bed_mixed.wh, pint_bed_pure.wh, places=6)
+        self.assertEqual(pint_bed_mixed.covered_by_source, {"primary:ledger": 3600.0})
+
+        pint_stu_pure = integrate_power_interval(
+            stu_primary, t_b0, t_b1, primary_entity=stu_act.power_entity, fallback_entity=stu_act.power_fallback
+        )
+        pint_stu_mixed = integrate_power_interval(
+            [*stu_primary, *stu_fallback],
+            t_b0,
+            t_b1,
+            primary_entity=stu_act.power_entity,
+            fallback_entity=stu_act.power_fallback,
+        )
+        self.assertFalse(pint_stu_mixed.has_gap)
+        self.assertAlmostEqual(pint_stu_mixed.wh, pint_stu_pure.wh, places=6)
+        self.assertEqual(pint_stu_mixed.covered_by_source, {"primary:ledger": 3600.0})
+
+        # --- Sample C style (60m = 3600s) through full build_dataset AND ShadowRuntime.settle_predictions!
+        base_c = 1_800_000_000.0
+        cutoff_c = base_c + 180 * 60.0
+        hist_pure = _make_clean_history(self.site, base_ts=base_c, minutes=260)
+        hist_mixed = deepcopy(hist_pure)
+        # Inject primary:recorder duplicates + multiple fallback:recorder short bursts inside 60s primary segments
+        extra_liv = []
+        for offset_s, burst_end_s in ((6 * 60.0 + 2.0, 6 * 60.0 + 38.0), (8 * 60.0 + 20.0, 8 * 60.0 + 56.0), (30 * 60.0 + 4.0, 30 * 60.0 + 13.0)):
+            extra_liv.append(PowerReport("living", liv_act.power_entity, "recorder", cutoff_c + offset_s - 20.0, 250.0))
+            extra_liv.append(PowerReport("living", liv_act.power_entity, "recorder", cutoff_c + offset_s + 40.0, 250.0))
+            extra_liv.append(PowerReport("living", liv_act.power_fallback, "recorder", cutoff_c + offset_s, 390.0, source_role="fallback"))
+            extra_liv.append(PowerReport("living", liv_act.power_fallback, "recorder", cutoff_c + burst_end_s, 395.0, source_role="fallback"))
+        hist_mixed.power_reports["living"] = sorted(
+            [*hist_mixed.power_reports["living"], *extra_liv], key=lambda r: r.report_at
+        )
+
+        ds_pure = build_dataset(hist_pure)
+        ds_mixed = build_dataset(hist_mixed)
+        idx_c = int(np.where(np.isclose(ds_pure.cutoff_ts, cutoff_c, rtol=0.0, atol=1e-3))[0][0])
+        np.testing.assert_array_equal(ds_mixed.y_total_valid[idx_c], np.array([True, True, True]))
+        np.testing.assert_allclose(ds_mixed.y_total_cov[idx_c], np.array([1.0, 1.0, 1.0]), atol=1e-6)
+        np.testing.assert_allclose(ds_mixed.y_total_wh[idx_c], ds_pure.y_total_wh[idx_c], atol=1e-4)
+        np.testing.assert_allclose(ds_mixed.y_unit_wh[idx_c], ds_pure.y_unit_wh[idx_c], atol=1e-4)
+
+        art = build_untrained_artifact(self.site, self.spec)
+        with TemporaryDirectory() as tmp:
+            rt_pure = ShadowRuntime(self.site, ShadowRuntimeConfig(Path(tmp) / "st_p", Path(tmp) / "out_p"), art)
+            rt_mixed = ShadowRuntime(self.site, ShadowRuntimeConfig(Path(tmp) / "st_m", Path(tmp) / "out_m"), art)
+            rt_pure.seal_prediction(hist_pure, cutoff_c, sealed_at=cutoff_c + 1.0)
+            rt_mixed.seal_prediction(hist_mixed, cutoff_c, sealed_at=cutoff_c + 1.0)
+            set_p = {r["horizon_minutes"]: r for r in rt_pure.settle_predictions(hist_pure, now_ts=cutoff_c + 4500.0)}
+            set_m = {r["horizon_minutes"]: r for r in rt_mixed.settle_predictions(hist_mixed, now_ts=cutoff_c + 4500.0)}
+            for h in (15, 30, 60):
+                self.assertFalse(set_m[h]["joint_wh_has_gap"])
+                self.assertTrue(set_m[h]["joint_wh_label_valid"])
+                self.assertAlmostEqual(set_m[h]["joint_wh_coverage_ratio"], 1.0, places=6)
+                self.assertAlmostEqual(set_m[h]["actual_total_wh"], set_p[h]["actual_total_wh"], places=3)
+                self.assertEqual(set_m[h]["actual_units_wh"]["living"]["covered_seconds_by_source"], {"primary:ledger": float(h * 60)})
+
+    # 15. Issue #2 regression: source priority holes, real multi-thousand-second gaps, and epoch/None restart rules
+    def test_issue2_source_priority_holes_real_long_gaps_and_epoch_restarts(self):
+        base = 1_800_000_000.0
+        primary = "sensor.example_bedroom_local_power"
+        fallback = "sensor.example_bedroom_legacy_power"
+
+        # 1. Strict priority chain: primary:ledger (0) > primary:recorder (1) > fallback:ledger (2) > fallback:recorder (3)
+        # Lower priority ONLY fills true uncovered holes.
+        tiered_reports = [
+            # primary:ledger covers [0, 60] and [300, 360] at 100W
+            PowerReport("bedroom", primary, "ep1", base + 0.0, 100.0),
+            PowerReport("bedroom", primary, "ep1", base + 60.0, 100.0),
+            PowerReport("bedroom", primary, "ep1", base + 300.0, 100.0),
+            PowerReport("bedroom", primary, "ep1", base + 360.0, 100.0),
+            # primary:recorder covers [0, 120] at 120W -> must NOT overwrite [0, 60], only fill [60, 120]
+            PowerReport("bedroom", primary, "recorder", base + 0.0, 120.0),
+            PowerReport("bedroom", primary, "recorder", base + 60.0, 120.0),
+            PowerReport("bedroom", primary, "recorder", base + 120.0, 120.0),
+            # fallback:ledger covers [90, 240] at 200W -> must NOT overwrite [90, 120], only fill [120, 240]
+            PowerReport("bedroom", fallback, "ep_fb", base + 90.0, 200.0, source_role="fallback"),
+            PowerReport("bedroom", fallback, "ep_fb", base + 180.0, 200.0, source_role="fallback"),
+            PowerReport("bedroom", fallback, "ep_fb", base + 240.0, 200.0, source_role="fallback"),
+            # fallback:recorder covers [0, 360] at 500W -> must ONLY fill remaining true hole [240, 300]
+            *[
+                PowerReport("bedroom", fallback, "recorder", base + m * 60.0, 500.0, source_role="fallback")
+                for m in range(7)
+            ],
+        ]
+        pint_tiered = integrate_power_interval(
+            tiered_reports, base, base + 360.0, primary_entity=primary, fallback_entity=fallback
+        )
+        self.assertFalse(pint_tiered.has_gap)
+        self.assertAlmostEqual(pint_tiered.coverage_ratio, 1.0, places=6)
+        self.assertEqual(
+            pint_tiered.covered_by_source,
+            {
+                "primary:ledger": 120.0,
+                "primary:recorder": 60.0,
+                "fallback:ledger": 120.0,
+                "fallback:recorder": 60.0,
+            },
+        )
+        expected_wh = (120.0 * 100.0 + 60.0 * 120.0 + 120.0 * 200.0 + 60.0 * 500.0) / 3600.0
+        self.assertAlmostEqual(pint_tiered.wh, expected_wh, places=6)
+
+        # 2. Real Recorder-only long gap (4200s early-morning hole) MUST stay flagged has_gap=True & excluded!
+        long_gap_reports = [
+            PowerReport("bedroom", primary, "recorder", base + 0.0, 250.0),
+            PowerReport("bedroom", primary, "recorder", base + 60.0, 250.0),
+            PowerReport("bedroom", primary, "recorder", base + 4260.0, 250.0),
+            PowerReport("bedroom", primary, "recorder", base + 4320.0, 250.0),
+            PowerReport("bedroom", fallback, "recorder", base + 10.0, 260.0, source_role="fallback"),
+            PowerReport("bedroom", fallback, "recorder", base + 50.0, 260.0, source_role="fallback"),
+            PowerReport("bedroom", fallback, "recorder", base + 4270.0, 260.0, source_role="fallback"),
+            PowerReport("bedroom", fallback, "recorder", base + 4310.0, 260.0, source_role="fallback"),
+        ]
+        pint_long = integrate_power_interval(
+            long_gap_reports, base, base + 4320.0, primary_entity=primary, fallback_entity=fallback
+        )
+        self.assertTrue(pint_long.has_gap)
+        self.assertIsNone(pint_long.full_interval_wh)
+        self.assertAlmostEqual(pint_long.covered_seconds, 120.0, places=3)
+        self.assertAlmostEqual(pint_long.gap_seconds, 4200.0, places=3)
+        self.assertAlmostEqual(pint_long.wh, 250.0 * 120.0 / 3600.0, places=4)
+
+        # 3. Observer-epoch restart with 1s gap MUST NOT bridge across epochs
+        restart_gap = [
+            PowerReport("bedroom", primary, "2026-11-27T10:00:00+00:00", base + 0.0, 100.0),
+            PowerReport("bedroom", primary, "2026-11-27T10:00:00+00:00", base + 60.0, 100.0),
+            PowerReport("bedroom", primary, "2026-11-27T10:01:01+00:00", base + 61.0, 90.0),
+            PowerReport("bedroom", primary, "2026-11-27T10:01:01+00:00", base + 121.0, 90.0),
+        ]
+        pint_rgap = integrate_power_interval(
+            restart_gap, base, base + 121.0, primary_entity=primary, fallback_entity=fallback
+        )
+        self.assertTrue(pint_rgap.has_gap)
+        self.assertAlmostEqual(pint_rgap.covered_seconds, 120.0, places=6)
+        self.assertAlmostEqual(pint_rgap.gap_seconds, 1.0, places=6)
+        self.assertIsNone(pint_rgap.full_interval_wh)
+
+        # 4. Observer-epoch restart with boundary overlap [0, 60] (100W) and [40, 100] (90W): newer epoch wins overlap
+        restart_overlap = [
+            PowerReport("bedroom", primary, "2026-11-27T10:00:00+00:00", base + 0.0, 100.0),
+            PowerReport("bedroom", primary, "2026-11-27T10:00:00+00:00", base + 60.0, 100.0),
+            PowerReport("bedroom", primary, "2026-11-27T10:00:40+00:00", base + 40.0, 90.0),
+            PowerReport("bedroom", primary, "2026-11-27T10:00:40+00:00", base + 100.0, 90.0),
+        ]
+        pint_rov = integrate_power_interval(
+            restart_overlap, base, base + 100.0, primary_entity=primary, fallback_entity=fallback
+        )
+        self.assertFalse(pint_rov.has_gap)
+        self.assertAlmostEqual(pint_rov.covered_seconds, 100.0, places=6)
+        self.assertAlmostEqual(pint_rov.wh, (40.0 * 100.0 + 60.0 * 90.0) / 3600.0, places=6)
+
+        # 5. Higher-tier same-entity watts=None outage blocks lower-tier same-entity bridging
+        same_entity_none = [
+            PowerReport("bedroom", primary, "ep1", base + 0.0, 500.0),
+            PowerReport("bedroom", primary, "ep1", base + 60.0, None),
+            PowerReport("bedroom", primary, "ep1", base + 120.0, 500.0),
+            # primary:recorder missed the transient None and has (0, 500) -> (120, 500) (dt == 120s)
+            PowerReport("bedroom", primary, "recorder", base + 0.0, 500.0),
+            PowerReport("bedroom", primary, "recorder", base + 120.0, 500.0),
+        ]
+        pint_none = integrate_power_interval(
+            same_entity_none, base, base + 120.0, primary_entity=primary, fallback_entity=fallback
+        )
+        self.assertTrue(pint_none.has_gap)
+        self.assertEqual(pint_none.covered_seconds, 0.0)
+        self.assertIsNone(pint_none.wh)
+
+    # 16. Issue #2 regression: X_hist features, verified_off_ceiling_w, production/export-history/snapshot & archive parity
+    def test_issue2_xhist_features_verified_off_ceiling_and_production_export_archive_parity(self):
+        from zipfile import ZipFile
+
+        # Verify config.py ignores verified_off_power if bound to fallback entity instead of primary
+        rooms_wrong_off = deepcopy(self.site.raw_rooms)
+        rooms_wrong_off["living"]["verified_off_power"] = {
+            "entity": rooms_wrong_off["living"]["power_fallback"],
+            "ceiling_w": 8.0,
+        }
+        site_wrong_off = build_site_config(rooms_wrong_off, self.site.raw_topology, self.site.policy)
+        self.assertIsNone(site_wrong_off.actuator_by_name("living").verified_off_ceiling_w)
+
+        # Build site with primary-only verified_off_power ceiling_w = 8.0 on every unit
+        rooms_voff = deepcopy(self.site.raw_rooms)
+        for u in rooms_voff:
+            rooms_voff[u]["verified_off_power"] = {"entity": rooms_voff[u]["power"], "ceiling_w": 8.0}
+        site_voff = build_site_config(rooms_voff, self.site.raw_topology, self.site.policy)
+        spec_voff = build_feature_spec(site_voff)
+
+        def _feat_idx(name: str) -> int:
+            return spec_voff.hist_feature_names.index(name)
+
+        base = 1_800_000_000.0
+        cutoff = base + 180 * 60.0
+        liv_act = site_voff.actuator_by_name("living")
+
+        # Part A: Healthy primary (4W, <= 8W ceiling) + newer fallback (45W, > 8W ceiling) on living
+        # Adding fallback MUST produce BIT-FOR-BIT IDENTICAL X_hist & meta!
+        hist_primary_only = _make_clean_history(site_voff, base_ts=base, minutes=200)
+        # Set living primary to 4W at :23s of every minute (so at 5-min bin_end, last primary report is 37s old!)
+        hist_primary_only.power_reports["living"] = [
+            PowerReport("living", liv_act.power_entity, "ep1", base + m * 60.0 + 23.0, 4.0)
+            for m in range(201)
+        ]
+        hist_with_fb = deepcopy(hist_primary_only)
+        fb_points = []
+        for m in range(201):
+            # Fallback reports 45W at :45s and :55s (strictly newer than primary :23s AND > verified_off_ceiling_w=8W!)
+            fb_points.append(PowerReport("living", liv_act.power_fallback, "recorder", base + m * 60.0 + 45.0, 45.0, source_role="fallback"))
+            fb_points.append(PowerReport("living", liv_act.power_fallback, "recorder", base + m * 60.0 + 55.0, 48.0, source_role="fallback"))
+        hist_with_fb.power_reports["living"] = sorted(
+            [*hist_with_fb.power_reports["living"], *fb_points], key=lambda r: r.report_at
+        )
+
+        xh_pure, meta_pure = extract_history_window(_HistoryIndex(hist_primary_only), spec_voff, cutoff)
+        xh_mixed, meta_mixed = extract_history_window(_HistoryIndex(hist_with_fb), spec_voff, cutoff)
+        np.testing.assert_array_equal(np.nan_to_num(xh_mixed, nan=-999.0), np.nan_to_num(xh_pure, nan=-999.0))
+        self.assertEqual(meta_mixed["unit_watts"]["living"], 4.0)
+        self.assertEqual(meta_mixed["unit_power_source"]["living"], "primary:ledger")
+        self.assertEqual(float(xh_mixed[-1, _feat_idx("unit:living:last_power_w")]), 4.0)
+        self.assertEqual(float(xh_mixed[-1, _feat_idx("unit:living:power_above_off")]), 0.0)
+
+        # Part B: Fallback-only window (true primary hole): fallback watts (120W) MUST NOT be compared
+        # against primary-only verified_off_ceiling_w=8.0 -> power_above_off MUST be NaN!
+        hist_fb_only = deepcopy(hist_primary_only)
+        stu_act = site_voff.actuator_by_name("study")
+        hist_fb_only.power_reports["study"] = [
+            PowerReport("study", stu_act.power_entity, "ep1", base + m * 60.0 + 10.0, 2.0)
+            for m in range(201)
+        ]
+        hist_fb_only.power_reports["living"] = [
+            PowerReport("living", liv_act.power_fallback, "recorder", base + m * 60.0 + 10.0, 120.0, source_role="fallback")
+            for m in range(201)
+        ]
+        # Set living proxy mode to "off" so we also verify mode=="off" uncertainty doesn't apply primary off_ceil to fallback
+        hist_fb_only.proxy_states["living"] = [
+            ProxyStateEvent("living", ev.at, "off", ev.setpoint, ev.target_c, source_fresh=True)
+            for ev in hist_fb_only.proxy_states["living"]
+        ]
+        xh_fb, meta_fb = extract_history_window(_HistoryIndex(hist_fb_only), spec_voff, cutoff)
+        self.assertEqual(meta_fb["unit_watts"]["living"], 120.0)
+        self.assertEqual(meta_fb["unit_power_source"]["living"], "fallback:recorder")
+        self.assertEqual(float(xh_fb[-1, _feat_idx("unit:living:last_power_w")]), 120.0)
+        self.assertEqual(float(xh_fb[-1, _feat_idx("unit:living:power_missing")]), 0.0)
+        self.assertGreater(float(xh_fb[-1, _feat_idx("unit:living:bin_power_cov")]), 0.7)
+        self.assertTrue(np.isnan(xh_fb[-1, _feat_idx("unit:living:power_above_off")]))
+        self.assertEqual(float(xh_fb[-1, _feat_idx("quality:any_uncertain")]), 0.0)
+
+        # Part C: Production SQLite (--production) + export-history -> data-build --snapshot parity
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            prod = root / "prod"
+            (prod / "shadow").mkdir(parents=True)
+            (prod / "shadow-data").mkdir(parents=True)
+            (prod / "pilot-data").mkdir(parents=True)
+            (prod / "config" / ".storage").mkdir(parents=True)
+            (prod / "shadow" / "rooms.json").write_text(json.dumps(rooms_voff))
+            (prod / "shadow" / "topology.json").write_text(json.dumps(site_voff.raw_topology))
+            (prod / "shadow" / "house_policy.json").write_text(json.dumps(site_voff.policy))
+
+            sdb = prod / "shadow-data" / "shadow.sqlite3"
+            with closing(sqlite3.connect(sdb)) as db, db:
+                db.execute("CREATE TABLE power_reports (source TEXT, observer_epoch TEXT, report_at REAL, watts REAL)")
+                for m in range(150):
+                    for act in site_voff.actuators:
+                        w = 4.0 if act.name == "living" else 100.0
+                        db.execute(
+                            "INSERT INTO power_reports VALUES (?,?,?,?)",
+                            (act.power_entity, "2026-11-26T17:38:21+00:00", base + m * 60.0 + 23.0, w),
+                        )
+
+            # Recorder DB with both primary:recorder AND short-burst fallback:recorder (the Issue #2 trigger!)
+            rec_db = prod / "config" / "home-assistant_v2.db"
+            with closing(sqlite3.connect(rec_db)) as db, db:
+                db.execute("CREATE TABLE states_meta (metadata_id INTEGER PRIMARY KEY, entity_id TEXT)")
+                db.execute(
+                    "CREATE TABLE states (state_id INTEGER PRIMARY KEY, metadata_id INTEGER, state TEXT, attributes_id INTEGER, last_updated_ts REAL, last_reported_ts REAL)"
+                )
+                db.execute("CREATE TABLE state_attributes (attributes_id INTEGER PRIMARY KEY, shared_attrs TEXT)")
+                mid = 1
+                meta_ids = {}
+                for z in site_voff.zones:
+                    meta_ids[z.primary_entity] = mid
+                    db.execute("INSERT INTO states_meta VALUES (?,?)", (mid, z.primary_entity))
+                    mid += 1
+                for act in site_voff.actuators:
+                    for ent in (act.power_entity, act.power_fallback):
+                        meta_ids[ent] = mid
+                        db.execute("INSERT INTO states_meta VALUES (?,?)", (mid, ent))
+                        mid += 1
+                sid = 1
+                for m in range(0, 150, 5):
+                    for z in site_voff.zones:
+                        t = base + m * 60.0 + 0.5
+                        db.execute("INSERT INTO states VALUES (?,?,?,NULL,?,?)", (sid, meta_ids[z.primary_entity], "24.0", t, t))
+                        sid += 1
+                for m in range(150):
+                    # Overlapping primary:recorder and shorter fallback:recorder bursts inside each 60s primary segment
+                    t_p = base + m * 60.0 + 23.0
+                    db.execute("INSERT INTO states VALUES (?,?,?,NULL,?,?)", (sid, meta_ids[liv_act.power_entity], "4.0", t_p, t_p))
+                    sid += 1
+                    for dt_fb, w_fb in ((35.0, "45.0"), (45.0, "54.0")):
+                        t_fb = base + m * 60.0 + dt_fb
+                        db.execute("INSERT INTO states VALUES (?,?,?,NULL,?,?)", (sid, meta_ids[liv_act.power_fallback], w_fb, t_fb, t_fb))
+                        sid += 1
+
+            rdb = prod / "config" / ".storage" / "room_climate_control.sqlite3"
+            with closing(sqlite3.connect(rdb)) as db, db:
+                db.execute(
+                    "CREATE TABLE samples (room TEXT, tick INTEGER, measured REAL, desired REAL, reported REAL, adapter_mode TEXT, watts REAL, outdoor REAL, temp_report INTEGER, quality TEXT)"
+                )
+                for m in range(150):
+                    t = int(base + m * 60)
+                    for act in site_voff.actuators:
+                        db.execute("INSERT INTO samples VALUES (?,?,24.0,24.0,24.0,'off',4.0,18.0,?,'observing')", (act.name, t, int(base + (m // 5) * 300)))
+
+            snap_dir = root / "snap"
+            ds_prod_dir = root / "ds_prod"
+            ds_snap_dir = root / "ds_snap"
+            from contextlib import redirect_stdout
+            from io import StringIO
+
+            with redirect_stdout(StringIO()):
+                self.assertEqual(ns_cli.main(["export-history", "--production", str(prod), "--output", str(snap_dir)]), 0)
+                self.assertEqual(ns_cli.main(["data-build", "--production", str(prod), "--output", str(ds_prod_dir)]), 0)
+                self.assertEqual(ns_cli.main(["data-build", "--snapshot", str(snap_dir), "--output", str(ds_snap_dir)]), 0)
+
+            ds_p = load_dataset(ds_prod_dir)
+            ds_s = load_dataset(ds_snap_dir)
+            self.assertGreater(ds_p.cutoff_ts.size, 0)
+            # Every 15m/30m/60m Wh label inside the window has 100% primary coverage (zero false gaps!)
+            h15 = ds_p.spec.horizons_minutes.index(15)
+            liv_u = ds_p.spec.unit_names.index("living")
+            self.assertTrue(bool(ds_p.y_total_valid[:, h15].all()))
+            np.testing.assert_allclose(ds_p.y_unit_cov[:, liv_u, h15], 1.0, atol=1e-6)
+            np.testing.assert_allclose(ds_p.y_unit_wh[:, liv_u, h15], 1.0, atol=1e-3)  # 4W * 0.25h = 1.0 Wh (NOT fallback 45W!)
+            # Production and export-history -> snapshot MUST match identically
+            np.testing.assert_array_equal(np.nan_to_num(ds_p.X_hist, nan=-999.0), np.nan_to_num(ds_s.X_hist, nan=-999.0))
+            np.testing.assert_allclose(ds_p.y_total_wh, ds_s.y_total_wh, equal_nan=True)
+            self.assertEqual(float(ds_p.X_hist[-1, -1, _feat_idx("unit:living:last_power_w")]), 4.0)
+            self.assertEqual(float(ds_p.X_hist[-1, -1, _feat_idx("unit:living:power_above_off")]), 0.0)
+
+            # Also verify legacy canonical snapshots (without source_role field) still classify fallback accurately!
+            pr_path = snap_dir / "power_reports.jsonl"
+            legacy_lines = []
+            for line in pr_path.read_text(encoding="utf-8").splitlines():
+                row = json.loads(line)
+                row.pop("source_role", None)
+                legacy_lines.append(json.dumps(row))
+            pr_path.write_text("\n".join(legacy_lines) + "\n", encoding="utf-8")
+            hist_legacy = ingest_canonical_snapshot(snap_dir)
+            ds_legacy = build_dataset(hist_legacy)
+            np.testing.assert_allclose(ds_legacy.y_total_wh, ds_p.y_total_wh, equal_nan=True)
+            np.testing.assert_array_equal(np.nan_to_num(ds_legacy.X_hist, nan=-999.0), np.nan_to_num(ds_p.X_hist, nan=-999.0))
+
+            # Part D: Archive ingestion (ingest_evidence_archives) follows exact same policy!
+            schema = telemetry_evidence.PublicSchema("c" * 64, rooms_voff, site_voff.raw_topology)
+            effective = schema.configuration(rooms_voff, site_voff.raw_topology, site_voff.policy)
+            liv_alias = schema.aliases["living"]
+            bed_alias = schema.aliases["bedroom"]
+            stu_alias = schema.aliases["study"]
+            liv_p_alias = schema.aliases[liv_act.power_entity]
+            liv_fb_alias = schema.aliases[liv_act.power_fallback]
+            bed_p_alias = schema.aliases[site_voff.actuator_by_name("bedroom").power_entity]
+            stu_p_alias = schema.aliases[site_voff.actuator_by_name("study").power_entity]
+
+            power_rows = []
+            recorder_rows = []
+            for m in range(25):
+                t_p = base + m * 60.0 + 23.0
+                power_rows.append({"source": liv_p_alias, "observer_epoch": "ep1", "report_at": t_p, "watts": 4.0})
+                power_rows.append({"source": bed_p_alias, "observer_epoch": "ep1", "report_at": t_p, "watts": 100.0})
+                power_rows.append({"source": stu_p_alias, "observer_epoch": "ep1", "report_at": t_p, "watts": 100.0})
+                # Also inject fallback short bursts into BOTH raw/power-reports.jsonl AND raw/recorder-states.jsonl
+                recorder_rows.append({"source": liv_fb_alias, "value": 45.0, "updated_at": base + m * 60.0 + 35.0, "reported_at": base + m * 60.0 + 35.0})
+                recorder_rows.append({"source": liv_fb_alias, "value": 54.0, "updated_at": base + m * 60.0 + 45.0, "reported_at": base + m * 60.0 + 45.0})
+                power_rows.append({"source": liv_fb_alias, "observer_epoch": "recorder", "report_at": base + m * 60.0 + 40.0, "watts": 60.0})
+
+            arc_mixed = root / "telemetry-mixed.zip"
+            with ZipFile(arc_mixed, "w") as zf:
+                zf.writestr("effective-config.json", json.dumps(effective))
+                zf.writestr("raw/power-reports.jsonl", "".join(json.dumps(r) + "\n" for r in power_rows))
+                zf.writestr("raw/recorder-states.jsonl", "".join(json.dumps(r) + "\n" for r in recorder_rows))
+            hist_arc = ingest_evidence_archives([arc_mixed])
+            arc_liv = hist_arc.site.actuator_by_name(liv_alias)
+            pint_arc = integrate_power_interval(
+                hist_arc.power_reports[liv_alias],
+                base + 120.0,
+                base + 1020.0,
+                primary_entity=arc_liv.power_entity,
+                fallback_entity=arc_liv.power_fallback,
+            )
+            self.assertFalse(pint_arc.has_gap)
+            self.assertAlmostEqual(pint_arc.coverage_ratio, 1.0, places=6)
+            self.assertAlmostEqual(pint_arc.wh, 1.0, places=4)  # 4W * 900s / 3600 = 1.0 Wh (pure primary!)
+            self.assertEqual(pint_arc.covered_by_source, {"primary:ledger": 900.0})
+
+            arc_spec = build_feature_spec(hist_arc.site)
+            xh_arc, meta_arc = extract_history_window(_HistoryIndex(hist_arc), arc_spec, base + 1020.0)
+            self.assertEqual(meta_arc["unit_watts"][liv_alias], 4.0)
+            self.assertEqual(meta_arc["unit_power_source"][liv_alias], "primary:ledger")
+            self.assertEqual(float(xh_arc[-1, arc_spec.hist_feature_names.index(f"unit:{liv_alias}:power_above_off")]), 0.0)
+
+            # Fallback-only archive window: power_above_off MUST be NaN (never compared against primary ceiling 8W)
+            arc_fb = root / "telemetry-fallback-only.zip"
+            fb_only_rec = [
+                {"source": liv_fb_alias, "value": 25.0, "updated_at": base + m * 60.0 + 10.0, "reported_at": base + m * 60.0 + 10.0}
+                for m in range(25)
+            ]
+            with ZipFile(arc_fb, "w") as zf:
+                zf.writestr("effective-config.json", json.dumps(effective))
+                zf.writestr("raw/recorder-states.jsonl", "".join(json.dumps(r) + "\n" for r in fb_only_rec))
+            hist_arc_fb = ingest_evidence_archives([arc_fb])
+            arc_fb_spec = build_feature_spec(hist_arc_fb.site)
+            xh_arc_fb, meta_arc_fb = extract_history_window(_HistoryIndex(hist_arc_fb), arc_fb_spec, base + 1020.0)
+            self.assertEqual(meta_arc_fb["unit_watts"][liv_alias], 25.0)
+            self.assertEqual(meta_arc_fb["unit_power_source"][liv_alias], "fallback:recorder")
+            self.assertTrue(np.isnan(xh_arc_fb[-1, arc_fb_spec.hist_feature_names.index(f"unit:{liv_alias}:power_above_off")]))
 
 
 if __name__ == "__main__":
