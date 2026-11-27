@@ -68,9 +68,9 @@ def read_permit(now):
     return (start, end, rooms)
 
 
-def publish(status, rooms=None):
+def publish(status, rooms=None, *, control=None):
     now = datetime.now(LOCAL).isoformat(timespec="seconds")
-    atomic(DATA_DIR / "status.json", encode({"at": now, "status": status, "rooms": rooms or {}}) + "\n")
+    atomic(DATA_DIR / "status.json", encode({"at": now, "status": status, "rooms": rooms or {}, "control": control}) + "\n")
 
 
 def reserve(record):

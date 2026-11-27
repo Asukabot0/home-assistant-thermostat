@@ -7,7 +7,7 @@ services:
     restart: unless-stopped
     network_mode: none
     read_only: true
-    tmpfs: [/tmp]
+    tmpfs: ["/tmp:size=32m,mode=1777"]
     cap_drop: [ALL]
     security_opt: [no-new-privileges:true]
     mem_limit: 160m

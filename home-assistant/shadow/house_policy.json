@@ -28,5 +28,17 @@
   "mode_dwell_seconds": 1800,
   "min_run_seconds": 900,
   "min_off_seconds": 300,
-  "reversal_run_seconds": 3600
+  "reversal_run_seconds": 3600,
+  "tracking_band": 0.3,
+  "tracking_dwell_seconds": 1200,
+  "tracking_report_span_seconds": 600,
+  "tracking_history_seconds": 3600,
+  "tracking_gap_seconds": 1200,
+  "maintain_confirmation_seconds": 1200,
+  "effect_sample_wait_seconds": 600,
+  "effect_max_seconds": 2400,
+  "effect_samples_min": 3,
+  "peer_unknown_max_step": 1,
+  "peer_fairness_wait_seconds": 1800,
+  "lower_output_observe_seconds": 180
 }

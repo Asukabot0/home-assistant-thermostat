@@ -8,6 +8,7 @@ from math import isfinite
 import os
 from pathlib import Path
 import signal
+from sqlite3 import Error as DatabaseError
 from tempfile import NamedTemporaryFile
 from threading import Event
 from time import time
@@ -21,6 +22,9 @@ from heating_pilot import DATA_DIR, ha_client, publish
 from model import increases_output, numeric
 from pilot_gate import ROOMS, matching_feedback, room_advice, room_feedback
 from service import CONFIG, encode, local
+from live_evidence import attach as attach_power
+from topology import extra_inputs, read_topology
+from zone_control import coordinate as coordinate_zones, learned_initial
 
 
 PERMIT = DATA_DIR / "continuous-permit.json"
@@ -28,6 +32,8 @@ LIVE_PERMIT = DATA_DIR / "live-permit.json"
 MAX_STEPS = 3
 ECHO_TIMEOUT = 180
 BATCH_SPACING = 5
+TOPOLOGY_PATH = CONFIG.with_name("topology.json")
+TOPOLOGY = read_topology(TOPOLOGY_PATH, ROOMS)
 
 
 AUDIT = logging.getLogger("thermostat.live")
@@ -40,13 +46,23 @@ def configure_audit():
     if commit is not None and (len(commit) != 40 or any(c not in "0123456789abcdef" for c in commit)):
         raise ValueError("Invalid installed release marker")
     RELEASE.update(commit=commit, config_sha256=sha256(CONFIG.read_bytes() + b"\0" +
-                   (directory / "house_policy.json").read_bytes()).hexdigest(),
+                   (directory / "house_policy.json").read_bytes() +
+                   (b"\0" + TOPOLOGY_PATH.read_bytes() if TOPOLOGY is not None else b"")).hexdigest(),
                    code_sha256=sha256(b"\0".join(p.read_bytes() for p in sorted(directory.glob("*.py")))).hexdigest())
-    handler = RotatingFileHandler(DATA_DIR / "live-audit.jsonl", maxBytes=4*1024*1024, backupCount=7, encoding="utf-8")
+    handler = RotatingFileHandler(DATA_DIR / "live-audit.jsonl", maxBytes=8*1024*1024, backupCount=23, encoding="utf-8")
     AUDIT.setLevel(logging.INFO)
     AUDIT.propagate = False
     AUDIT.addHandler(handler)
-    audit("startup")
+    now = time()
+    metadata = {"observation_version": TOPOLOGY["observation_version"] if TOPOLOGY else None,
+                "observation_fingerprint": TOPOLOGY["fingerprint"] if TOPOLOGY else None}
+    startup = dict(RELEASE, at=now, event="startup", **metadata)
+    put_state(DATA_DIR/"startup.json", startup)
+    put_state(DATA_DIR/f"startup-{int(now*1_000_000)}.json", startup)
+    if TOPOLOGY is not None:
+        put_state(DATA_DIR/f"configuration-{RELEASE['config_sha256']}.json",
+                  {"rooms": ROOMS, "policy": POLICY, "topology": json.loads(TOPOLOGY_PATH.read_bytes())})
+    audit("startup", **metadata, startup_at=now)
 
 
 def audit(event, **fields):
@@ -62,7 +78,7 @@ def audit_error(event, error, **fields):
 
 
 def group(room):
-    return "living_study" if room in SHARED_ROOMS else room
+    return TOPOLOGY["actuators"][room]["lock_group"] if TOPOLOGY else "living_study" if room in SHARED_ROOMS else room
 
 
 def read_permit(now):
@@ -87,6 +103,9 @@ def read_permit(now):
         return None
     isolated = raw.get("isolated_rooms", [])
     if not isinstance(isolated, list) or any(not isinstance(room, str) or room not in ROOMS for room in isolated):
+        return None
+    zones = raw.get("paused_zones", [])
+    if not isinstance(zones, list) or any(TOPOLOGY is None or key not in TOPOLOGY["zones"] for key in zones):
         return None
     return raw
 
@@ -118,11 +137,11 @@ def settle(state, live, now, *, trial=True):
             if echoed and action["sent_at"]-1 <= values["adapter"]["updated_at"] <= action["sent_at"]+ECHO_TIMEOUT:
                 action.update(status="proxy_echo", proxy_at=values["adapter"]["updated_at"])
                 state["baselines"][room] = list(signature)
-                if action["kind"] == "temperature" and action.get("target_at_send") is not None and mode in ACTIVE:
+                if TOPOLOGY is None and action["kind"] == "temperature" and action.get("target_at_send") is not None and mode in ACTIVE:
                     state.setdefault("last_mode_setting", {}).setdefault(room, {})[mode] = {
                         "target": action["target_at_send"], "value": setpoint, "at": action["proxy_at"]}
                 if action["purpose"] == "energy_off":
-                    if action.get("target_at_send") is not None and numeric(action["before"][1]) is not None:
+                    if TOPOLOGY is None and action.get("target_at_send") is not None and numeric(action["before"][1]) is not None:
                         state.setdefault("last_mode_setting", {}).setdefault(room, {})[action["before"][0]] = {
                             "target": action["target_at_send"], "value": action["before"][1], "at": action["proxy_at"]}
                     state.setdefault("parked", {})[room] = {"off_at": action["proxy_at"],
@@ -157,7 +176,9 @@ def settle(state, live, now, *, trial=True):
                 if age >= minute*60 and key not in action["followup"]:
                     action["followup"][key] = {"at": now, "room_c": numeric(values["temperature"]),
                         "room_age_s": round(values["temperature_age"]), "watts": numeric(values["adapter"]["power"]),
-                        "power_age_s": round(values["adapter"]["from_power_s"]), "reported": list(signature)}
+                        "power_age_s": round(values["adapter"]["from_power_s"]), "reported": list(signature),
+                        "temperature_report_at": values.get("temperature_report_at"),
+                        "power_report_at": values["adapter"].get("power_report_at")}
 
 
 def archive_actions(path, state, now):
@@ -176,13 +197,15 @@ def archive_actions(path, state, now):
     state["commands"] = recent
 
 
-def assess(live, state, now, advise_room=room_advice, *, trial=True, isolated=(), trace=None):
+def assess(live, state, now, advise_room=room_advice, *, trial=True, isolated=(), trace=None, inputs=None, paused=()):
     trace = {} if trace is None else trace
     pending = {a["room"] for a in state["commands"] if a["status"] in {"prepared", "accepted"}}
     transitions = state.setdefault("transitions", {})
     manual = state.setdefault("manual_holds", {})
     parked = state.setdefault("parked", {})
     connected = set(live) - set(isolated)
+    if TOPOLOGY is not None:
+        state.pop("gentle", None)
     echoes = acknowledged(state["commands"])
     details, ready, members = {}, {}, {}
     for key, batch in list(transitions.items()):
@@ -237,28 +260,71 @@ def assess(live, state, now, advise_room=room_advice, *, trial=True, isolated=()
         return details, None
     last_control = max((a["proxy_at"] for a in echoes if a["room"] in connected), default=0)
     references = set(INDEPENDENT) & connected
-    readings = {room: advise_room(room, values["signature"][0], offsets=values["offsets"],
-                                  feedback=values, house_since=last_control)
-                for room, values in live.items() if ready[room] or room in references}
+    readings = {}
+    for room, values in live.items():
+        if room not in (connected if TOPOLOGY is not None else references) and not ready[room]:
+            continue
+        try:
+            readings[room] = advise_room(room, values["signature"][0], offsets=values["offsets"],
+                                         feedback=values, house_since=last_control)
+        except (ValueError, DatabaseError) as error:
+            if TOPOLOGY is None:
+                raise
+            ready[room] = False
+            details[room].update(ready=False, status="设备见证或功率证据暂不可读")
+            audit_error("evidence_error", error, room=room)
+    if TOPOLOGY is not None:
+        meter_memory = state.setdefault("power_live", {})
+        readings = {room: attach_power(now, live[room], row, meter_memory.setdefault(room, {}))
+                    for room, row in readings.items()}
+        for room in details:
+            proof = readings.get(room, {}).get("power_evidence") or {}
+            details[room].update(power_report_at=live[room]["adapter"].get("power_report_at"),
+                                 temperature_source=live[room].get("temperature_source"),
+                                 power_context=live[room].get("power_context"),
+                                 power_bands=proof.get("bands"), power_evidence_at=proof.get("last_report"))
+
+    def allocate(available, record, *, acquire_gentle=True):
+        if TOPOLOGY is not None:
+            return coordinate_zones(live, readings, available, state, now, ROOMS, connected,
+                                    TOPOLOGY, inputs or {}, set(paused), record, control_ready=ready)
+        return coordinate(live, readings, available, state, now, ROOMS, connected, trace=record,
+                          control_ready=ready, acquire_gentle=acquire_gentle)
     # Finish an already confirmed mode change before making any unrelated allocation.
     incomplete = {room for room, (_, member) in members.items() if member["phase"] == "initial"}
     allocation_ready = {room: enabled and room not in incomplete and group(room) not in transitions
                         for room, enabled in ready.items()}
-    need, reasons, candidates = coordinate(live, readings, allocation_ready, state, now, ROOMS, connected,
-                                           trace=trace, control_ready=ready)
+    need, reasons, candidates = allocate(allocation_ready, trace)
     plan = state.get("gentle")
     invalidated, closed, safety = [], [], {}
     for room in sorted(incomplete):
         batch, member = members[room]
         feedback = live[room]
         mode, setpoint, _, _, target, _, _ = feedback["signature"]
-        if (not ready[room] or need == "unknown" or mode != batch["mode"]
-                or matching_feedback(now, feedback, readings[room]["sample"], target)):
+        if not ready[room] or mode != batch["mode"]:
+            continue
+        if TOPOLOGY is not None:
+            home = TOPOLOGY["actuators"][room]["zone"]
+            zone_name = (member.get("control") or {}).get("zone", home)
+            zone = trace["zones"].get(zone_name)
+            if zone is None or zone["paused"] or zone["quality"] != "fresh":
+                if zone is None or zone["paused"]:
+                    member["phase"] = "done"
+                    closed.append(room)
+                    invalidated.append(room)
+                continue
+        elif need == "unknown" or matching_feedback(now, feedback, readings[room]["sample"], target):
             continue
         optional = member.get("gentle_at")
         invalid = need != mode or (optional is not None and trace["normal_need"] != mode and (
             plan is None or plan["unit"] != room or plan["selected_at"] != optional
             or trace["gentle"]["reason"] in {"inside_ideal_band", "peer_comfort_risk", "returning_to_ideal"}))
+        if TOPOLOGY is not None:
+            binding = member.get("control") or {}
+            invalid = (zone_name != trace["owner"] or binding.get("definition") != TOPOLOGY["fingerprint"]
+                       or binding.get("source_version") != zone["source_version"] or binding.get("target") != zone["target"]
+                       or not zone["qualified"] or zone["direction"] != mode or room not in trace["feasible"].get(zone_name, ()))
+            target = zone["target"]
         if invalid:
             if not member.get("initial_invalidated") or member["target"] != target:
                 invalidated.append(room)
@@ -283,17 +349,21 @@ def assess(live, state, now, advise_room=room_advice, *, trial=True, isolated=()
         # lifecycle event in the audit, and do not acquire a new gentle owner
         # during the same assessment that discarded an old continuation.
         followup = {}
-        need, reasons, candidates = coordinate(live, readings, allocation_ready, state, now, ROOMS, connected,
-                                               trace=followup, control_ready=ready,
-                                               acquire_gentle=trace["gentle"]["state"] != "exited")
-        if trace["gentle"]["state"] not in {"selected", "exited"}:
+        need, reasons, candidates = allocate(allocation_ready, followup, acquire_gentle=trace["gentle"]["state"] != "exited")
+        if TOPOLOGY is not None:
+            trace.update(followup)
+        elif trace["gentle"]["state"] not in {"selected", "exited"}:
             trace["gentle"] = followup["gentle"]
     trace.update(need=need, lead=state.get("house_lead"), invalidated_initial=invalidated)
     for room, detail in details.items():
         detail["house_need"] = need
         if room in reasons:
             detail["status"] = reasons[room]
-        if room in readings:
+        if TOPOLOGY is not None:
+            zone = trace["zones"][TOPOLOGY["actuators"][room]["zone"]]
+            detail.update(zone=zone["key"], zone_intent=zone["intent"], zone_reason=zone["reason"],
+                          zone_target_c=zone["target"], zone_temperature_c=zone["measured"])
+        elif room in readings:
             view = readings[room]["house_view"]
             detail["prediction_10m_c"] = view["trend"] if view is not None else None
             detail["trend_valid"] = view is not None and view["trend"] is not None
@@ -315,11 +385,25 @@ def assess(live, state, now, advise_room=room_advice, *, trial=True, isolated=()
         if (mode != batch["mode"] or need != mode
                 or (state.get("gentle") is not None and state["gentle"]["unit"] != room)):
             continue
-        initial = recovery_initial(room, mode, live, readings[room], state, ROOMS)
-        if initial is None or matching_feedback(now, live[room], readings[room]["sample"], target):
+        if TOPOLOGY is not None:
+            binding = member.get("control") or {}
+            zone_name = binding.get("zone")
+            zone = trace["zones"].get(zone_name)
+            if (zone is None or zone_name != trace["owner"] or not zone["qualified"]
+                    or zone["source_version"] != binding.get("source_version") or zone["target"] != binding.get("target")):
+                continue
+            initial = learned_initial(room, mode, zone, state["closed_loop"], ROOMS[room]["soft_limits"][mode])
+            target = zone["target"]
+            trace["feasible"].setdefault(zone_name, []).append(room)
+            trace["action_scopes"][room] = dict(binding, before_c=zone["measured"], at=zone["at"])
+        else:
+            initial = recovery_initial(room, mode, live, readings[room], state, ROOMS)
+            if matching_feedback(now, live[room], readings[room]["sample"], target):
+                continue
+        if initial is None:
             continue
         if initial != current and increases_output(mode, current, initial):
-            if need != mode or any(live[peer]["adapter"]["mode"] not in {mode, "off", "fan_only"}
+            if need != mode or TOPOLOGY is None and any(live[peer]["adapter"]["mode"] not in {mode, "off", "fan_only"}
                                    for peer in connected - {room}):
                 details[room]["status"] = "等待本模式的全屋需求并确认无反向设备"
                 continue
@@ -341,7 +425,7 @@ def assess(live, state, now, advise_room=room_advice, *, trial=True, isolated=()
             details[room]["status"] = "已达本次试点的设温次数限制"
             trace["rejections"].append([action, details[room]["status"]])
             continue
-        if flag := final_gate(action, now, live, readings, connected, state, ROOMS):
+        if flag := final_gate(action, now, live, readings, connected, state, ROOMS, topology=TOPOLOGY, trace=trace):
             details[action[0]]["status"] = flag
             trace["rejections"].append([action, flag])
         else:
@@ -349,8 +433,10 @@ def assess(live, state, now, advise_room=room_advice, *, trial=True, isolated=()
     return details, None
 
 
-def start_batch(state, room, desired, details, sent):
+def start_batch(state, room, desired, details, sent, control=None):
     member = {"phase": "queued", "target": details[room]["target_c"]}
+    if control:
+        member["control"] = control
     if plan := state.get("gentle"):
         if plan["unit"] == room and plan["mode"] == desired:
             member["gentle_at"] = plan["selected_at"]
@@ -372,6 +458,16 @@ def cancel_inactive_gentle(now):
             put_state(path, state)
             exits.append(ended)
     return exits
+
+
+def display_progress(message, details, trace, selection=None):
+    if TOPOLOGY is None:
+        publish(message, details)
+        return
+    control = {key: trace.get(key) for key in ("topology", "definition", "zones", "environment", "need", "owner",
+                                               "lead", "risks", "candidates", "rejections", "pending_rooms", "unmet")}
+    control.update(at=time(), selected=selection)
+    publish(message, details, control=control)
 
 
 def cycle(call):
@@ -401,19 +497,25 @@ def cycle(call):
     before = settled
     isolated = permit.get("isolated_rooms", ())
     trace = {"permit_sha256": sha256(encode(permit).encode()).hexdigest()}
-    details, selection = assess(live, state, now, trial=trial, isolated=isolated, trace=trace)
+    inputs = extra_inputs(call, TOPOLOGY)
+    paused = permit.get("paused_zones", ())
+    details, selection = assess(live, state, now, trial=trial, isolated=isolated, trace=trace, inputs=inputs, paused=paused)
     if before != encode(state):
         put_state(path, state)
     if selection is None or now >= end-30:
         audit("cycle", outcome="idle" if selection is None else "permit_expiring", assessment=trace, rooms=details)
-        publish("实机持续试点运行中" if trial else "持续实机控制运行中", details)
+        display_progress("实机持续试点运行中" if trial else "持续实机控制运行中", details, trace)
         return
 
     room, kind, value, purpose = selection
     refreshed = {code: room_feedback(call, code) for code in ROOMS}
     verification = {}
-    checked, confirmed = assess(refreshed, state, time(), trial=trial, isolated=isolated, trace=verification)
-    if selection != confirmed or read_permit(time()) != permit:
+    refreshed_inputs = extra_inputs(call, TOPOLOGY)
+    checked, confirmed = assess(refreshed, state, time(), trial=trial, isolated=isolated, trace=verification,
+                                inputs=refreshed_inputs, paused=paused)
+    scope_key = lambda t: tuple((t.get("action_scopes", {}).get(room) or {}).get(k)
+                                for k in ("zone", "target", "definition", "source_version"))
+    if selection != confirmed or scope_key(trace) != scope_key(verification) or read_permit(time()) != permit:
         if selection == confirmed:
             ended = cancel_gentle(state, time(), "permit_inactive")
             if ended:
@@ -421,7 +523,7 @@ def cycle(call):
         put_state(path, state)
         audit("cycle", outcome="recheck_changed", assessment=trace, verification=verification,
               proposed=selection, final=None, rooms=checked)
-        publish("发令前条件变化，本轮维持原设置", checked)
+        display_progress("发令前条件变化，本轮维持原设置", checked, verification)
         return
     previous = list(refreshed[room]["signature"][:3])
     sent = time()
@@ -429,16 +531,19 @@ def cycle(call):
         audit("cycle", outcome="permit_expiring", assessment=trace, verification=verification, rooms=checked)
         return
     batch = None
+    control = verification.get("action_scopes", {}).get(room)
     if purpose in {"energy_start", "reversal_initial", "initial_safety_easing"}:
         batch = state["transitions"].get(group(room))
         if batch is None and purpose == "energy_start":
-            batch = start_batch(state, room, value, checked, sent)
+            batch = start_batch(state, room, value, checked, sent, control)
     action = {"room": room, "kind": kind, "value": value, "before": previous, "sent_at": sent, "status": "prepared",
               "purpose": purpose, "transaction": batch["id"] if batch else None, "target_at_send": checked[room]["target_c"],
               "expected": [previous[0], value, previous[2]] if kind == "temperature" else [value],
               "before_room_c": numeric(refreshed[room]["temperature"]),
               "before_watts": numeric(refreshed[room]["adapter"]["power"]),
               "before_mode_at": refreshed[room]["adapter"]["last_mode_change"], "followup": {}, "physical_verified": False}
+    if control is not None:
+        action["control"] = control
     if ((plan := state.get("gentle")) and room == plan["unit"]
             and purpose in {"energy_start", "gentle_temperature", "reversal_initial"}):
         action["gentle"] = public_gentle(plan)
@@ -471,7 +576,7 @@ def cycle(call):
     put_state(path, state)
     save_receipt(DATA_DIR, room, sent, action["status"], received, purpose=purpose)
     audit("relay", room=room, command_at=sent, status=action["status"], http=action.get("http"))
-    publish("已记录一条米家实机指令，等待伴侣回报", checked)
+    display_progress("已记录一条米家实机指令，等待伴侣回报", checked, verification, selection)
 
 
 def main():

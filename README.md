@@ -5,7 +5,7 @@ Coordinated thermostat software for three connected rooms with separate heating 
 - The Home Assistant integration in `home-assistant/config/custom_components/room_climate_control` provides observations and virtual room thermostats.
 - `home-assistant/shadow/service.py` reads Recorder data, maintains power evidence and estimates kWh for covered intervals.
 - `home-assistant/shadow/continuous_pilot.py` schedules equipment changes through the configured climate entities and persists command and feedback state.
-- `home-assistant/shadow/house_policy.json` contains policy parameters. The example target is 24°C with a ±0.5°C ideal band and ±0.7°C tolerance.
+- `home-assistant/shadow/house_policy.json` contains policy parameters. The example target is 24°C with a configurable ±0.3°C tracking band. The ±0.5°C and ±0.7°C bands remain available for reporting.
 
 ## Offline tests
 
@@ -31,4 +31,6 @@ The Compose files are sidecar templates for an existing Home Assistant Container
 
 Automatic stops and subsequent starts require an independently verified local off-power reference for each device. Supply `verified_off_power` with the corresponding `entity` and an exclusive `ceiling_w` from actual confirmed stopped measurements. The examples omit that value so that powering off and restarting equipment is gated until commissioning. Mode and setting echoes alone are proxy evidence.
 
-Production credentials, equipment identifiers, telemetry, command journals and backups belong in the local runtime files excluded by `.gitignore`.
+Use `topology.example.json` to configure sensors, zones and equipment influence. See [unified control and evidence scheduling](docs/unified-control.md) for the state machine, production deployment, rollback and telemetry installation.
+
+Production credentials, equipment identifiers, unreduced telemetry, command journals and backups belong in the local runtime files excluded by `.gitignore`.

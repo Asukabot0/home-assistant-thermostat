@@ -18,3 +18,4 @@ __pycache__/
 /outputs/
 /home-assistant/shadow/.release
 /home-assistant/release-backups/
+/home-assistant/shadow/topology.json

@@ -10,6 +10,7 @@ import signal
 import sqlite3
 from tempfile import TemporaryDirectory
 from threading import Event
+from traceback import extract_tb
 import time
 from zoneinfo import ZoneInfo
 
@@ -69,6 +70,7 @@ CREATE TABLE IF NOT EXISTS stable_setpoints (
 def open_readonly(path):
     db = sqlite3.connect(path.as_uri() + "?mode=ro", uri=True, timeout=3)
     db.execute("PRAGMA query_only=ON")
+    db.execute("PRAGMA temp_store=MEMORY")
     db.row_factory = sqlite3.Row
     return db
 
@@ -290,6 +292,18 @@ def stable_setpoints(db, room, tick, history, session, active_since, above_low_s
     return {mode: learned_offset(db, room, mode, tick) for mode in ("heat", "cool")}
 
 
+@contextmanager
+def learning_transaction(db):
+    db.execute("SAVEPOINT stable_learning")
+    try:
+        yield
+    except Exception:
+        db.execute("ROLLBACK TO stable_learning")
+        raise
+    finally:
+        db.execute("RELEASE stable_learning")
+
+
 def profile_for(registry_state, sample):
     attrs = json.loads(registry_state["shared_attrs"] or "{}") if registry_state else {}
     target = sample["desired"] if sample else numeric(attrs.get("temperature"))
@@ -421,6 +435,22 @@ def load_room(db, rooms, recorder, code, config, tick, actual_beep, shared_simul
     fresh_power = bool(latest and latest["tick"] == tick and latest["watts"] is not None and recent
                        and recent[-1][1] == latest["watts"] and -59 <= tick-recent[-1][0] <= 600)
     observed_at = virtual["updated"] if virtual and tick <= virtual["updated"] < tick + 60 else None
+    power_without_room_sample = False
+    if ((not latest or latest["tick"] != tick) and observed_at is not None and as_of is not None
+            and 0 <= observed_at-as_of <= POWER_REPORT_GAP_SECONDS):
+        # The meter and observer can be valid when the minute room sample did
+        # not commit. Derive the exact pair from Recorder only, preserving
+        # unavailable points and refusing a mutable report dated after as_of.
+        raw = state_history(recorder, config["power"], 0, end=as_of+1e-6, tail=True)
+        watts = numeric(raw["state"]) if raw else None
+        native_at = raw["reported"] if raw else None
+        if (watts is not None and 0 <= watts <= 10000 and native_at is not None
+                and native_at <= as_of+1e-6 and as_of-native_at <= POWER_REPORT_GAP_SECONDS):
+            exact = dict(recent)
+            exact.setdefault(as_of, watts)
+            recent = sorted(exact.items())
+            power_without_room_sample = recent[-1] == (as_of, watts)
+            fresh_power = power_without_room_sample
     evidence_status = ("recorder_snapshot_missing" if observed_at is None else
                        "observer_context_missing" if context is None else
                        "no_fresh_report")
@@ -460,7 +490,7 @@ def load_room(db, rooms, recorder, code, config, tick, actual_beep, shared_simul
                 break
         evidence = power_evidence(observed_at, recent, context,
                                   {"low": verified_low, "above_low": verified_low, "high": high_cutoff, "learning": low_cutoff}, previous)
-        evidence_status = "ready" if evidence["last_report"] is not None else "no_fresh_report"
+        evidence_status = ("power_only" if power_without_room_sample else "ready") if evidence["last_report"] is not None else "no_fresh_report"
     bands = evidence["bands"] if evidence else {}
     low_seconds = bands.get("low", {}).get("seconds", 0)
     above_low_seconds = bands.get("above_low", {}).get("seconds", 0)
@@ -470,7 +500,7 @@ def load_room(db, rooms, recorder, code, config, tick, actual_beep, shared_simul
         activity = identify(tick, latest, [point for point in recent if point[0] >= tick - 900], model, history)
     else:
         activity = Activity("未知", "未知", "等待该分钟的 HA 观测")
-    active_since = learning_active(session, code, virtual) if source_fresh and fresh_power else None
+    active_since = learning_active(session, code, virtual) if source_fresh and fresh_power and not power_without_room_sample else None
     learning_power_span = bands.get("learning", {}).get("seconds", 0)
     if active_since is not None and learning_power_span >= EPISODE_SECONDS:
         since = tick - EPISODE_SECONDS
@@ -484,7 +514,15 @@ def load_room(db, rooms, recorder, code, config, tick, actual_beep, shared_simul
             and numeric(json.loads(row["shared_attrs"] or "{}").get("temperature")) == latest["reported"])
         if not steady:
             learning_power_span = 0
-    learned = stable_setpoints(db, code, tick, history, session, active_since, learning_power_span)
+    try:
+        with learning_transaction(db):
+            learned = stable_setpoints(db, code, tick, history, session, active_since, learning_power_span)
+        learning_error = None
+    except Exception as error:
+        learning_error = type(error).__name__
+        learned = {}
+        LOG.error("Learning skipped %s %s", learning_error,
+                  [(f.name, f.lineno) for f in extract_tb(error.__traceback__)])
     last_row = db.execute("SELECT tick,value FROM decisions WHERE room=? AND hypothetical=1 ORDER BY tick DESC LIMIT 1",
                           (code,)).fetchone()
     last = dict(json.loads(last_row["value"]), tick=last_row["tick"]) if last_row else None
@@ -517,12 +555,14 @@ def load_room(db, rooms, recorder, code, config, tick, actual_beep, shared_simul
                     "outdoor": latest["outdoor"] if latest else None,
                     "quiet": profile["quiet"], "comfort_half_band": 0.95 if profile["quiet"] else 0.7,
                     "model": model, "model_at": trained, "passive_setpoints": learned,
-                    "learning_session": active_since,
+                    "learning_session": active_since, "learning_error": learning_error,
                     "reference": config["reference"]})
     return current
 
 
 def coordinate(current):
+    if not all(room in current for room in SHARED_ROOMS):
+        return  # Compatibility report for historical shared-room advice.
     living, study = (current[room] for room in SHARED_ROOMS)
     proposals = [room for room in (living, study) if room["send_after"] is not None]
     if not proposals:
@@ -542,7 +582,7 @@ def daily(db, today):
                                SELECT 1 FROM daily AS a WHERE a.localday=d.localday AND a.room=d.room)
                                ORDER BY localday""", (today,)).fetchall()
     for row in candidates:
-        for room in ("bedroom", "living", "study"):
+        for room, in db.execute("SELECT DISTINCT room FROM decisions WHERE localday=?", (row["localday"],)):
             entries = db.execute("SELECT tick,value FROM decisions WHERE localday=? AND room=? ORDER BY tick",
                                  (row["localday"], room)).fetchall()
             db.execute("INSERT OR REPLACE INTO daily VALUES (?,?,?)", (row["localday"], room, encode(metrics(entries))))
@@ -623,6 +663,11 @@ def display(db, config, tick, error=None, *, release=(None, None)):
         current[room] = {"latest": latest, "tick": row["tick"] if row else None,
                          "totals": totals, "today_hypothetical_beeps": today_rows[0] or 0,
                          "coverage_pct": round(100 * totals["valid_temperature_minutes"] / expected, 1)}
+    live_summary = None
+    try:
+        live_summary = json.loads((JOURNALS/"status.json").read_bytes()).get("control")
+    except (FileNotFoundError, json.JSONDecodeError):
+        pass
     complete_days = db.execute("SELECT * FROM daily ORDER BY localday DESC,room LIMIT 9").fetchall()
     enough_data = (assessment is not None and tick+60-assessment >= DAY and
                    all(current[room]["coverage_pct"] >= 80 for room in ("bedroom", "living") if room in current))
@@ -635,7 +680,13 @@ def display(db, config, tick, error=None, *, release=(None, None)):
                 and value.get("metered_seconds", 0) >= 60-1e-6):
             shared_energy.setdefault(row["tick"], []).append(value["metered_kwh"])
     complete_energy = [sum(readings) for readings in shared_energy.values() if len(readings) == len(config)]
+    latest_tick = max((item["tick"] for item in current.values() if item["tick"] is not None), default=None)
+    generated = time.time()
     summary = {"started_at":local(started).isoformat(), "checked_at":local(tick).isoformat(),
+               "published_at": local(generated).isoformat(),
+               "latest_observation_at": local(latest_tick).isoformat() if latest_tick is not None else None,
+               "stale_after": local(latest_tick+240).isoformat() if latest_tick is not None else None,
+               "stale": error is not None or latest_tick is None or generated-latest_tick > 240,
                "policy_revision": POLICY_REVISION, "release_commit": commit,
                "deployment_at": local(deployed_at).isoformat() if deployed_at is not None else None,
                "assessment_window_from": local(floor).isoformat(), "assessment_window_to": local(tick+60).isoformat(),
@@ -644,7 +695,7 @@ def display(db, config, tick, error=None, *, release=(None, None)):
                "earliest_24h_review":local(assessment+DAY).isoformat() if assessment else None,
                "72h_review":local(assessment+3*DAY).isoformat() if assessment else None,
                "data_ready_for_24h_review":enough_data and not error,
-               "mijia_rules_confirmation": rules,
+               "mijia_rules_confirmation": rules, "live_control": live_summary,
                "source_error":error,"rooms":current,
                "observed_home_kwh": round(sum(complete_energy), 6) if complete_energy else None,
                "observed_home_minutes": len(complete_energy),
@@ -775,6 +826,7 @@ def main():
     signal.signal(signal.SIGINT, lambda *_: stop.set())
     with closing(sqlite3.connect(DATA/"shadow.sqlite3")) as db:
         db.row_factory = sqlite3.Row
+        db.execute("PRAGMA temp_store=MEMORY")
         init(db, int(time.time()))
         LOG.info("Offline shadow service running for %d rooms", len(config))
         last_report = None
@@ -809,11 +861,20 @@ def main():
                     if changed:
                         daily_snapshot(db, tick)
                 last_error = None
-            except (sqlite3.Error, OSError, KeyError, ValueError) as exc:
+                if last_report is not None:
+                    atomic(OUTPUT/"shadow-health.json", encode({"at": now, "last_success_tick": last_report,
+                               "stale_after": last_report+240, "state": "stale" if now-last_report > 240 else "healthy"}))
+            except (sqlite3.Error, OSError, KeyError, ValueError, AttributeError, TypeError) as exc:
                 name = type(exc).__name__
                 if last_error != name:
                     LOG.warning("Shadow input or storage unavailable: %s", name)
                 last_error = name
+                try:
+                    atomic(OUTPUT/"shadow-health.json", encode({"at": now, "last_success_tick": last_report,
+                               "stale_after": (last_report+240) if last_report is not None else None,
+                               "state": "stale", "error": name}))
+                except OSError:
+                    LOG.warning("Shadow health output unavailable")
                 try:
                     display(db, config, tick, name, release=release)
                 except (sqlite3.Error, OSError):

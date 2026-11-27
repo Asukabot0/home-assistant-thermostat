@@ -8,6 +8,7 @@ from cadence import latest_beeps
 from house_policy import ACTIVE, POLICY, recovering, thermostat_view
 from model import Activity, OVERSHOOT_HIGH_POWER_SECONDS, RAPID_REPORT_MAX_AGE, advise, increases_output, numeric
 from service import CONFIG, DATA, POWER_REPORT_GAP_SECONDS, initial_setpoint, open_readonly, power_context
+from topology import report_time
 
 
 ROOMS = json.loads(CONFIG.read_text(encoding="utf-8"))
@@ -85,6 +86,11 @@ def room_advice(room, fixed_mode="heat", *, offsets=None, mode_changed_at=None, 
                          if offsets is not None and house_since is None else None)
         limits = ROOMS[room]["soft_limits"]
         initial = {}
+        ledger_reports = []
+        if feedback is not None and feedback.get("power_context") and feedback["adapter"].get("power_report_at") is not None:
+            ledger_reports = db.execute("""SELECT report_at, watts FROM power_reports WHERE source=?
+                                       AND observer_epoch=? AND report_at BETWEEN ? AND ? ORDER BY report_at""",
+                                       (*feedback["power_context"], now-2100, now)).fetchall()
         if entries and offsets is not None:
             target = json.loads(entries[0]["value"])["target"]
             initial = {mode: initial_setpoint(db, room, mode, now, target, limits[mode]) for mode in limits}
@@ -136,7 +142,8 @@ def room_advice(room, fixed_mode="heat", *, offsets=None, mode_changed_at=None, 
             "reversal_beep_at": reversal_beep.at if reversal_beep is not None else None,
             "low_power_cutoff": value.get("low_power_cutoff"), "low_power_seconds": low_seconds,
             "reversal_low_cutoff": value.get("reversal_low_cutoff"),
-            "power_evidence": value.get("power_evidence"),
+            "power_evidence": value.get("power_evidence"), "ledger_reports": [tuple(r) for r in ledger_reports],
+            "model_at": value.get("model_at"),
             "above_low_seconds": value.get("above_low_seconds", 0), "edges": edges}
 
 
@@ -153,14 +160,17 @@ def room_feedback(request, room):
     signature = (mode, setpoint, adapter["attributes"].get("fan_mode"), thermostat["state"],
                  attrs.get("temperature"), attrs.get("preset_mode"), attrs.get("automatic_control_enabled"))
     context = power_context(attrs, config["power"])
-    power_age = report_age(power, attrs.get("power_reported_at") if context else None, now)
-    temperature_age = report_age(sensor, attrs.get("temperature_reported_at"), now)
+    power_report_at = report_time(power, attrs.get("power_reported_at") if context else None)
+    observer_matches = attrs.get("temperature_entity_id", TEMPERATURE[room]) == TEMPERATURE[room]
+    temp_report_at = report_time(sensor, attrs.get("temperature_reported_at") if observer_matches else None)
+    power_age = now-power_report_at if power_report_at is not None else 1e12
+    temperature_age = now-temp_report_at if temp_report_at is not None else 1e12
     return {"signature": signature, "temperature": sensor["state"], "temperature_age": temperature_age,
-            "temperature_report_at": now - temperature_age, "power_context": context,
-            "temperature_source": [TEMPERATURE[room], context[1]] if context else None,
+            "temperature_report_at": temp_report_at, "power_context": context,
+            "temperature_source": [TEMPERATURE[room], attrs.get("power_observer_started_at", "ha_report")] if observer_matches else None,
             "native_authorized": attrs.get("configured_for_actuation"),
             "offsets": {m: attrs.get(m + "ing_offset") for m in ("heat", "cool")},
-            "adapter": {"mode": mode, "setpoint": setpoint, "power": power["state"], "from_power_s": power_age,
+            "adapter": {"mode": mode, "setpoint": setpoint, "power": power["state"], "from_power_s": power_age, "power_report_at": power_report_at,
                         "power_state_updated_at": datetime.fromisoformat(power["last_updated"]).timestamp(),
                         "modes": adapter["attributes"].get("hvac_modes", []),
                         "updated_at": datetime.fromisoformat(adapter["last_updated"]).timestamp(),
@@ -195,7 +205,7 @@ def matching_feedback(now, live, sampled, target, *, reversal=False):
     return None
 
 
-def eligible(now, baseline, live, shadow, *, mode="heat", setpoints=(20, 22), target=24, easing=False):
+def eligible(now, baseline, live, shadow, *, mode="heat", setpoints=(20, 22), target=24, easing=False, match_sample=True):
     if live["signature"] != baseline:
         return "检测到伴侣或恒温器设置变化，结束本次试用", None
     if shadow["witness"] != "matched" or not shadow["followup_complete"]:
@@ -204,7 +214,7 @@ def eligible(now, baseline, live, shadow, *, mode="heat", setpoints=(20, 22), ta
     advice = shadow["easing"] if easing else shadow["decision"]
     if advice is None:
         return "等待可用的减载建议", None
-    if reason := matching_feedback(now, live, sampled, target):
+    if match_sample and (reason := matching_feedback(now, live, sampled, target)):
         return reason, None
     if not advice["hypothetical_send"] or advice["command_kind"] != "temperature":
         return advice["reason"], None

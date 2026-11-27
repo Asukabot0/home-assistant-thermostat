@@ -102,7 +102,7 @@ def record_episode(db, room, tick, history, session, active_since, power_span):
     if not window:
         return
     mode, setpoint = window[-1]["adapter_mode"], window[-1]["reported"]
-    target = numeric(window[-1].get("desired"))
+    target = numeric(window[-1]["desired"])
     if (mode not in {"heat", "cool"} or setpoint is None or target is None
             or [row["tick"] for row in window] != list(range(start, tick+1, 60))):
         return

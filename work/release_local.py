@@ -87,14 +87,38 @@ def resume(root):
     sidecar(root, "pilot", "start")
 
 
+def shadow_compose_storage(contents):
+    text = contents.decode()
+    lines = text.splitlines(keepends=True)
+    for index, line in enumerate(lines):
+        if line.startswith("    tmpfs:"):
+            if "size=32m" in line:
+                return contents
+            lines[index] = '    tmpfs: ["/tmp:size=32m,mode=1777"]\n'
+            return "".join(lines).encode()
+    index = lines.index("    read_only: true\n")
+    lines.insert(index+1, '    tmpfs: ["/tmp:size=32m,mode=1777"]\n')
+    return "".join(lines).encode()
+
+
+def replace_shadow(root):
+    run("docker", "compose", "-f", str(root/"compose.shadow.yaml"), "up", "-d", "--no-deps", "--force-recreate",
+        "room-climate-shadow", cwd=root)
+
+
 def backup(root, destination, names):
     destination.mkdir(mode=0o700, parents=True)
     path = destination / "runtime"
     path.mkdir(mode=0o700)
-    for name in {*names, "rooms.json", ".release"}:
+    owned = {*names, "rooms.json", ".release", "topology.json"}
+    (destination/"managed-files.json").write_text(json.dumps(sorted(owned)))
+    for name in owned:
         source = root / "shadow" / name
         if source.exists():
             shutil.copy2(source, path / name)
+    compose = root/"compose.shadow.yaml"
+    if compose.is_file():
+        shutil.copy2(compose,destination/compose.name)
     journals = destination / "journal-evidence"
     journals.mkdir(mode=0o700)
     for source in (root / "pilot-data").glob("*.json"):
@@ -109,6 +133,11 @@ def backup(root, destination, names):
 def restore_code(directory, recorded):
     for source in recorded.iterdir():
         install_bytes(directory / source.name, source.read_bytes(), 0o600 if source.name=="rooms.json" else 0o644)
+    managed = recorded.parent/"managed-files.json"
+    if managed.exists():
+        for name in json.loads(managed.read_bytes()):
+            if Path(name).name == name and not (recorded/name).exists():
+                (directory/name).unlink(missing_ok=True)
     if not (recorded/".release").exists():
         (directory/".release").unlink(missing_ok=True)
 
@@ -116,6 +145,7 @@ def restore_code(directory, recorded):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--production", type=Path, required=True, help="directory containing compose.pilot.yaml and shadow/")
+    parser.add_argument("--topology", type=Path, help="initial site observation/zone configuration, kept private")
     group = parser.add_mutually_exclusive_group(required=True)
     group.add_argument("--commit")
     group.add_argument("--rollback", type=Path, help="backup directory printed by the preceding deployment")
@@ -131,6 +161,10 @@ def main():
         quiesce(root)
         try:
             restore_code(directory, recorded)
+            compose = recorded.parent/"compose.shadow.yaml"
+            if compose.exists() and compose.read_bytes() != (root/compose.name).read_bytes():
+                install_bytes(root/compose.name, compose.read_bytes())
+                replace_shadow(root)
         finally:
             resume(root)
         print("Rollback complete. Active journals, receipts and database were retained.")
@@ -154,6 +188,18 @@ def main():
     for which in ("shadow","pilot"):
         run("docker", "compose", "-f", str(root/f"compose.{which}.yaml"), "config", "--quiet", cwd=root)
     local_config = local_mapping(directory)
+    topology_path = args.topology or directory/"topology.json"
+    topology = topology_path.read_bytes() if topology_path.is_file() else None
+    if "zone_control.py" in bundle:
+        if topology is None:
+            raise ValueError("Pass the site topology JSON for a unified-controller deployment")
+        import sys
+        sys.path.insert(0, str(repo/"home-assistant/shadow"))
+        from topology import configure
+        configure(json.loads(topology), json.loads(local_config))
+    compose = root/"compose.shadow.yaml"
+    previous_compose = compose.read_bytes()
+    updated_compose = shadow_compose_storage(previous_compose) if topology is not None else previous_compose
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     destination = root / "release-backups" / f"{stamp}-{commit[:12]}"
     quiesce(root)
@@ -164,8 +210,14 @@ def main():
         for name, data in bundle.items():
             install_bytes(directory/name, data)
         install_bytes(directory/"rooms.json", local_config, 0o600)
+        if topology is not None:
+            install_bytes(directory/"topology.json", topology, 0o600)
         install_bytes(directory/".release", (commit+"\n").encode())
         assert all((directory/name).read_bytes()==data for name,data in bundle.items())
+        if updated_compose != previous_compose:
+            install_bytes(compose, updated_compose)
+            run("docker", "compose", "-f", str(compose), "config", "--quiet", cwd=root)
+            replace_shadow(root)
         resume(root)
     except BaseException:
         if installed:
@@ -173,10 +225,16 @@ def main():
             # journals with the pre-deployment archive.
             quiesce(root)
             restore_code(directory, destination/"runtime")
+            if compose.read_bytes() != previous_compose:
+                install_bytes(compose, previous_compose)
+                replace_shadow(root)
         resume(root)
         raise
     print("Commit", commit)
-    print("Config SHA256", sha256(local_config+b"\0"+bundle["house_policy.json"]).hexdigest())
+    settings = [local_config, bundle["house_policy.json"]]
+    if topology is not None:
+        settings.append(topology)
+    print("Config SHA256", sha256(b"\0".join(settings)).hexdigest())
     print("Backup", destination)
 
 

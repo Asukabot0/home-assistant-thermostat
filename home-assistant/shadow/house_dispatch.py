@@ -34,23 +34,50 @@ def initial_safety_setting(mode, setting, target, limits):
     return max(bounds[0], min(bounds[1], round(target)))
 
 
-def final_gate(candidate, now, live, readings, connected, state, configurations, *, policy=POLICY):
+def final_gate(candidate, now, live, readings, connected, state, configurations, *, policy=POLICY, topology=None, trace=None):
     room, kind, value, purpose = candidate
     feedback = live[room]
     shadow = readings[room]
     mode, setpoint, _, _, target, _, _ = feedback["signature"]
-    group = "living_study" if room in {"living","study"} else room
+    group = topology["actuators"][room]["lock_group"] if topology else "living_study" if room in {"living","study"} else room
     if (feedback["signature"][3] != "auto" or feedback["signature"][5:] != ("标准", False)
             or feedback["native_authorized"] is not False or group in state["holds"]
             or not shadow["witness"] == "matched" or not shadow["followup_complete"]
             or room in state["manual_holds"]
             or list(feedback["signature"][:3]) != state["baselines"][room]):
         return "等待可信回报或人工恢复"
-    if flag := matching_feedback(now, feedback, shadow["sample"], target, reversal=kind == "mode" and value != "off"):
+    if topology is None and (flag := matching_feedback(now, feedback, shadow["sample"], target, reversal=kind == "mode" and value != "off")):
         return flag
     if not current_power_evidence(now, feedback, shadow):
         return "等待本机新鲜功率上报"
-    plan = state.get("gentle")
+    if topology is not None:
+        home = topology["actuators"][room]["zone"]
+        local = trace["zones"][home]
+        if local["paused"] or local["quality"] != "fresh" or local["target"] is None:
+            return "设备所在区域已暂停或观测失效"
+        if kind == "temperature" and mode not in ACTIVE:
+            return "当前模式不能调温"
+        if kind == "mode" and value not in {*ACTIVE, "off"}:
+            return "无效运行模式"
+        stronger = (kind == "mode" and value in ACTIVE or kind == "temperature" and
+                    purpose != "initial_safety_easing" and increases_output(mode, setpoint, value))
+        if stronger:
+            from zone_control import opposing_allowed
+            scope = trace["action_scopes"].get(room)
+            zone = trace["zones"].get(scope["zone"]) if scope else None
+            direction = value if kind == "mode" else mode
+            if (not zone or not zone["qualified"] or zone["paused"] or zone["direction"] != direction
+                    or scope["zone"] != trace["owner"] or room not in trace["feasible"].get(scope["zone"], ())):
+                return "区域需求或作用范围已变化"
+            modes = {unit: live[unit]["adapter"]["mode"] for unit in connected}
+            if any(m not in {direction, "off", "fan_only"} and not opposing_allowed(
+                    room, scope["zone"], unit, modes, trace["zones"], topology, trace["output_evidence"])
+                   for unit, m in modes.items() if unit != room):
+                return "等待相反输出有序退出"
+        if power_endpoint := shadow.get("live_power_endpoint"):
+            if power_endpoint != feedback["adapter"].get("power_report_at"):
+                return "实时功率证据与当前末端不一致"
+    plan = state.get("gentle") if topology is None else None
     optional = purpose == "gentle_temperature" or (purpose in {"energy_start", "reversal_initial"} and plan is not None)
     if optional:
         index = tuple(ref for ref in INDEPENDENT if ref in connected)
@@ -90,7 +117,7 @@ def final_gate(candidate, now, live, readings, connected, state, configurations,
                     "command_kind": "temperature", "rapid_override": False,
                     "house_weakening": not increases_output(mode, setpoint, value), "reason": "house"}
         reason, permitted = eligible(now, feedback["signature"], feedback, dict(shadow, decision=decision),
-                                     mode=mode, setpoints=(value,), target=target)
+                                     mode=mode, setpoints=(value,), target=target, match_sample=topology is None)
         return reason if permitted is None else None
     adapter = feedback["adapter"]
     if value not in adapter["modes"]:
@@ -101,7 +128,7 @@ def final_gate(candidate, now, live, readings, connected, state, configurations,
         if now - adapter["last_mode_change"] < policy["min_run_seconds"]:
             return "等待本机最短运行时间"
         return None
-    for peer in connected - {room}:
+    for peer in (connected - {room}) if topology is None else ():
         peer_mode = live[peer]["adapter"]["mode"]
         if peer_mode not in {value, "off", "fan_only"}:
             return "等待相反或未知模式退出"
