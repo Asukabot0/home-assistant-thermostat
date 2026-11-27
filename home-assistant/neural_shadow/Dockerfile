@@ -4,8 +4,8 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1
 
-RUN groupadd --gid 10001 shadow && \
-    useradd --uid 10001 --gid 10001 --create-home --shell /usr/sbin/nologin shadow
+RUN groupadd --gid 10001 thermostat-shadow && \
+    useradd --uid 10001 --gid 10001 --create-home --shell /usr/sbin/nologin thermostat-shadow
 
 WORKDIR /app
 
@@ -25,7 +25,7 @@ COPY home-assistant/neural_shadow /app/home-assistant/neural_shadow/
 
 ENV PYTHONPATH=/app/home-assistant
 
-USER shadow
+USER thermostat-shadow
 
 ENTRYPOINT ["python3", "-B", "-m", "neural_shadow"]
 CMD ["serve", "--config", "/config/neural_shadow.json"]
