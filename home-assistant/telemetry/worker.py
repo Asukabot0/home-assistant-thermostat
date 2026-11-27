@@ -322,7 +322,8 @@ def package(config,directory,state,gh,current,window,kind,revision_only=False):
     last=next((x for x in reversed(state["uploaded"]) if (x["start"],x["end"],x["kind"])==(start,end,kind)),None)
     # Keep earlier verified raw observations available across Recorder retention.
     prior_archive=prior_reports(spool,last)
-    snapshot=collect(Path(config["production"]),start,end,current,config["anonymization_key"],previous_archive=prior_archive)
+    ns_dir = Path(config["neural_shadow_output"]) if config.get("neural_shadow_output") else None
+    snapshot=collect(Path(config["production"]),start,end,current,config["anonymization_key"],previous_archive=prior_archive,neural_shadow_dir=ns_dir)
     snapshot["raw"]["runtime-probe"]=[{"at":snapshot["captured_at"],"event":"runtime_probe",
                                       "status":current["status"],"problems":current["problems"]}]
     try:

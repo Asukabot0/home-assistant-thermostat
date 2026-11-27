@@ -1,0 +1,36 @@
+name: room-thermostat-neural-shadow
+
+services:
+  neural-climate-shadow:
+    build:
+      context: ..
+      dockerfile: home-assistant/neural_shadow/Dockerfile
+    image: room-thermostat-neural-shadow:v1
+    restart: unless-stopped
+    # Zero network access enforces at the container boundary that the shadow model
+    # has no path to Home Assistant services or any device actuation endpoint.
+    network_mode: none
+    read_only: true
+    tmpfs: ["/tmp:size=64m,mode=1777"]
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    mem_limit: 512m
+    pids_limit: 64
+    environment:
+      TZ: Asia/Tokyo
+      PYTHONDONTWRITEBYTECODE: "1"
+      OMP_NUM_THREADS: "2"
+    volumes:
+      - ./neural_shadow/config.json:/config/neural_shadow.json:ro
+      - ./shadow:/opt/shadow-config:ro
+      - ./config:/ha-readonly:ro
+      - ./shadow-data:/shadow-data-ro:ro
+      - ./pilot-data:/pilot-data-ro:ro
+      - ./neural-shadow-models:/models:ro
+      - ./neural-shadow-data:/state
+      - ../outputs/neural-shadow:/output
+    logging:
+      driver: json-file
+      options:
+        max-size: 2m
+        max-file: "2"

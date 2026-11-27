@@ -554,7 +554,156 @@ def release_groups(audit, frames, power, meter_by_unit, zones, commands, start, 
     return results
 
 
-def collect(root, start, end, runtime, key, *, previous_archive=None):
+def read_neural_shadow(folder, start, end, schema):
+    """Read-only, exception-isolated export of neural shadow scores, gaps, and versions."""
+    acquired = time()
+    folder = Path(folder)
+    try:
+        status_path = folder / "neural-shadow-status.json"
+        scores_path = folder / "neural-shadow-scores.jsonl"
+        status_raw = load_json(status_path) if status_path.is_file() else {}
+        model_info = status_raw.get("model") or {}
+        pub_token = lambda v: v if isinstance(v, str) and re.fullmatch(r"[a-z][a-z0-9_-]{0,55}", v) else None
+        versions = {
+            "model_id": schema.id("ns_model", model_info.get("model_id")) if model_info.get("model_id") else None,
+            "model_state": pub_token(model_info.get("model_state")),
+            "deployment_eligible": bool(model_info.get("deployment_eligible", False)),
+            "model_arch_version": pub_token(model_info.get("model_arch_version")),
+            "feature_version": pub_token(model_info.get("feature_version")),
+            "constraint_version": pub_token(model_info.get("constraint_version")),
+            "config_fingerprint": model_info.get("config_fingerprint")
+            if isinstance(model_info.get("config_fingerprint"), str)
+            and HEXDIGEST.fullmatch(model_info["config_fingerprint"])
+            else None,
+            "training_cutoff_utc": model_info.get("training_cutoff_utc")
+            if isinstance(model_info.get("training_cutoff_utc"), str)
+            and re.match(r"^\d{4}-\d{2}-\d{2}T", model_info["training_cutoff_utc"])
+            else None,
+            "data_origin": pub_token(model_info.get("data_origin")),
+            "parameter_count": int(model_info["parameter_count"])
+            if isinstance(model_info.get("parameter_count"), int)
+            else None,
+        }
+        rows = []
+        if scores_path.is_file():
+            with scores_path.open("r", encoding="utf-8") as stream:
+                for line in stream:
+                    if not line.strip():
+                        continue
+                    try:
+                        rec = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    end_ts = num(rec.get("horizon_end_ts"))
+                    if end_ts is None or not (start <= end_ts < end):
+                        continue
+                    zone_errs = {}
+                    for z, zval in (rec.get("factual_hold_temp_errors") or {}).items():
+                        z_alias = schema.aliases.get(z, schema.id("zones", z))
+                        zone_errs[z_alias] = {
+                            k: (bool(zval[k]) if k == "within_pi80" else num(zval.get(k)))
+                            for k in ("pred_delta_c", "actual_delta_c", "signed_error_c", "abs_error_c", "sigma_c", "within_pi80")
+                            if k in zval
+                        }
+                    wh_err_raw = rec.get("factual_hold_wh_error")
+                    wh_err = (
+                        {
+                            k: (bool(wh_err_raw[k]) if k == "within_pi80" else num(wh_err_raw.get(k)))
+                            for k in ("pred_total_wh", "actual_total_wh", "signed_error_wh", "abs_error_wh", "sigma_wh", "within_pi80")
+                            if k in wh_err_raw
+                        }
+                        if isinstance(wh_err_raw, dict)
+                        else None
+                    )
+                    rows.append(
+                        {
+                            "id": schema.id("ns_score", (rec.get("prediction_id"), rec.get("horizon_minutes"))),
+                            "horizon_minutes": int(rec["horizon_minutes"]),
+                            "cutoff_ts": num(rec.get("cutoff_ts")),
+                            "horizon_end_ts": end_ts,
+                            "intervened": bool(rec.get("intervened", False)),
+                            "factual_settlement_kind": pub_token(rec.get("factual_settlement_kind")),
+                            "recommended_execution_status": pub_token(rec.get("recommended_execution_status")),
+                            "model_state": pub_token(rec.get("model_state")),
+                            "model_arch_version": pub_token(rec.get("model_arch_version")),
+                            "feature_version": pub_token(rec.get("feature_version")),
+                            "config_fingerprint": rec.get("config_fingerprint")
+                            if isinstance(rec.get("config_fingerprint"), str)
+                            and HEXDIGEST.fullmatch(rec["config_fingerprint"])
+                            else None,
+                            "training_cutoff_ts": num(rec.get("training_cutoff_ts")),
+                            "factual_hold_temp_errors": zone_errs,
+                            "factual_hold_wh_error": wh_err,
+                            "joint_wh_coverage_ratio": num(rec.get("joint_wh_coverage_ratio")),
+                            "joint_wh_has_gap": bool(rec.get("joint_wh_has_gap", True)),
+                            "joint_wh_label_valid": bool(rec.get("joint_wh_label_valid", False)),
+                        }
+                    )
+        rows.sort(key=lambda r: (r["horizon_end_ts"], r["horizon_minutes"], r["id"]))
+        by_horizon = {}
+        for h_min in sorted({r["horizon_minutes"] for r in rows} | {15, 30, 60}):
+            h_rows = [r for r in rows if r["horizon_minutes"] == h_min]
+            f_rows = [r for r in h_rows if not r["intervened"]]
+            z_keys = sorted({z for r in f_rows for z in r["factual_hold_temp_errors"]})
+            z_summary = {}
+            for z in z_keys:
+                errs = [r["factual_hold_temp_errors"][z] for r in f_rows if z in r["factual_hold_temp_errors"]]
+                abs_e = [e["abs_error_c"] for e in errs if e.get("abs_error_c") is not None]
+                sgn_e = [e["signed_error_c"] for e in errs if e.get("signed_error_c") is not None]
+                cov_e = [1.0 if e.get("within_pi80") else 0.0 for e in errs if "within_pi80" in e]
+                z_summary[z] = {
+                    "n_factual": len(abs_e),
+                    "mae_c": round(sum(abs_e) / len(abs_e), 4) if abs_e else None,
+                    "bias_c": round(sum(sgn_e) / len(sgn_e), 4) if sgn_e else None,
+                    "pi80_coverage": round(sum(cov_e) / len(cov_e), 4) if cov_e else None,
+                }
+            wh_errs = [r["factual_hold_wh_error"] for r in f_rows if r.get("factual_hold_wh_error")]
+            wh_abs = [e["abs_error_wh"] for e in wh_errs if e.get("abs_error_wh") is not None]
+            covs = [r["joint_wh_coverage_ratio"] for r in h_rows if r.get("joint_wh_coverage_ratio") is not None]
+            gaps_n = sum(1 for r in h_rows if r.get("joint_wh_has_gap"))
+            by_horizon[f"{h_min}m"] = {
+                "n_settled": len(h_rows),
+                "n_factual_hold": len(f_rows),
+                "n_intervened_excluded": sum(1 for r in h_rows if r["intervened"]),
+                "zones": z_summary,
+                "total_wh_mae": round(sum(wh_abs) / len(wh_abs), 2) if wh_abs else None,
+                "mean_joint_coverage_ratio": round(sum(covs) / len(covs), 4) if covs else None,
+                "coverage_gap_count": gaps_n,
+                "has_coverage_gap": gaps_n > 0 or (len(h_rows) == 0),
+            }
+        summary = {
+            "status": "available" if status_path.is_file() or scores_path.is_file() else "unavailable",
+            "versions": versions,
+            "window_counts": {
+                "settled_total": len(rows),
+                "factual_hold": sum(1 for r in rows if not r["intervened"]),
+                "intervened_excluded": sum(1 for r in rows if r["intervened"]),
+                "counterfactual_unexecuted": sum(
+                    1 for r in rows if r["recommended_execution_status"] == "counterfactual_unexecuted"
+                ),
+                "coverage_gap_count": sum(1 for r in rows if r["joint_wh_has_gap"]),
+            },
+            "window_factual_scores": by_horizon,
+        }
+        watermark = {
+            **source_watermark(rows, "horizon_end_ts", acquired, start, end),
+            "status": summary["status"],
+            "generated_at_utc": status_raw.get("generated_at_utc")
+            if isinstance(status_raw.get("generated_at_utc"), str)
+            and re.match(r"^\d{4}-\d{2}-\d{2}T", status_raw["generated_at_utc"])
+            else None,
+        }
+        return rows, summary, watermark
+    except (OSError, ValueError, KeyError, TypeError) as error:
+        err_name = type(error).__name__
+        return (
+            [],
+            {"status": "unavailable", "error": err_name},
+            {"acquired_at": iso(acquired), "status": "unavailable", "error": err_name, "window_from": start, "window_to": end},
+        )
+
+
+def collect(root, start, end, runtime, key, *, previous_archive=None, neural_shadow_dir=None):
     captured = time()
     audit_floor = end-86400
     folder = root/"pilot-data"
@@ -660,6 +809,11 @@ def collect(root, start, end, runtime, key, *, previous_archive=None):
         reconciled = sum((Counter(row["statistics"]["controller_errors"]) for row in periods), Counter())
         if totals["controller_errors"] != reconciled:
             raise ValueError("Controller errors must reconcile across deployment windows")
+    if neural_shadow_dir is not None:
+        ns_rows, ns_summary, ns_mark = read_neural_shadow(neural_shadow_dir, start, end, schema)
+        raw["neural-shadow-scores"] = ns_rows
+        summary["neural_shadow"] = ns_summary
+        marks["neural_shadow"] = ns_mark
     return {"captured_at":captured,"runtime":runtime,"raw":raw,"status":{"last_completed_cycle":latest,**status},
             "effective":schema.configuration(rooms,topology,policy),"configurations":versions,"summary":summary,"watermarks":marks,
             "private_values":[k for k in schema.aliases if "." in k]}
