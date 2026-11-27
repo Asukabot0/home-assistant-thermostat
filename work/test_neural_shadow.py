@@ -36,6 +36,7 @@ sys.path.insert(0, str(REPO_ROOT / "work"))
 
 import evidence as telemetry_evidence  # noqa: E402
 from neural_shadow import DataOrigin, FEATURE_VERSION, MODEL_ARCH_VERSION, ModelState  # noqa: E402
+from neural_shadow import cli as ns_cli  # noqa: E402
 from neural_shadow.config import build_site_config, load_default_example_config  # noqa: E402
 from neural_shadow.constraints import generate_v1_candidates, validate_v1_action_proposal  # noqa: E402
 from neural_shadow.data_pipeline import (  # noqa: E402
@@ -813,6 +814,172 @@ class NeuralShadowRegressionTests(unittest.TestCase):
             short_ds = build_dataset(short_hist)
             short_art, _ = train_and_evaluate(short_ds, epochs=2, seed=5, gates=ReadinessGates())
             self.assertEqual(short_art.model_state, ModelState.INSUFFICIENT_DATA)
+
+    # B6 regression: version mismatch in serve/run-once and stale/stopped outputs must fail closed outwardly
+    def test_b6_version_mismatch_and_stale_status_fail_closed_outwardly(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            prod = root / "prod"
+            (prod / "shadow").mkdir(parents=True)
+            (prod / "config").mkdir(parents=True)
+            (prod / "shadow-data").mkdir(parents=True)
+            (prod / "pilot-data").mkdir(parents=True)
+            (prod / "shadow" / "rooms.json").write_text(json.dumps(self.site.raw_rooms))
+            (prod / "shadow" / "topology.json").write_text(json.dumps(self.site.raw_topology))
+            (prod / "shadow" / "house_policy.json").write_text(json.dumps(self.site.policy))
+            now = time.time()
+            start = now - 3900.0
+            end = now - 300.0
+            (prod / "pilot-data" / "live-audit.jsonl").write_text(
+                json.dumps({"event": "cycle", "at": end - 60.0, "rooms": {}}) + "\n"
+            )
+
+            models_dir = root / "models"
+            state_dir = root / "state"
+            out_dir = root / "out"
+            models_dir.mkdir()
+            state_dir.mkdir()
+            out_dir.mkdir()
+
+            # Save a checkpoint trained against a DIFFERENT topology observation_version
+            topo_other = deepcopy(self.site.raw_topology)
+            topo_other["observation_version"] = "site-mismatch-other"
+            site_other = build_site_config(self.site.raw_rooms, topo_other, self.site.policy)
+            spec_other = build_feature_spec(site_other)
+            ckpt_path = models_dir / "thermostat_shadow_gru.pt"
+            save_checkpoint(build_untrained_artifact(site_other, spec_other), ckpt_path)
+
+            cfg_path = root / "neural_shadow.json"
+            cfg_data = {
+                "schema": 1,
+                "inputs": {
+                    "rooms_file": str(prod / "shadow" / "rooms.json"),
+                    "topology_file": str(prod / "shadow" / "topology.json"),
+                    "policy_file": str(prod / "shadow" / "house_policy.json"),
+                    "ha_config_dir": str(prod / "config"),
+                    "shadow_data_dir": str(prod / "shadow-data"),
+                    "pilot_data_dir": str(prod / "pilot-data"),
+                },
+                "model": {
+                    "artifact_dir": str(models_dir),
+                    "checkpoint_name": "thermostat_shadow_gru.pt",
+                    "expected_feature_version": FEATURE_VERSION,
+                    "expected_arch_version": MODEL_ARCH_VERSION,
+                },
+                "outputs": {"state_dir": str(state_dir), "output_dir": str(out_dir)},
+                "runtime": {"poll_interval_seconds": 300},
+            }
+            cfg_path.write_text(json.dumps(cfg_data))
+
+            def _seed_stale_ready_status(gen_ts: float):
+                (out_dir / "neural-shadow-status.json").write_text(
+                    json.dumps(
+                        {
+                            "schema_version": 1,
+                            "generated_at": gen_ts,
+                            "generated_at_utc": datetime.fromtimestamp(gen_ts, timezone.utc).isoformat(),
+                            "poll_interval_seconds": 300.0,
+                            "state": "healthy",
+                            "declined": False,
+                            "model": {
+                                "model_id": "old-ready-model",
+                                "model_state": "ready_to_use",
+                                "deployment_eligible": True,
+                                "model_arch_version": MODEL_ARCH_VERSION,
+                                "feature_version": FEATURE_VERSION,
+                            },
+                        }
+                    )
+                )
+
+            # 1. serve iteration with mismatched checkpoint MUST overwrite stale ready_to_use status + health!
+            _seed_stale_ready_status(now - 30.0)
+            ok, poll_s = ns_cli._run_serve_iteration(cfg_path)
+            self.assertFalse(ok)
+            self.assertEqual(poll_s, 300.0)
+            st_after_serve = json.loads((out_dir / "neural-shadow-status.json").read_text(encoding="utf-8"))
+            hl_after_serve = json.loads((out_dir / "neural-shadow-health.json").read_text(encoding="utf-8"))
+            self.assertEqual(st_after_serve["state"], "version_mismatch")
+            self.assertTrue(st_after_serve["declined"])
+            self.assertEqual(st_after_serve["model"]["model_state"], "version_mismatch")
+            self.assertFalse(st_after_serve["model"]["deployment_eligible"])
+            self.assertEqual(hl_after_serve["state"], "version_mismatch")
+            self.assertEqual(hl_after_serve["model_state"], "version_mismatch")
+
+            # Hourly telemetry hook MUST also fail closed outwardly on version_mismatch
+            snap_mm = telemetry_evidence.collect(
+                prod, start, end, {"status": "verified"}, "a" * 64, neural_shadow_dir=out_dir
+            )
+            self.assertEqual(snap_mm["summary"]["neural_shadow"]["status"], "unavailable")
+            self.assertEqual(snap_mm["summary"]["neural_shadow"]["reason"], "version_mismatch")
+            self.assertEqual(snap_mm["summary"]["neural_shadow"]["versions"]["model_state"], "version_mismatch")
+            self.assertFalse(snap_mm["summary"]["neural_shadow"]["versions"]["deployment_eligible"])
+            telemetry_evidence.bundle((start, end), "hourly", snap_mm, None, None)
+
+            # 2. run-once with mismatched checkpoint returns 2 and updates BOTH status.json and health.json
+            _seed_stale_ready_status(now - 30.0)
+            rc = ns_cli.main(["run-once", "--config", str(cfg_path)])
+            self.assertEqual(rc, 2)
+            st_after_once = json.loads((out_dir / "neural-shadow-status.json").read_text(encoding="utf-8"))
+            self.assertEqual(st_after_once["model"]["model_state"], "version_mismatch")
+            self.assertFalse(st_after_once["model"]["deployment_eligible"])
+            self.assertTrue(st_after_once["declined"])
+
+            # 3. Stopped container: stale ready_to_use (> 2 * poll = 600s old) MUST NOT export as available/ready_to_use
+            stale_dir = root / "stale_out"
+            stale_dir.mkdir()
+            old_ts = now - 900.0
+            (stale_dir / "neural-shadow-status.json").write_text(
+                json.dumps(
+                    {
+                        "generated_at": old_ts,
+                        "generated_at_utc": datetime.fromtimestamp(old_ts, timezone.utc).isoformat(),
+                        "poll_interval_seconds": 300.0,
+                        "state": "healthy",
+                        "model": {"model_id": "old-ready", "model_state": "ready_to_use", "deployment_eligible": True},
+                    }
+                )
+            )
+            snap_stale = telemetry_evidence.collect(
+                prod, start, end, {"status": "verified"}, "a" * 64, neural_shadow_dir=stale_dir
+            )
+            self.assertEqual(snap_stale["summary"]["neural_shadow"]["status"], "unavailable")
+            self.assertTrue(snap_stale["summary"]["neural_shadow"]["stale"])
+            self.assertEqual(snap_stale["summary"]["neural_shadow"]["reason"], "stale")
+            self.assertNotEqual(snap_stale["summary"]["neural_shadow"]["versions"]["model_state"], "ready_to_use")
+            self.assertFalse(snap_stale["summary"]["neural_shadow"]["versions"]["deployment_eligible"])
+            telemetry_evidence.bundle((start, end), "hourly", snap_stale, None, None)
+
+            # 4. Newer health.json reporting version_mismatch overrides an untouched ready_to_use status.json
+            split_dir = root / "split_out"
+            split_dir.mkdir()
+            (split_dir / "neural-shadow-status.json").write_text(
+                json.dumps(
+                    {
+                        "generated_at": now - 60.0,
+                        "generated_at_utc": datetime.fromtimestamp(now - 60.0, timezone.utc).isoformat(),
+                        "poll_interval_seconds": 300.0,
+                        "model": {"model_id": "old-ready", "model_state": "ready_to_use", "deployment_eligible": True},
+                    }
+                )
+            )
+            (split_dir / "neural-shadow-health.json").write_text(
+                json.dumps(
+                    {
+                        "at": now - 10.0,
+                        "at_utc": datetime.fromtimestamp(now - 10.0, timezone.utc).isoformat(),
+                        "state": "version_mismatch",
+                        "model_state": "version_mismatch",
+                        "declined": True,
+                    }
+                )
+            )
+            snap_split = telemetry_evidence.collect(
+                prod, start, end, {"status": "verified"}, "a" * 64, neural_shadow_dir=split_dir
+            )
+            self.assertEqual(snap_split["summary"]["neural_shadow"]["status"], "unavailable")
+            self.assertEqual(snap_split["summary"]["neural_shadow"]["versions"]["model_state"], "version_mismatch")
+            self.assertFalse(snap_split["summary"]["neural_shadow"]["versions"]["deployment_eligible"])
 
     # B3 regression (part 1): action-response audit must reject inverted, null, negative-Wh, and partial-pass models
     def test_b3_action_response_rejects_inverted_null_and_partial_pass(self):

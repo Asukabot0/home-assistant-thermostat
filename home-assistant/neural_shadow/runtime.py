@@ -129,8 +129,95 @@ class ShadowRuntimeConfig:
     horizons_minutes: tuple[int, ...] = HORIZONS_MINUTES
     settle_window_seconds: float = DEFAULT_SETTLE_WINDOW_SECONDS
     min_wh_label_coverage: float = DEFAULT_MIN_WH_COVERAGE
+    poll_interval_seconds: float = 300.0
     cycle_timeout_seconds: float = 25.0
     scoring_policy: ScoringPolicy = ScoringPolicy()
+
+
+def write_fail_closed_outputs(
+    output_dir: Path,
+    *,
+    health_state: str,
+    model_state: str,
+    error_type: str,
+    error_detail: str | None = None,
+    poll_interval_seconds: float = 300.0,
+    now_ts: float | None = None,
+) -> dict[str, Any]:
+    """Atomically write fail-closed status, health, and report outputs so stale ready_to_use never persists."""
+    wall_now = time.time() if now_ts is None else float(now_ts)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    err_info = {
+        "at": wall_now,
+        "at_utc": _iso_utc(wall_now),
+        "type": error_type,
+        "detail": error_detail,
+    }
+    status = {
+        "schema_version": 1,
+        "shadow_only": True,
+        "actuation_capable": False,
+        "generated_at": wall_now,
+        "generated_at_utc": _iso_utc(wall_now),
+        "poll_interval_seconds": float(poll_interval_seconds),
+        "state": health_state,
+        "declined": True,
+        "model": {
+            "model_id": None,
+            "model_state": model_state,
+            "deployment_eligible": False,
+            "model_arch_version": MODEL_ARCH_VERSION,
+            "feature_version": FEATURE_VERSION,
+            "constraint_version": CONSTRAINT_VERSION,
+            "config_fingerprint": None,
+            "training_cutoff_ts": None,
+            "training_cutoff_utc": None,
+            "parameter_count": None,
+            "data_origin": None,
+            "readiness_reasons": [health_state],
+        },
+        "counts": {
+            "sealed_predictions": 0,
+            "declined_predictions": 0,
+            "settled_horizons": 0,
+            "factual_settlement_kinds": {},
+            "recommended_execution_statuses": {},
+            "decline_reasons": {},
+        },
+        "factual_scores": {},
+        "latest_sealed": None,
+        "last_error": err_info,
+    }
+    health = {
+        "at": wall_now,
+        "at_utc": _iso_utc(wall_now),
+        "state": health_state,
+        "model_state": model_state,
+        "declined": True,
+        "poll_interval_seconds": float(poll_interval_seconds),
+        "last_error": err_info,
+    }
+    report_md = "\n".join(
+        [
+            "# Neural-Network Thermostat Shadow Report",
+            "",
+            f"- Generated (UTC): `{_iso_utc(wall_now)}`",
+            f"- Status: **{health_state}** (fail-closed; recommendations declined)",
+            f"- Model state: `{model_state}` (`deployment_eligible=false`)",
+            f"- Error type: `{error_type}`",
+            "",
+        ]
+    )
+    _atomic_write_text(
+        output_dir / "neural-shadow-status.json",
+        json.dumps(status, indent=2, ensure_ascii=False) + "\n",
+    )
+    _atomic_write_text(
+        output_dir / "neural-shadow-health.json",
+        json.dumps(health, indent=2, ensure_ascii=False) + "\n",
+    )
+    _atomic_write_text(output_dir / "neural-shadow-report.md", report_md)
+    return {"status": status, "health": health}
 
 
 class ShadowRuntime:
@@ -163,7 +250,18 @@ class ShadowRuntime:
         site: SiteConfig,
         runtime_cfg: ShadowRuntimeConfig,
         checkpoint_path: Path | None,
+        *,
+        expected_arch_version: str = MODEL_ARCH_VERSION,
+        expected_feature_version: str = FEATURE_VERSION,
     ) -> "ShadowRuntime":
+        if expected_arch_version != MODEL_ARCH_VERSION:
+            raise ModelVersionMismatchError(
+                f"configured_arch_version_mismatch:{expected_arch_version}!={MODEL_ARCH_VERSION}"
+            )
+        if expected_feature_version != FEATURE_VERSION:
+            raise ModelVersionMismatchError(
+                f"configured_feature_version_mismatch:{expected_feature_version}!={FEATURE_VERSION}"
+            )
         spec = build_feature_spec(
             site,
             history_minutes=runtime_cfg.history_minutes,
@@ -179,8 +277,8 @@ class ShadowRuntime:
             checkpoint_path,
             expected_site=site,
             expected_spec=spec,
-            expected_arch_version=MODEL_ARCH_VERSION,
-            expected_feature_version=FEATURE_VERSION,
+            expected_arch_version=expected_arch_version,
+            expected_feature_version=expected_feature_version,
             strict=True,
         )
         return cls(site, runtime_cfg, artifact)
@@ -661,6 +759,9 @@ class ShadowRuntime:
             "actuation_capable": False,
             "generated_at": now_ts,
             "generated_at_utc": _iso_utc(now_ts),
+            "poll_interval_seconds": float(self.cfg.poll_interval_seconds),
+            "state": "degraded" if last_error is not None else "healthy",
+            "declined": bool(latest_sealed["declined"]) if latest_sealed is not None else True,
             "site": self.site.summary_dict(),
             "model": {
                 "model_id": self.artifact.model_id,
@@ -713,6 +814,8 @@ class ShadowRuntime:
             "at_utc": _iso_utc(now_ts),
             "state": "degraded" if last_error is not None else "healthy",
             "model_state": self.artifact.model_state.value,
+            "declined": bool(latest_sealed["declined"]) if latest_sealed is not None else True,
+            "poll_interval_seconds": float(self.cfg.poll_interval_seconds),
             "sealed_predictions": len(sealed),
             "settled_horizons": len(settled),
             "latest_cutoff_utc": latest_sealed["cutoff_utc"] if latest_sealed else None,
@@ -820,16 +923,37 @@ class ShadowRuntime:
                 "type": type(exc).__name__,
                 "stack": frames[-6:],
             }
+            if isinstance(exc, ModelVersionMismatchError):
+                try:
+                    written = write_fail_closed_outputs(
+                        self.cfg.output_dir,
+                        health_state="version_mismatch",
+                        model_state="version_mismatch",
+                        error_type=type(exc).__name__,
+                        error_detail=str(exc),
+                        poll_interval_seconds=self.cfg.poll_interval_seconds,
+                        now_ts=wall_now,
+                    )
+                    status = written["status"]
+                except OSError:
+                    status = None
+                return {"ok": False, "error": err_info, "status": status}
             try:
                 status = self.build_status_and_reports(now_ts=wall_now, last_error=err_info)
             except Exception:
-                # Even if SQLite/report fails, write minimal isolated health marker.
+                # Even if SQLite/report fails, fail closed in BOTH status.json and health.json.
                 status = None
                 try:
-                    _atomic_write_text(
-                        self.cfg.output_dir / "neural-shadow-health.json",
-                        json.dumps({"at": wall_now, "state": "error", "last_error": err_info}, indent=2) + "\n",
+                    written = write_fail_closed_outputs(
+                        self.cfg.output_dir,
+                        health_state="error",
+                        model_state="unavailable",
+                        error_type=type(exc).__name__,
+                        error_detail=None,
+                        poll_interval_seconds=self.cfg.poll_interval_seconds,
+                        now_ts=wall_now,
                     )
+                    status = written["status"]
                 except OSError:
                     pass
             return {"ok": False, "error": err_info, "status": status}

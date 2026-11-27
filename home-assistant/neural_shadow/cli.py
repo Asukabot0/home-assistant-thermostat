@@ -25,7 +25,9 @@ from typing import Any
 from . import (
     DEFAULT_HISTORY_MINUTES,
     DataOrigin,
+    FEATURE_VERSION,
     HORIZONS_MINUTES,
+    MODEL_ARCH_VERSION,
     STEP_MINUTES,
 )
 from .config import load_default_example_config, load_site_config_from_files
@@ -42,7 +44,7 @@ from .data_pipeline import (
 )
 from .evaluate import evaluate_all_models
 from .nn_model import ModelVersionMismatchError, load_checkpoint
-from .runtime import ShadowRuntime, ShadowRuntimeConfig
+from .runtime import ShadowRuntime, ShadowRuntimeConfig, write_fail_closed_outputs
 from .scoring import ScoringPolicy
 from .synthetic import generate_synthetic_history
 from .train import ReadinessGates, forward_chain_split, forward_chain_split_dataset, train_and_evaluate
@@ -194,12 +196,61 @@ def _build_runtime_from_config(cfg_path: Path) -> tuple[ShadowRuntime, Any]:
         horizons_minutes=tuple(int(h) for h in rt.get("horizons_minutes", HORIZONS_MINUTES)),
         settle_window_seconds=float(rt.get("settle_window_seconds", 300.0)),
         min_wh_label_coverage=float(rt.get("min_wh_label_coverage", DEFAULT_MIN_WH_COVERAGE)),
+        poll_interval_seconds=float(rt.get("poll_interval_seconds", 300.0)),
         cycle_timeout_seconds=float(rt.get("cycle_timeout_seconds", 25.0)),
         scoring_policy=scoring_policy,
     )
     ckpt = Path(mod["artifact_dir"]) / mod["checkpoint_name"]
-    runtime = ShadowRuntime.from_checkpoint_path(site, rcfg, ckpt if ckpt.is_file() else None)
+    expected_arch = str(mod.get("expected_arch_version") or MODEL_ARCH_VERSION)
+    expected_feat = str(mod.get("expected_feature_version") or FEATURE_VERSION)
+    runtime = ShadowRuntime.from_checkpoint_path(
+        site,
+        rcfg,
+        ckpt if ckpt.is_file() else None,
+        expected_arch_version=expected_arch,
+        expected_feature_version=expected_feat,
+    )
     return runtime, raw
+
+
+def _fail_closed_from_config(cfg_path: Path, exc: Exception, *, is_mismatch: bool) -> dict[str, Any]:
+    """Best-effort atomic fail-closed update of status, health, and report when runtime startup fails."""
+    health_state = "version_mismatch" if is_mismatch else "unavailable"
+    model_state = "version_mismatch" if is_mismatch else "unavailable"
+    poll_s = 300.0
+    out_dir: Path | None = None
+    try:
+        raw = json.loads(cfg_path.read_text(encoding="utf-8"))
+        if isinstance(raw, dict):
+            poll_s = float((raw.get("runtime") or {}).get("poll_interval_seconds", 300.0))
+            out_raw = (raw.get("outputs") or {}).get("output_dir")
+            if out_raw:
+                out_dir = Path(out_raw)
+    except Exception:
+        out_dir = None
+
+    err_payload = {
+        "at": time.time(),
+        "state": health_state,
+        "model_state": model_state,
+        "declined": True,
+        "error": type(exc).__name__,
+        "detail": str(exc),
+    }
+    if out_dir is not None:
+        try:
+            write_fail_closed_outputs(
+                out_dir,
+                health_state=health_state,
+                model_state=model_state,
+                error_type=type(exc).__name__,
+                error_detail=str(exc),
+                poll_interval_seconds=poll_s,
+                now_ts=err_payload["at"],
+            )
+        except OSError:
+            pass
+    return err_payload
 
 
 def _make_production_loader(raw_cfg: dict[str, Any]):
@@ -274,28 +325,47 @@ def _cmd_seal_settle_report(args: argparse.Namespace) -> int:
 
 
 def _cmd_run_once(args: argparse.Namespace) -> int:
+    cfg_path = Path(args.config)
     try:
-        runtime, raw_cfg = _build_runtime_from_config(Path(args.config))
+        runtime, raw_cfg = _build_runtime_from_config(cfg_path)
     except ModelVersionMismatchError as exc:
-        # Fail closed cleanly without crashing container supervisor or disturbing live controller
-        raw = json.loads(Path(args.config).read_text(encoding="utf-8"))
-        out_dir = Path(raw["outputs"]["output_dir"])
-        out_dir.mkdir(parents=True, exist_ok=True)
-        err_payload = {
-            "at": time.time(),
-            "state": "version_mismatch",
-            "declined": True,
-            "error": type(exc).__name__,
-            "detail": str(exc),
-        }
-        (out_dir / "neural-shadow-health.json").write_text(json.dumps(err_payload, indent=2) + "\n", encoding="utf-8")
+        # Fail closed outwardly (status.json + health.json + report.md) without disturbing live controller
+        err_payload = _fail_closed_from_config(cfg_path, exc, is_mismatch=True)
         print(json.dumps({"ok": False, **err_payload}, indent=2))
         return 2
+    except Exception as exc:
+        err_payload = _fail_closed_from_config(cfg_path, exc, is_mismatch=False)
+        print(json.dumps({"ok": False, **err_payload}, indent=2))
+        return 1
 
     loader = _make_production_loader(raw_cfg)
     result = runtime.run_isolated_cycle(loader)
     print(json.dumps({"ok": result["ok"], "error": result.get("error"), "sealed_prediction_id": result.get("sealed_prediction_id"), "newly_settled_count": result.get("newly_settled_count")}, indent=2))
     return 0 if result["ok"] else 1
+
+
+def _run_serve_iteration(cfg_path: Path) -> tuple[bool, float]:
+    """Execute one serve loop iteration, failing closed outwardly on version mismatch or build errors."""
+    poll_s = 300.0
+    try:
+        raw = json.loads(cfg_path.read_text(encoding="utf-8"))
+        if isinstance(raw, dict):
+            poll_s = float((raw.get("runtime") or {}).get("poll_interval_seconds", 300.0))
+        runtime, raw_cfg = _build_runtime_from_config(cfg_path)
+        loader = _make_production_loader(raw_cfg)
+        result = runtime.run_isolated_cycle(loader)
+        if not result["ok"]:
+            LOG.warning("Neural shadow cycle failed isolated: %s", (result.get("error") or {}).get("type"))
+            return False, poll_s
+        return True, poll_s
+    except ModelVersionMismatchError as exc:
+        LOG.warning("Neural shadow version mismatch (failing closed): %s", exc)
+        _fail_closed_from_config(cfg_path, exc, is_mismatch=True)
+        return False, poll_s
+    except Exception as exc:
+        LOG.warning("Neural shadow outer loop isolated error (failing closed): %s", type(exc).__name__)
+        _fail_closed_from_config(cfg_path, exc, is_mismatch=False)
+        return False, poll_s
 
 
 def _cmd_serve(args: argparse.Namespace) -> int:
@@ -306,17 +376,7 @@ def _cmd_serve(args: argparse.Namespace) -> int:
     cfg_path = Path(args.config)
     LOG.info("Neural thermostat shadow service starting (read-only, zero actuation path)")
     while not stop.is_set():
-        poll_s = 300.0
-        try:
-            raw = json.loads(cfg_path.read_text(encoding="utf-8"))
-            poll_s = float(raw.get("runtime", {}).get("poll_interval_seconds", 300.0))
-            runtime, raw_cfg = _build_runtime_from_config(cfg_path)
-            loader = _make_production_loader(raw_cfg)
-            result = runtime.run_isolated_cycle(loader)
-            if not result["ok"]:
-                LOG.warning("Neural shadow cycle failed isolated: %s", (result.get("error") or {}).get("type"))
-        except Exception as exc:
-            LOG.warning("Neural shadow outer loop isolated error: %s", type(exc).__name__)
+        _, poll_s = _run_serve_iteration(cfg_path)
         stop.wait(max(10.0, poll_s))
     LOG.info("Neural thermostat shadow service stopped cleanly")
     return 0

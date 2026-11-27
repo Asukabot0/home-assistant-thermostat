@@ -555,11 +555,12 @@ def release_groups(audit, frames, power, meter_by_unit, zones, commands, start, 
 
 
 def read_neural_shadow(folder, start, end, schema):
-    """Read-only, exception-isolated export of neural shadow scores, gaps, and versions."""
+    """Read-only, exception-isolated export of neural shadow scores, gaps, health, freshness, and versions."""
     acquired = time()
     try:
         folder = Path(folder)
         status_path = folder / "neural-shadow-status.json"
+        health_path = folder / "neural-shadow-health.json"
         scores_path = folder / "neural-shadow-scores.jsonl"
 
         pub_token = lambda v: v if isinstance(v, str) and re.fullmatch(r"[a-z][a-z0-9_-]{0,55}", v) else None
@@ -595,6 +596,19 @@ def read_neural_shadow(folder, start, end, schema):
                 else:
                     status_error = "InvalidStatusType"
 
+        health_raw = {}
+        health_error = None
+        if health_path.is_file():
+            try:
+                loaded_health = load_json(health_path)
+            except Exception as exc:
+                health_error = type(exc).__name__
+            else:
+                if isinstance(loaded_health, dict):
+                    health_raw = loaded_health
+                else:
+                    health_error = "InvalidHealthType"
+
         model_raw = status_raw.get("model")
         if model_raw is not None and not isinstance(model_raw, dict):
             status_error = status_error or "InvalidModelType"
@@ -625,6 +639,73 @@ def read_neural_shadow(folder, start, end, schema):
             "data_origin": pub_token(model_info.get("data_origin")),
             "parameter_count": safe_int(model_info.get("parameter_count"), low=0),
         }
+
+        # Check health state, fail-closed status, and freshness (> 2 * poll_interval_seconds -> stale/unavailable)
+        raw_poll = safe_num(status_raw.get("poll_interval_seconds"))
+        if raw_poll is None or not (10.0 <= raw_poll <= 86400.0):
+            raw_poll = safe_num(health_raw.get("poll_interval_seconds"))
+        poll_s = raw_poll if (raw_poll is not None and 10.0 <= raw_poll <= 86400.0) else 300.0
+        max_stale_s = 2.0 * poll_s
+
+        status_ts = safe_num(status_raw.get("generated_at"))
+        if status_ts is None:
+            gen_utc = iso_token(status_raw.get("generated_at_utc"))
+            status_ts = stamp(gen_utc) if gen_utc is not None else None
+        health_ts = safe_num(health_raw.get("at"))
+        if health_ts is None:
+            h_utc = iso_token(health_raw.get("at_utc"))
+            health_ts = stamp(h_utc) if h_utc is not None else None
+        fresh_ts_candidates = [t for t in (status_ts, health_ts) if t is not None]
+        latest_ts = max(fresh_ts_candidates) if fresh_ts_candidates else None
+
+        health_state = pub_token(health_raw.get("state"))
+        status_state = pub_token(status_raw.get("state"))
+        health_model_state = pub_token(health_raw.get("model_state"))
+        health_overrides_status = health_ts is None or status_ts is None or health_ts >= status_ts - 1.0
+
+        age_vs_now = (acquired - latest_ts) if latest_ts is not None else None
+        age_vs_end = (end - latest_ts) if latest_ts is not None else None
+        is_stale = (
+            latest_ts is None
+            or (age_vs_now is not None and age_vs_now > max_stale_s)
+            or (age_vs_end is not None and age_vs_end > max_stale_s)
+        )
+
+        fail_reason = None
+        outward_status = "available"
+        if status_error is not None or health_error is not None:
+            outward_status = "unavailable"
+            fail_reason = "corrupt_status_or_health"
+            versions["model_state"] = "unavailable"
+            versions["deployment_eligible"] = False
+        elif not (status_path.is_file() or health_path.is_file()):
+            outward_status = "unavailable"
+            fail_reason = "status_missing"
+            versions["model_state"] = "unavailable"
+            versions["deployment_eligible"] = False
+        elif (
+            (health_overrides_status and (health_state == "version_mismatch" or health_model_state == "version_mismatch"))
+            or status_state == "version_mismatch"
+            or versions["model_state"] == "version_mismatch"
+        ):
+            outward_status = "unavailable"
+            fail_reason = "version_mismatch"
+            versions["model_state"] = "version_mismatch"
+            versions["deployment_eligible"] = False
+        elif (
+            (health_overrides_status and health_state in {"unavailable", "error"})
+            or status_state in {"unavailable", "error"}
+            or versions["model_state"] == "unavailable"
+        ):
+            outward_status = "unavailable"
+            fail_reason = health_state if (health_overrides_status and health_state in {"unavailable", "error"}) else (status_state or "unavailable")
+            versions["model_state"] = "unavailable"
+            versions["deployment_eligible"] = False
+        elif is_stale:
+            outward_status = "unavailable"
+            fail_reason = "stale"
+            versions["model_state"] = "stale"
+            versions["deployment_eligible"] = False
 
         rows = []
         skipped_malformed_rows = 0
@@ -738,9 +819,11 @@ def read_neural_shadow(folder, start, end, schema):
                 "coverage_gap_count": gaps_n,
                 "has_coverage_gap": gaps_n > 0 or (len(h_rows) == 0),
             }
-        has_valid_source = (status_path.is_file() and status_error is None) or (scores_path.is_file() and status_error is None)
         summary = {
-            "status": "available" if has_valid_source else "unavailable",
+            "status": outward_status,
+            "reason": fail_reason,
+            "stale": bool(is_stale),
+            "health_state": health_state,
             "versions": versions,
             "window_counts": {
                 "settled_total": len(rows),
@@ -753,16 +836,22 @@ def read_neural_shadow(folder, start, end, schema):
             },
             "window_factual_scores": by_horizon,
         }
-        if status_error is not None:
-            summary["error"] = status_error
+        err_out = status_error or health_error
+        if err_out is not None:
+            summary["error"] = err_out
         watermark = {
             **source_watermark(rows, "horizon_end_ts", acquired, start, end),
             "status": summary["status"],
+            "reason": fail_reason,
+            "stale": bool(is_stale),
+            "health_state": health_state,
             "generated_at_utc": iso_token(status_raw.get("generated_at_utc")),
+            "health_at_utc": iso_token(health_raw.get("at_utc")),
+            "status_age_seconds": round(max(0.0, age_vs_now), 1) if age_vs_now is not None else None,
             "skipped_malformed_rows": skipped_malformed_rows,
         }
-        if status_error is not None:
-            watermark["error"] = status_error
+        if err_out is not None:
+            watermark["error"] = err_out
         return rows, summary, watermark
     except Exception as error:
         err_name = type(error).__name__
