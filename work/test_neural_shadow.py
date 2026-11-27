@@ -49,6 +49,7 @@ from neural_shadow.data_pipeline import (  # noqa: E402
     build_feature_spec,
     deduplicate_temp_reports,
     extract_history_window,
+    ingest_evidence_archives,
     ingest_production_readonly,
     integrate_power_interval,
 )
@@ -259,6 +260,131 @@ class NeuralShadowRegressionTests(unittest.TestCase):
         self.assertEqual(spec2.n_zones, 3)
         self.assertIn("balcony", spec2.env_sensor_names)
         self.assertNotEqual(site2.config_fingerprint, self.site.config_fingerprint)
+
+    # B4 regression: archive ingestion must NEVER mix auxiliary/constraint sensor readings into primary zone labels
+    def test_b4_archive_ingestion_excludes_auxiliary_and_constraint_sensors(self):
+        from zipfile import ZipFile
+
+        topo = deepcopy(self.site.raw_topology)
+        topo["sensors"]["lounge_auxiliary"]["enabled"] = True
+        topo["sensors"]["lounge_constraint"] = {
+            "role": "constraint",
+            "enabled": True,
+            "entity": "sensor.example_lounge_constraint",
+            "max_age_seconds": 1200,
+        }
+        topo["zones"]["lounge"]["sensors"] = ["lounge_auxiliary", "lounge_constraint"]
+
+        schema = telemetry_evidence.PublicSchema("b" * 64, self.site.raw_rooms, topo)
+        effective = schema.configuration(self.site.raw_rooms, topo, self.site.policy)
+        lounge_alias = schema.aliases["lounge"]
+        sleep_alias = schema.aliases["sleep"]
+        lounge_primary_alias = schema.aliases["lounge_primary"]
+        lounge_aux_alias = schema.aliases["lounge_auxiliary"]
+        lounge_cons_alias = schema.aliases["lounge_constraint"]
+        sleep_primary_alias = schema.aliases["sleep_primary"]
+        lounge_primary_src = schema.aliases[self.site.raw_rooms["living"]["temperature"]]
+        lounge_aux_src = schema.aliases["sensor.example_lounge_auxiliary"]
+        lounge_cons_src = schema.aliases["sensor.example_lounge_constraint"]
+        sleep_primary_src = schema.aliases[self.site.raw_rooms["bedroom"]["temperature"]]
+
+        base = 1_800_000_000.0
+        temp_rows = []
+        for i in range(6):
+            t_p = base + i * 300.0
+            # Alternating primary (24.0C), auxiliary (27.5C), and constraint (29.0C) under the SAME lounge zone
+            temp_rows.append(
+                {
+                    "id": f"p_lounge_{i}",
+                    "zone": lounge_alias,
+                    "sensor": lounge_primary_alias,
+                    "source": [lounge_primary_src, "ha_report"],
+                    "report_at": t_p,
+                    "temperature": 24.0,
+                    "quality": "fresh",
+                }
+            )
+            temp_rows.append(
+                {
+                    "id": f"aux_lounge_{i}",
+                    "zone": lounge_alias,
+                    "sensor": lounge_aux_alias,
+                    "source": [lounge_aux_src, "ha_report"],
+                    "report_at": t_p + 60.0,
+                    "temperature": 27.5,
+                    "quality": "fresh",
+                }
+            )
+            temp_rows.append(
+                {
+                    "id": f"cons_lounge_{i}",
+                    "zone": lounge_alias,
+                    "sensor": lounge_cons_alias,
+                    "source": [lounge_cons_src, "ha_report"],
+                    "report_at": t_p + 120.0,
+                    "temperature": 29.0,
+                    "quality": "fresh",
+                }
+            )
+            temp_rows.append(
+                {
+                    "id": f"p_sleep_{i}",
+                    "zone": sleep_alias,
+                    "sensor": sleep_primary_alias,
+                    "source": [sleep_primary_src, "ha_report"],
+                    "report_at": t_p,
+                    "temperature": 23.2,
+                    "quality": "fresh",
+                }
+            )
+        # Also include a legacy frame row (no "sensor" key) for lounge primary, plus a substring trap
+        temp_rows.append(
+            {
+                "id": "legacy_frame_primary",
+                "zone": lounge_alias,
+                "source": lounge_primary_alias,
+                "report_at": base + 2000.0,
+                "temperature": 24.1,
+            }
+        )
+        temp_rows.append(
+            {
+                "id": "legacy_aux_no_sensor_key",
+                "zone": lounge_alias,
+                "source": lounge_aux_src,
+                "report_at": base + 2060.0,
+                "temperature": 28.8,
+            }
+        )
+        temp_rows.append(
+            {
+                "id": "substring_trap",
+                "zone": "unknown_zone",
+                "source": "sensor.living_auxiliary_trap",
+                "report_at": base + 2120.0,
+                "temperature": 31.0,
+            }
+        )
+
+        with TemporaryDirectory() as tmp:
+            arc = Path(tmp) / "telemetry-b4.zip"
+            with ZipFile(arc, "w") as zf:
+                zf.writestr("effective-config.json", json.dumps(effective))
+                zf.writestr(
+                    "raw/temperature-reports.jsonl",
+                    "".join(json.dumps(r) + "\n" for r in temp_rows),
+                )
+            hist = ingest_evidence_archives([arc])
+
+        # Strictly 2 independent temperature label zones
+        self.assertEqual(len(hist.site.zone_names), 2)
+        lounge_reps = hist.zone_temp_reports[lounge_alias]
+        sleep_reps = hist.zone_temp_reports[sleep_alias]
+        # 6 audit primary rows + 1 legacy frame primary row = 7; ZERO auxiliary/constraint/substring readings!
+        self.assertEqual(len(lounge_reps), 7)
+        self.assertEqual({round(r.value_c, 2) for r in lounge_reps}, {24.0, 24.1})
+        self.assertEqual(len(sleep_reps), 6)
+        self.assertEqual({round(r.value_c, 2) for r in sleep_reps}, {23.2})
 
     # 4. Duplicate cache vs same-value new reports (temperature & power)
     def test_duplicate_cache_vs_same_value_new_report(self):

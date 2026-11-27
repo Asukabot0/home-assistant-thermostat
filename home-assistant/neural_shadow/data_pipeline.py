@@ -953,6 +953,15 @@ def ingest_evidence_archives(
         raise ValueError("Archive does not contain effective-config.json or effective-config.redacted.json")
 
     entity_to_zone, unit_to_zone = _build_zone_lookup(site)
+    primary_sensor_to_zone = {z.primary_sensor: z.name for z in site.zones}
+    non_primary_sensors = {
+        s for z in site.zones for s in (*z.auxiliary_sensors, *z.constraint_sensors)
+    }
+    non_primary_entities = {
+        sdef["entity"]
+        for sname, sdef in (site.raw_topology.get("sensors") or {}).items()
+        if sname in non_primary_sensors and sdef.get("entity")
+    }
     power_entity_to_unit: dict[str, str] = {}
     for act in site.actuators:
         power_entity_to_unit[act.power_entity] = act.name
@@ -1017,15 +1026,26 @@ def ingest_evidence_archives(
                         )
                     )
                 else:
+                    if role not in {None, "primary", "zone_primary"}:
+                        continue
+                    sensor = row.get("sensor")
                     zone = row.get("zone")
-                    if zone not in site.zone_names:
-                        src = row.get("source")
-                        if isinstance(src, str) and "bedroom" in src:
-                            zone = "sleep" if "sleep" in site.zone_names else site.zone_names[0]
-                        elif isinstance(src, str) and "living" in src:
-                            zone = "lounge" if "lounge" in site.zone_names else site.zone_names[-1]
-                        else:
-                            zone = entity_to_zone.get(src[0] if isinstance(src, list) and src else str(src))
+                    src = row.get("source")
+                    src_entity = src[0] if isinstance(src, list) and src else (src if isinstance(src, str) else None)
+                    if sensor is not None:
+                        # Audit-derived temperature-reports include primary AND auxiliary/constraint inputs
+                        # under the same zone; accept ONLY the zone's primary sensor.
+                        primary_zone = primary_sensor_to_zone.get(sensor)
+                        if primary_zone is None or (zone is not None and zone != primary_zone):
+                            continue
+                        zone = primary_zone
+                    else:
+                        # Frame-derived rows omit "sensor"; reject known non-primary sources and resolve
+                        # strictly by primary entity mapping (never by substring heuristics).
+                        if src_entity in non_primary_entities or src_entity in non_primary_sensors:
+                            continue
+                        if zone not in site.zone_names:
+                            zone = entity_to_zone.get(src_entity) if src_entity is not None else None
                     if zone in site.zone_names and 0 < val <= 50:
                         raw_temp.append(
                             TempReport(
@@ -1104,8 +1124,17 @@ def ingest_evidence_archives(
                     obs_at = _ts(val.get("observed_at")) or tick
                     t_rep = _ts(val.get("temperature_report_at"))
                     measured = _num(val.get("measured"))
+                    tsrc = val.get("temperature_source")
+                    tsrc_entity = tsrc[0] if isinstance(tsrc, list) and tsrc else (tsrc if isinstance(tsrc, str) else None)
                     zone = site.actuator_by_name(unit).home_zone
-                    if zone in site.zone_names and t_rep is not None and measured is not None and 0 < measured <= 50:
+                    if (
+                        zone in site.zone_names
+                        and tsrc_entity not in non_primary_entities
+                        and tsrc_entity not in non_primary_sensors
+                        and t_rep is not None
+                        and measured is not None
+                        and 0 < measured <= 50
+                    ):
                         raw_temp.append(
                             TempReport(
                                 zone=zone,
