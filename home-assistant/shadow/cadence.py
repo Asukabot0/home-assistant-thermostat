@@ -59,7 +59,7 @@ def journal_actions(journals, since, now):
             }
 
 
-def latest_beeps(db, now, journals=JOURNALS, *, for_reversal=False):
+def latest_beeps(db, now, journals=JOURNALS, *, for_reversal=False, shared_groups=None):
     """Find the last beep, with an exception only for the same room's easing step."""
     since = now - 86400
     records = {(r["room"], round(r["sent_at"], 3)): r for r in journal_actions(journals, since, now)}
@@ -94,14 +94,18 @@ def latest_beeps(db, now, journals=JOURNALS, *, for_reversal=False):
         if record.get("purpose") != REVERSAL_EASING or record.get("relay") != "accepted":
             if room not in reversal or event.at > reversal[room].at:
                 reversal[room] = event
+    groups = (SHARED_ROOMS,) if shared_groups is None else tuple(g for g in shared_groups if len(g) >= 2)
     if for_reversal:
-        for room, peer in (SHARED_ROOMS, SHARED_ROOMS[::-1]):
-            if peer in by_room and (room not in reversal or by_room[peer].at > reversal[room].at):
-                reversal[room] = by_room[peer]
+        for group in groups:
+            for room in group:
+                for peer in group:
+                    if peer != room and peer in by_room and (room not in reversal or by_room[peer].at > reversal[room].at):
+                        reversal[room] = by_room[peer]
         return reversal
-    shared = max((by_room[room] for room in SHARED_ROOMS if room in by_room), key=lambda event: event.at, default=None)
-    if shared is not None:
-        by_room.update(dict.fromkeys(SHARED_ROOMS, shared))
+    for group in groups:
+        shared = max((by_room[room] for room in group if room in by_room), key=lambda event: event.at, default=None)
+        if shared is not None:
+            by_room.update(dict.fromkeys(group, shared))
     return by_room
 
 

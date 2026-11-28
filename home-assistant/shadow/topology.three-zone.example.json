@@ -1,0 +1,26 @@
+{
+  "schema": 1,
+  "observation_version": "site-star-1",
+  "sensors": {
+    "sleep_primary": {"role": "primary", "from_actuator": "bedroom", "max_age_seconds": 1200},
+    "lounge_primary": {"role": "primary", "from_actuator": "living", "max_age_seconds": 1200},
+    "lounge_auxiliary": {"role": "auxiliary", "enabled": false, "entity": "sensor.example_lounge_auxiliary", "weight": 0.3},
+    "office_primary": {"role": "primary", "from_actuator": "study", "max_age_seconds": 1200},
+    "balcony": {"role": "environment", "enabled": false, "entity": "sensor.example_balcony_temperature", "max_age_seconds": 7200}
+  },
+  "zones": {
+    "sleep": {"primary": "sleep_primary", "fusion": "primary", "target": {"actuator": "bedroom"}},
+    "lounge": {"primary": "lounge_primary", "sensors": ["lounge_auxiliary"], "fusion": "primary", "target": {"actuator": "living"}},
+    "office": {"primary": "office_primary", "fusion": "primary", "target": {"actuator": "study"}}
+  },
+  "actuators": {
+    "bedroom": {"zone": "sleep", "influences": {"sleep": 1, "lounge": 0.35}, "priority": 0, "lock_group": "bedroom"},
+    "living": {"zone": "lounge", "influences": {"lounge": 1, "sleep": 0.35, "office": 0.35}, "priority": 0, "lock_group": "living"},
+    "study": {"zone": "office", "influences": {"office": 1, "lounge": 0.35}, "priority": 0, "lock_group": "study"}
+  },
+  "connections": [
+    {"from": "sleep", "to": "lounge", "coupling": 0.35},
+    {"from": "lounge", "to": "office", "coupling": 0.35}
+  ],
+  "opposite_operation": {"enabled": false, "max_cross_influence": 0.1}
+}

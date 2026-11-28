@@ -31,7 +31,7 @@ The Compose files are sidecar templates for an existing Home Assistant Container
 
 Automatic stops and subsequent starts require an independently verified local off-power reference for each device. Supply `verified_off_power` with the corresponding `entity` and an exclusive `ceiling_w` from actual confirmed stopped measurements. The examples omit that value so that powering off and restarting equipment is gated until commissioning. Mode and setting echoes alone are proxy evidence.
 
-Use `topology.example.json` to configure sensors, zones and equipment influence. See [unified control and evidence scheduling](docs/unified-control.md) for the state machine, production deployment, rollback and telemetry installation.
+Use `topology.example.json` (two zones with shared living/study temperature) or `topology.three-zone.example.json` (three independent zones in a bedroom–living–study star layout with independent lock groups and `opposite_operation.enabled: false`) to configure sensors, zones and equipment influence. See [unified control and evidence scheduling](docs/unified-control.md) for the state machine, production deployment, rollback and telemetry installation.
 
 ## Web dashboard (read-only)
 

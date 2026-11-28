@@ -404,8 +404,8 @@ def continuous_entity(recorder, entity, since, end, qualifies):
     ))
 
 
-def load_room(db, rooms, recorder, code, config, tick, actual_beep, shared_simulated_beep, session=None):
-    # Read ordinary observational snapshots. The configured source for the study is the living room.
+def load_room(db, rooms, recorder, code, config, tick, actual_beep, shared_simulated_beep, session=None, *, lock_group=None):
+    # Read ordinary observational snapshots using each room's configured sensor.
     history = rooms.execute("SELECT * FROM samples WHERE room=? AND tick BETWEEN ? AND ? ORDER BY tick",
                             (code, tick - HISTORY, tick)).fetchall()
     latest = history[-1] if history and tick-history[-1]["tick"] <= 120 else None
@@ -500,12 +500,13 @@ def load_room(db, rooms, recorder, code, config, tick, actual_beep, shared_simul
         activity = identify(tick, latest, [point for point in recent if point[0] >= tick - 900], model, history)
     else:
         activity = Activity("未知", "未知", "等待该分钟的 HA 观测")
-    active_since = learning_active(session, code, virtual, tick) if source_fresh and fresh_power and not power_without_room_sample else None
+    active_since = (learning_active(session, code, virtual, tick, lock_group=lock_group)
+                    if source_fresh and fresh_power and not power_without_room_sample else None)
     learning_power_span = bands.get("learning", {}).get("seconds", 0)
     if active_since is not None and learning_power_span >= EPISODE_SECONDS:
         since = tick - EPISODE_SECONDS
         auto = continuous_entity(recorder, thermostat, since, tick+60,
-                                 lambda row: learning_active(session, code, row, tick) is not None
+                                 lambda row: learning_active(session, code, row, tick, lock_group=lock_group) is not None
                                  and (fields := json.loads(row["shared_attrs"] or "{}")).get("temperature_entity_id") == attrs.get("temperature_entity_id")
                                  and numeric(fields.get("temperature")) == latest["desired"]
                                  and power_context(fields, config["power"]) == context)
@@ -560,21 +561,56 @@ def load_room(db, rooms, recorder, code, config, tick, actual_beep, shared_simul
     return current
 
 
-def coordinate(current):
-    if not all(room in current for room in SHARED_ROOMS):
-        return  # Compatibility report for historical shared-room advice.
-    living, study = (current[room] for room in SHARED_ROOMS)
-    proposals = [room for room in (living, study) if room["send_after"] is not None]
-    if not proposals:
-        return
-    if ({living["mode"], study["mode"]} == {"heat", "cool"}
-        or not all(room["source_fresh"] for room in (living,study))):
-        for room in proposals:
-            room.update(hypothetical_send=False, send_after=None, reason="共享参考温度存在方向冲突或数据过期")
-        return
-    _, *waiting = sorted(proposals, key=lambda item: item["send_after"])
-    for room in waiting:
-        room.update(hypothetical_send=False, send_after=None, reason="客厅与书房共享参考温度，本轮只计一条建议")
+def shared_sensor_groups(config):
+    by_sensor = {}
+    for room, settings in config.items():
+        if sensor := settings.get("temperature"):
+            by_sensor.setdefault(sensor, []).append(room)
+    return tuple(tuple(rooms) for rooms in by_sensor.values() if len(rooms) >= 2)
+
+
+def independent_temperature_rooms(config):
+    if not all(settings.get("temperature") for settings in config.values()):
+        return [room for room in ("bedroom", "living") if room in config]
+    seen, rooms = set(), []
+    for room, settings in config.items():
+        sensor = settings["temperature"]
+        if sensor not in seen:
+            seen.add(sensor)
+            rooms.append(room)
+    return rooms
+
+
+def room_lock_groups(config):
+    path = CONFIG.with_name("topology.json")
+    if path.is_file():
+        try:
+            actuators = json.loads(path.read_text(encoding="utf-8")).get("actuators", {})
+            if isinstance(actuators, dict) and set(actuators) == set(config):
+                return {room: unit.get("lock_group") or room for room, unit in actuators.items() if isinstance(unit, dict)}
+        except (OSError, json.JSONDecodeError, AttributeError):
+            pass
+    shared = {room for group in shared_sensor_groups(config) for room in group}
+    return {room: ("living_study" if room in shared and room in SHARED_ROOMS else room) for room in config}
+
+
+def coordinate(current, config=None):
+    groups = shared_sensor_groups(config) if config is not None else (SHARED_ROOMS,)
+    for group in groups:
+        if not all(room in current for room in group):
+            continue
+        members = [current[room] for room in group]
+        proposals = [room for room in members if room["send_after"] is not None]
+        if not proposals:
+            continue
+        if ({"heat", "cool"} <= {room["mode"] for room in members}
+                or not all(room["source_fresh"] for room in members)):
+            for room in proposals:
+                room.update(hypothetical_send=False, send_after=None, reason="共享参考温度存在方向冲突或数据过期")
+            continue
+        _, *waiting = sorted(proposals, key=lambda item: item["send_after"])
+        for room in waiting:
+            room.update(hypothetical_send=False, send_after=None, reason="客厅与书房共享参考温度，本轮只计一条建议")
 
 
 def daily(db, today):
@@ -669,8 +705,9 @@ def display(db, config, tick, error=None, *, release=(None, None)):
     except (FileNotFoundError, json.JSONDecodeError):
         pass
     complete_days = db.execute("SELECT * FROM daily ORDER BY localday DESC,room LIMIT 9").fetchall()
+    independent_rooms = independent_temperature_rooms(config)
     enough_data = (assessment is not None and tick+60-assessment >= DAY and
-                   all(current[room]["coverage_pct"] >= 80 for room in ("bedroom", "living") if room in current))
+                   all(current[room]["coverage_pct"] >= 80 for room in independent_rooms if room in current))
     rules = db.execute("SELECT value FROM settings WHERE key='mijia_rules_confirmation'").fetchone()
     rules = json.loads(rules[0]) if rules else None
     shared_energy = {}
@@ -700,7 +737,7 @@ def display(db, config, tick, error=None, *, release=(None, None)):
                "observed_home_kwh": round(sum(complete_energy), 6) if complete_energy else None,
                "observed_home_minutes": len(complete_energy),
                "observed_home_coverage_pct": round(100 * len(complete_energy) / expected, 1),
-               "independent_temperature_rooms": [room for room in ("bedroom", "living") if room in config],
+               "independent_temperature_rooms": independent_rooms,
                "live_actuations": live_actuations(max(floor-60, assessment or floor), tick+60),
                "metered_seconds_by_room": {room: r["totals"]["metered_seconds"] for room, r in current.items()},
                "completed_days_scope": "cumulative_history",
@@ -755,7 +792,10 @@ def display(db, config, tick, error=None, *, release=(None, None)):
             percent = f"{values['within_comfort_pct']}%" if values["within_comfort_pct"] is not None else "—"
             error = f"{values['mae_c']}℃" if values["mae_c"] is not None else "—"
             lines.append(f"| {row['localday']} | {config[row['room']]['name']} | {values['valid_temperature_minutes']} | {percent} | {error} | {values['hypothetical_beeps']} |")
-    lines.extend(["", "温度预测沿用现有米家运行趋势。书房使用客厅参考温度。功率分类属于推测，闭环精度与指令执行需真机验证。", ""])
+    study_shared = ("living" in config and "study" in config
+                    and config["living"].get("temperature") == config["study"].get("temperature"))
+    shared_note = "书房使用客厅参考温度。" if study_shared else ""
+    lines.extend(["", f"温度预测沿用现有米家运行趋势。{shared_note}功率分类属于推测，闭环精度与指令执行需真机验证。", ""])
     atomic(OUTPUT/"shadow-status.md", "\n".join(lines))
 
 
@@ -773,12 +813,22 @@ def cycle(db, config, tick, *, release_commit=None, now=None):
     ) as rooms, db:
         if awaiting_inputs and rooms.execute("SELECT count(*) FROM samples WHERE tick=?", (tick,)).fetchone()[0] < len(config):
             return False
-        shared = db.execute("SELECT max(tick) FROM decisions WHERE hypothetical=1 AND room IN (?,?)", SHARED_ROOMS).fetchone()[0]
-        recorded = latest_beeps(db, now)
+        groups = shared_sensor_groups(config)
+        shared_ticks = {}
+        for group in groups:
+            placeholders = ",".join("?" for _ in group)
+            latest_shared = db.execute(
+                f"SELECT max(tick) FROM decisions WHERE hypothetical=1 AND room IN ({placeholders})", group
+            ).fetchone()[0]
+            for room in group:
+                shared_ticks[room] = latest_shared
+        recorded = latest_beeps(db, now, shared_groups=groups)
+        lock_groups = room_lock_groups(config)
         session = learning_session(JOURNALS, tick)
         db.execute("SAVEPOINT input_snapshot")
         data = {room: load_room(db, rooms, recorder, room, settings, tick, recorded.get(room),
-                                shared if room in SHARED_ROOMS else None, session) for room, settings in config.items()}
+                                shared_ticks.get(room), session, lock_group=lock_groups.get(room))
+                for room, settings in config.items()}
         if awaiting_inputs and any(d["power_evidence_status"] in LATE_RECORDER
                                    for d in data.values()):
             # The observer SQLite commit can lead the Recorder commit. A
@@ -786,7 +836,7 @@ def cycle(db, config, tick, *, release_commit=None, now=None):
             db.execute("ROLLBACK TO input_snapshot")
             db.execute("RELEASE input_snapshot")
             return False
-        coordinate(data)
+        coordinate(data, config)
         if all(value["source_fresh"] for value in data.values()):
             db.execute("INSERT OR IGNORE INTO settings VALUES ('valid_started',?)", (str(int(now)),))
             db.execute("INSERT OR IGNORE INTO settings VALUES (?,?)", (POLICY_START_KEY, str(tick)))

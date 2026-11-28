@@ -52,7 +52,7 @@ stateDiagram-v2
 
 ## 区域与设备配置
 
-从 `home-assistant/shadow/topology.example.json` 建立本地 `topology.json`。`rooms.json` 继续绑定已有设备、硬件软限及调试见证。`sensors` 支持 `primary`、`auxiliary`、`constraint` 和 `environment`，显式禁用的点无需存在。每个区域具有独立主点，`primary` 直接使用主点，`weighted` 按配置把新鲜辅助点加入融合，独立证据仍采用主点的上报时间。`constraint` 独立保护危险边界，环境点使用配置的温度属性。
+从 `home-assistant/shadow/topology.example.json`（两区共享书房测温模板）或 `home-assistant/shadow/topology.three-zone.example.json`（三区独立测温星形模板：卧室与书房各自独立且分别与客厅连通、各机独立 `lock_group`、关闭反向运行）建立本地 `topology.json`。`rooms.json` 继续绑定已有设备、硬件软限及调试见证。`sensors` 支持 `primary`、`auxiliary`、`constraint` 和 `environment`，显式禁用的点无需存在。每个区域具有独立主点，`primary` 直接使用主点，`weighted` 按配置把新鲜辅助点加入融合，独立证据仍采用主点的上报时间。`constraint` 独立保护危险边界，环境点使用配置的温度属性。
 
 `zones.target` 可映射某台虚拟恒温器、指定 HA 数值实体及可选属性，或设静态目标。`pause_entity` 可接绑定的 `input_boolean`。许可的 `paused_zones` 暂停一个区域，`isolated_rooms` 和伴侣手动状态限制对应设备。暂停区域仍保留温度约束。`actuators.influences` 显式描述设备可作用的多个区域。`connections` 记录区域耦合，`opposite_operation.enabled` 默认关闭。开启后还要求明确分区、低跨区影响、真实输出证据以及对侧匹配需求。新增室内主点后建立新区域，修改设备影响关系并提升 `observation_version`。变更定义、实际来源或目标会废弃受影响的暂态证据；设备基线及发令历史照常继承。
 

@@ -669,5 +669,139 @@ class LivePowerTests(unittest.TestCase):
         self.assertEqual(attach(1150,active,shadow,memory)["power_evidence"]["bands"]["low"]["seconds"],0)
 
 
+THREE_ZONE_EXAMPLE=Path(pilot.__file__).with_name("topology.three-zone.example.json")
+
+
+class ThreeZoneStarTopologyTests(unittest.TestCase):
+    def setUp(self):
+        self.h=fixture.DispatchTests()
+        self.addCleanup(self.h.doCleanups)
+        self.h.setUp()
+        self.legacy_rooms=pilot.ROOMS
+        self.rooms={room: dict(cfg) for room, cfg in pilot.ROOMS.items()}
+        self.rooms["study"]["temperature"]="sensor.example_office_temperature"
+        self.topology=configure(json.loads(THREE_ZONE_EXAMPLE.read_bytes()),self.rooms)
+        self.enterContext(patch.object(pilot,"ROOMS",self.rooms))
+        self.enterContext(patch.object(pilot,"TOPOLOGY",self.topology))
+        self.audit=self.enterContext(patch.object(pilot,"audit"))
+
+    def scene(self, bed=("off",24,24.0,8), lounge=("off",24,24.0,8), study=("off",24,24.0,8)):
+        self.h.whole_scene(bed,lounge,study)
+        self.h.live["study"]["temperature_source"]=["sensor.example_office_temperature","test-epoch"]
+        permit=json.loads(self.h.permit.read_bytes())
+        for r,s in permit["rooms"].items():
+            if s[0]=="off":
+                permit["rooms"][r]=["cool",25,"auto"]
+        self.h.permit.write_text(json.dumps(permit))
+        self.h.park(*(r for r, state in self.h.live.items() if state["signature"][0]=="off"),ago=4000)
+
+    def run_cycle(self, seconds=0, bed=None, lounge=None, study=None, *, cache=()):
+        self.h.now += seconds
+        for room, degrees in (("bedroom",bed),("living",lounge),("study",study)):
+            if degrees is not None:
+                self.h.live[room]["temperature"]=degrees
+            self.h.observe(room,new_report=room not in cache)
+            with self.h.db:
+                self.h.db.execute("UPDATE decisions SET value=json_set(value,'$.power_evidence.bands.low.seconds',600) WHERE room=?",(room,))
+        return self.h.snapshot()
+
+    def qualify(self, bed=None, lounge=None, study=None):
+        self.run_cycle(bed=bed,lounge=lounge,study=study)
+        self.run_cycle(600,bed=bed,lounge=lounge,study=study)
+        self.run_cycle(600,bed=bed,lounge=lounge,study=study)
+        return self.run_cycle(600,bed=bed,lounge=lounge,study=study)
+
+    def trace(self):
+        return next(x.kwargs["assessment"] for x in reversed(self.audit.call_args_list)
+                    if x.args==("cycle",) and "assessment" in x.kwargs)
+
+    def test_bedroom_and_study_are_isolated_from_each_other_while_connected_through_lounge(self):
+        # Study needs cooling, bedroom is cool near the opposite boundary, lounge is comfortable.
+        # Because sleep and office have no direct link, bedroom neither assists office nor blocks study via peer_risk.
+        self.scene(bed=("off",24,23.2,8),lounge=("off",24,24.0,8),study=("off",24,25.2,8))
+        state=self.qualify()
+        trace=self.trace()
+        self.assertEqual(trace["owner"],"office")
+        self.assertNotIn("bedroom",trace["feasible"]["office"])
+        self.assertIn("study",trace["feasible"]["office"])
+        self.assertEqual(trace["risks"]["study"],[])
+        self.assertEqual((state["commands"][-1]["room"],state["commands"][-1]["value"],state["commands"][-1]["purpose"]),
+                         ("study","cool","energy_start"))
+
+        # Living room connects to both sleep and office, so cold bedroom blocks living from cooling lounge.
+        self.h.journal.unlink(missing_ok=True)
+        self.h.calls.clear()
+        self.scene(bed=("off",24,23.1,8),lounge=("off",24,25.0,8),study=("off",24,24.0,8))
+        self.qualify()
+        trace=self.trace()
+        self.assertEqual(trace["owner"],None)
+        self.assertEqual(trace["feasible"]["lounge"],[])
+        self.assertEqual(trace["unmet"]["lounge"],"no_comfort_safe_assignment")
+        self.assertEqual(trace["feasible"]["sleep"],[])
+        self.assertEqual(trace["unmet"]["sleep"],"no_comfort_safe_assignment")
+
+        # When living is actively cooling while bedroom is cold, peer_risk flags sleep on living (not on study).
+        self.h.journal.unlink(missing_ok=True)
+        self.h.calls.clear()
+        self.scene(bed=("off",24,23.1,8),lounge=("cool",24,24.5,300),study=("cool",24,24.5,300))
+        self.run_cycle(bed=23.1,lounge=24.5,study=24.5)
+        trace=self.trace()
+        self.assertTrue(any(r["point"] == "sleep" and r["reason"] == "peer_comfort_risk" for r in trace["risks"]["living"]))
+        self.assertEqual(trace["risks"]["study"],[])
+
+    def test_opposite_operation_remains_forbidden_even_between_bedroom_and_study(self):
+        # Even though bedroom (sleep) and study (office) have no direct connection,
+        # opposite_operation.enabled is false so opposing heat in bedroom must yield before study cools.
+        self.scene(bed=("heat",22,23.6,300),lounge=("off",24,24.0,8),study=("off",24,25.2,8))
+        state=self.qualify()
+        trace=self.trace()
+        self.assertEqual(trace["owner"],"office")
+        self.assertTrue(trace["conflict"])
+        self.assertEqual(trace["handoff"]["blocker"],"bedroom")
+        self.assertEqual((state["commands"][-1]["room"],state["commands"][-1]["purpose"]),("bedroom","handoff_reduce"))
+
+    def test_independent_lock_groups_prevent_living_hold_from_locking_study(self):
+        self.scene(bed=("off",24,24.0,8),lounge=("off",24,24.0,8),study=("off",24,25.2,8))
+        self.h.update_state(holds={"living":"fixture_hold"})
+        state=self.qualify()
+        self.assertEqual((state["commands"][-1]["room"],state["commands"][-1]["value"],state["commands"][-1]["purpose"]),
+                         ("study","cool","energy_start"))
+
+    def test_shadow_helpers_stop_coupling_living_and_study_when_sensors_are_independent(self):
+        import cadence
+        import service
+        import steady_learning
+
+        self.assertEqual(service.shared_sensor_groups(self.rooms),())
+        self.assertEqual(service.independent_temperature_rooms(self.rooms),["bedroom","living","study"])
+        self.assertEqual(service.shared_sensor_groups(self.legacy_rooms),(("living","study"),))
+        self.assertEqual(service.independent_temperature_rooms(self.legacy_rooms),["bedroom","living"])
+
+        proposals={
+            "living":{"mode":"cool","source_fresh":True,"send_after":100,"hypothetical_send":True,"reason":"ok"},
+            "study":{"mode":"cool","source_fresh":True,"send_after":120,"hypothetical_send":True,"reason":"ok"},
+        }
+        service.coordinate(proposals,self.rooms)
+        self.assertTrue(proposals["living"]["hypothetical_send"])
+        self.assertTrue(proposals["study"]["hypothetical_send"])
+
+        service.coordinate(proposals,self.legacy_rooms)
+        self.assertTrue(proposals["living"]["hypothetical_send"])
+        self.assertFalse(proposals["study"]["hypothetical_send"])
+
+        with TemporaryDirectory() as tmp:
+            journal=Path(tmp)
+            cadence.save_receipt(journal,"living",100,"accepted",101)
+            beeps=cadence.latest_beeps(self.h.db,200,journal,shared_groups=())
+            self.assertIn("living",beeps)
+            self.assertNotIn("study",beeps)
+
+        session={"start":1,"holds":{"living":"fixture"},"manual_holds":{},"isolated_rooms":[]}
+        virtual={"state":"auto","shared_attrs":json.dumps({"preset_mode":"标准"})}
+        self.assertIsNone(steady_learning.learning_active(session,"living",virtual,100,lock_group="living"))
+        self.assertEqual(steady_learning.learning_active(session,"study",virtual,100,lock_group="study"),1)
+
+
+
 if __name__=="__main__":
     unittest.main()
