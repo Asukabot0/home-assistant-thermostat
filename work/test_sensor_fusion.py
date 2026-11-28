@@ -88,6 +88,18 @@ class FusionTests(unittest.TestCase):
                            memory, now+1510, self.policy)
         self.assertEqual(weighted["quality"], "stale")
 
+    def test_failover_deadline_counts_from_the_last_valid_primary_temperature(self):
+        memory, zone = {}, self.zone("estimated")
+        valid_at = self.learn(zone, memory)-100
+        unavailable = {"value": None, "at": valid_at+4400, "source": ["sensor.p", "ha_report"], "quality": "unavailable"}
+        late, detail = fuse(zone, self.topology, {"p": unavailable, "x": reading(23.2, valid_at+4450)}, memory,
+                            valid_at+4500, self.policy)
+        self.assertEqual((late["quality"], detail["failover"]), ("unavailable", False))
+        early, detail = fuse(zone, self.topology, {"p": dict(unavailable, at=valid_at+900), "x": reading(23.2, valid_at+1450)},
+                             memory, valid_at+1500, self.policy)
+        self.assertEqual((early["quality"], detail["failover"]), ("fresh", True))
+        self.assertEqual(memory["primary_valid_at"], valid_at)
+
     def test_offsets_count_each_report_once_and_bound_a_glitch(self):
         memory, zone = {}, self.zone("weighted")
         now = self.learn(zone, memory)

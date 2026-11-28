@@ -35,8 +35,9 @@ class House:
 
     gains = {("ua", "a"): -10.0, ("ua", "b"): -5.0, ("ub", "b"): -8.0, ("ub", "a"): 0.0}
 
-    def __init__(self, seed=7):
+    def __init__(self, seed=7, cadences=(("a", 300), ("b", 600))):
         self.rng = random.Random(seed)
+        self.cadences = cadences
         self.t, self.temps = 0.0, {"a": 25.0, "b": 25.0}
         self.reports, self.power = {"a": None, "b": None}, {"ua": [], "ub": []}
         self.modes, self.changed = {"ua": "off", "ub": "off"}, {"ua": -1e6, "ub": -1e6}
@@ -64,7 +65,7 @@ class House:
             rate += sum(self.gains[(unit, zone)]*kw[unit] for unit in kw if self.modes[unit] == "cool")
             self.temps[zone] += rate/60
         self.t += 60
-        for zone, cadence in (("a", 300), ("b", 600)):
+        for zone, cadence in self.cadences:
             if int(self.t) % cadence == 0:
                 self.reports[zone] = {"value": round(self.temps[zone]+self.rng.gauss(0, 0.03), 1),
                                       "at": self.t, "quality": "fresh", "source": ["sensor.p" + zone, "x"]}
@@ -142,6 +143,21 @@ class ZoneModelTests(unittest.TestCase):
             for j in range(size):
                 self.assertAlmostEqual(zone["covariance"][i][j], zone["covariance"][j][i], places=9)
         self.assertLess(len(json.dumps(local)), 20000)
+
+
+class FrequentReportTests(unittest.TestCase):
+    def test_minute_reports_still_learn_and_settle_forecasts(self):
+        house, topology, local = House(seed=11, cadences=(("a", 60), ("b", 60))), site(), {}
+        run(house, topology, local, POLICY, 1440)
+        for key in ("a", "b"):
+            zone = local["model"]["zones"][key]
+            self.assertGreater(zone["updates"], 300, key)
+            self.assertGreaterEqual(zone["stats"]["n"], POLICY["model_min_samples"], key)
+            self.assertLessEqual(len(zone["pending"]),
+                                 zone_model.SETTLE_SECONDS[1]//zone_model.PENDING_SPACING_SECONDS+1)
+            self.assertLess(zone["stats"]["model"], zone["stats"]["persistence"])
+        gain = local["model"]["zones"]["a"]
+        self.assertAlmostEqual(gain["theta"][gain["features"].index("ua:cool")], -10.0, delta=2.0)
 
 
 class ZoneModelRobustnessTests(unittest.TestCase):

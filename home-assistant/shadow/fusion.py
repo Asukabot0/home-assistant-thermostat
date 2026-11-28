@@ -70,6 +70,9 @@ def fuse(zone, topology, by_sensor, memory, now, policy):
     fusion = zone.get("fusion", "primary")
     sensors = topology["sensors"]
     primary = calibrated(by_sensor[zone["primary"]], sensors[zone["primary"]])
+    if primary["value"] is not None and primary["quality"] != "unavailable" and primary["at"] is not None:
+        # An unavailable report still carries a time; failover counts from the last real temperature.
+        memory["primary_valid_at"] = primary["at"]
     learn_offsets(zone, topology, by_sensor, memory)
     keys = auxiliaries(zone, topology, by_sensor)
     detail = {"mode": fusion, "failover": False,
@@ -93,8 +96,9 @@ def fuse(zone, topology, by_sensor, memory, now, policy):
         anchor = primary["value"]
     else:
         usable = {key: reading for key, reading in fresh.items() if learned(key)}
-        if (fusion != "estimated" or not usable or primary["at"] is None
-                or now-primary["at"] > setting(policy, "fusion_failover_seconds")):
+        valid_at = memory.get("primary_valid_at")
+        if (fusion != "estimated" or not usable or valid_at is None
+                or now-valid_at > setting(policy, "fusion_failover_seconds")):
             return ref, detail
         weights = {key: sensors[key].get("weight", 1) for key in usable}
         anchor = sum(weights[key]*(usable[key]["value"]-memory[key]["offset"]) for key in usable)/sum(weights.values())

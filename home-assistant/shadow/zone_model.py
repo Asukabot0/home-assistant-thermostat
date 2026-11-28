@@ -29,7 +29,7 @@ SETTLE_SECONDS = (450, 1200)
 ENVIRONMENT_HOLD_SECONDS = 7200
 MASS_SECONDS = 2700
 STATS_WINDOW = 48
-PENDING_LIMIT = 4
+PENDING_SPACING_SECONDS = 240
 EXCITATION_KW = 0.15
 HUBER = 3.0
 INITIAL_NOISE_C = 0.08
@@ -119,7 +119,7 @@ def zone_state(context, key):
             "covariance": covariance, "noise": zone["noise"] if kept else INITIAL_NOISE_C**2,
             "updates": zone["updates"] if kept else 0,
             "excited": {unit: counts for unit, counts in zone["excited"].items() if unit in units} if kept else {},
-            "pending": [], "stats": {"n": 0, "unscored": 0}, "ready": False, "last": None}
+            "pending": [], "stats": {"n": 0, "unscored": 0}, "ready": False, "last": None, "anchor": None}
     return zone
 
 
@@ -163,24 +163,30 @@ def split_power(mode, kw):
 
 
 def learn(context, key, zone, ref, units_now, power):
-    """Update the coefficients from the interval between the previous and the new report."""
-    last = zone["last"]
-    if last is None:
+    """Update the coefficients from the interval between the learning anchor and the new report.
+
+    Reports closer than MIN_INTERVAL_SECONDS to the anchor return "accumulating"
+    and leave the anchor in place, so frequent reports still form intervals.
+    """
+    anchor = zone["anchor"]
+    if anchor is None:
         return "first_report"
-    elapsed = ref["at"]-last["at"]
-    if not MIN_INTERVAL_SECONDS <= elapsed <= setting(context["policy"], "model_max_interval_seconds"):
+    elapsed = ref["at"]-anchor["at"]
+    if elapsed < MIN_INTERVAL_SECONDS:
+        return "accumulating"
+    if elapsed > setting(context["policy"], "model_max_interval_seconds"):
         return "interval"
-    if any(value is None for value in last["environment"]):
+    if any(value is None for value in anchor["environment"]):
         return "environment_missing"
     operation = {}
     for unit in context["units"]:
         condition = units_now.get(unit) or {}
-        modes = ({condition.get("mode")} if (condition.get("changed_at") or inf) <= last["at"]
-                 else {condition.get("mode"), last["modes"].get(unit)})
+        modes = ({condition.get("mode")} if (condition.get("changed_at") or inf) <= anchor["at"]
+                 else {condition.get("mode"), anchor["modes"].get(unit)})
         running = modes & set(MODES)
         if len(running) > 1:
             return "mode_reversal"
-        kw = power(unit, last["at"], ref["at"])
+        kw = power(unit, anchor["at"], ref["at"])
         if kw is None:
             if running:
                 return "power_missing"
@@ -191,9 +197,9 @@ def learn(context, key, zone, ref, units_now, power):
         operation[unit] = (mode, kw)
     hours = elapsed/3600
     powers = [value for unit in context["units"] for value in split_power(*operation[unit])]
-    x = regressor(last, last["environment"], hours, powers)
+    x = regressor(anchor, anchor["environment"], hours, powers)
     _, variance, drift = prior(context["topology"], key, context["environment"], context["units"], context["policy"])
-    kalman(zone, x, ref["value"]-last["value"], variance, [hours*value for value in drift])
+    kalman(zone, x, ref["value"]-anchor["value"], variance, [hours*value for value in drift])
     zone["updates"] += 1
     drawing = [(unit, mode) for unit, (mode, kw) in operation.items() if mode and kw >= EXCITATION_KW]
     if len(drawing) == 1:
@@ -288,11 +294,17 @@ def observe_zone(context, key, ref, rule, environment, units_now, power, now, in
             mass = ref["value"]
         zone["last"] = {"at": ref["at"], "value": ref["value"], "environment": values, "mass": compact(mass),
                         "modes": {unit: (units_now.get(unit) or {}).get("mode") for unit in context["units"]}}
+        if zone["reason"] != "accumulating":
+            zone["anchor"] = zone["last"]
     projected = forecast(context, zone, values, units_now)
     if fresh and projected is not None:
-        zone["pending"] = zone["pending"][-(PENDING_LIMIT-1):] + [{
-            "at": ref["at"], "value": ref["value"], "model": compact(projected["delta"]),
-            "sigma": compact(projected["uncertainty"]), "rule": compact(rule["delta"]) if rule else 0.0}]
+        # Bound pending forecasts by age and space them out, so frequent reports
+        # cannot push every forecast out before it can be settled.
+        pending = [item for item in zone["pending"] if ref["at"]-item["at"] <= SETTLE_SECONDS[1]]
+        if not pending or ref["at"]-pending[-1]["at"] >= PENDING_SPACING_SECONDS:
+            pending.append({"at": ref["at"], "value": ref["value"], "model": compact(projected["delta"]),
+                            "sigma": compact(projected["uncertainty"]), "rule": compact(rule["delta"]) if rule else 0.0})
+        zone["pending"] = pending
     if fresh:
         zone["theta"] = [compact(value) for value in zone["theta"]]
         zone["covariance"] = [[compact(value) for value in row] for row in zone["covariance"]]
