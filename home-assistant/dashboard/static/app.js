@@ -277,11 +277,16 @@
         ? "传统全屋 / 温和模式"
         : "未识别模式";
 
-    // Alert banner for offline / stale / fault lock
+    // Alert banner for read errors / offline / stale / fault lock
     const notice = document.getElementById("offline-notice");
     const locks = snap.state_machines?.ledger?.locks || {};
     const holdKeys = Object.keys(locks.holds || {});
-    if (!ctrl.data_present) {
+    const readErrors = ctrl.read_errors || [];
+    if (readErrors.length > 0) {
+      notice.className = "alert-banner danger";
+      const list = readErrors.map((e) => `${e.file} (${e.error})`).join("、");
+      notice.textContent = `部分控制器运行文件读取失败或权限不足：${list}。请检查只读挂载与容器权限（compose.dashboard.yaml 已配置 DAC_READ_SEARCH 以读取 0600 账本与配置）。`;
+    } else if (!ctrl.data_present) {
       notice.className = "alert-banner";
       notice.textContent = "未在挂载目录检测到实机控制器输出（pilot-data/status.json）。若要在本地预览各状态机效果，可使用 `--demo` 参数启动演示模式。";
     } else if (holdKeys.length > 0) {

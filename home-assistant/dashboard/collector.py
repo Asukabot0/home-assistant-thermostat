@@ -237,9 +237,9 @@ def _read_json(path: Path) -> tuple[Any | None, str | None]:
         return None, type(exc).__name__
 
 
-def _tail_jsonl(path: Path, max_lines: int = 80, max_bytes: int = 262_144) -> list[dict[str, Any]]:
+def _tail_jsonl(path: Path, max_lines: int = 80, max_bytes: int = 262_144) -> tuple[list[dict[str, Any]], str | None]:
     if not path.is_file():
-        return []
+        return [], None
     try:
         size = path.stat().st_size
         with path.open("rb") as handle:
@@ -247,8 +247,8 @@ def _tail_jsonl(path: Path, max_lines: int = 80, max_bytes: int = 262_144) -> li
                 handle.seek(size - max_bytes)
                 handle.readline()  # discard partial first line
             raw_lines = handle.read().splitlines()
-    except OSError:
-        return []
+    except OSError as exc:
+        return [], type(exc).__name__
     records: list[dict[str, Any]] = []
     for raw in raw_lines[-max_lines:]:
         try:
@@ -257,7 +257,7 @@ def _tail_jsonl(path: Path, max_lines: int = 80, max_bytes: int = 262_144) -> li
             continue
         if isinstance(parsed, dict):
             records.append(parsed)
-    return records
+    return records, None
 
 
 def _setpoint_bounds(limits: Any) -> tuple[float, float] | None:
@@ -317,8 +317,13 @@ def _learned_initial(
     return max(bounds[0], min(bounds[1], chosen))
 
 
-def _load_config(paths: DashboardPaths) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any] | None, dict[str, bool]]:
-    policy_raw, _ = _read_json(paths.shadow_config_dir / "house_policy.json")
+def _load_config(
+    paths: DashboardPaths,
+) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any] | None, dict[str, Any]]:
+    read_errors: list[dict[str, str]] = []
+    policy_raw, policy_err = _read_json(paths.shadow_config_dir / "house_policy.json")
+    if policy_err is not None:
+        read_errors.append({"file": "house_policy.json", "error": policy_err})
     policy = dict(DEFAULT_POLICY)
     if isinstance(policy_raw, dict):
         policy.update(policy_raw)
@@ -326,25 +331,29 @@ def _load_config(paths: DashboardPaths) -> tuple[dict[str, Any], dict[str, Any],
     rooms_live = paths.shadow_config_dir / "rooms.json"
     rooms_example = paths.shadow_config_dir / "rooms.example.json"
     using_example_rooms = False
-    rooms_raw, _ = _read_json(rooms_live)
-    if not isinstance(rooms_raw, dict):
+    rooms_raw, rooms_err = _read_json(rooms_live)
+    if rooms_err is not None:
+        read_errors.append({"file": "rooms.json", "error": rooms_err})
+    elif not isinstance(rooms_raw, dict) and not rooms_live.exists():
         rooms_raw, _ = _read_json(rooms_example)
         using_example_rooms = isinstance(rooms_raw, dict)
     rooms = rooms_raw if isinstance(rooms_raw, dict) else {}
 
     topo_live = paths.shadow_config_dir / "topology.json"
     topo_example = paths.shadow_config_dir / "topology.example.json"
-    using_example_topo = False
-    topo_raw, _ = _read_json(topo_live)
-    if not isinstance(topo_raw, dict):
-        # Only fall back to example topology if rooms also came from example,
-        # OR if status.json indicates unified topology mode.
+    topo_raw, topo_err = _read_json(topo_live)
+    if topo_err is not None:
+        read_errors.append({"file": "topology.json", "error": topo_err})
+        topo_raw = None
+    elif not isinstance(topo_raw, dict):
         topo_raw = None
     topology = topo_raw if isinstance(topo_raw, dict) else None
     meta = {
         "rooms_from_example": using_example_rooms,
-        "topology_from_example": using_example_topo,
+        "topology_from_example": False,
+        "topology_live_present": topo_live.exists(),
         "topology_example_exists": topo_example.is_file(),
+        "read_errors": read_errors,
     }
     return policy, rooms, topology, meta
 
@@ -424,12 +433,17 @@ def _load_permit(pilot_dir: Path, now: float) -> tuple[dict[str, Any] | None, di
     }
 
 
-def _load_journal(pilot_dir: Path, permit_raw: dict[str, Any] | None) -> tuple[dict[str, Any], str | None]:
+def _load_journal(
+    pilot_dir: Path, permit_raw: dict[str, Any] | None
+) -> tuple[dict[str, Any], str | None, list[dict[str, str]]]:
+    errors: list[dict[str, str]] = []
     if isinstance(permit_raw, dict) and _num(permit_raw.get("start")) is not None:
         candidate = pilot_dir / f"continuous-{int(float(permit_raw['start']))}.json"
-        data, _ = _read_json(candidate)
+        data, err = _read_json(candidate)
+        if err is not None:
+            errors.append({"file": candidate.name, "error": err})
         if isinstance(data, dict):
-            return data, candidate.name
+            return data, candidate.name, errors
 
     candidates: list[tuple[int, Path]] = []
     if pilot_dir.is_dir():
@@ -438,10 +452,12 @@ def _load_journal(pilot_dir: Path, permit_raw: dict[str, Any] | None) -> tuple[d
             if suffix.isdigit():
                 candidates.append((int(suffix), path))
     for _, path in sorted(candidates, reverse=True):
-        data, _ = _read_json(path)
+        data, err = _read_json(path)
+        if err is not None and not any(e["file"] == path.name for e in errors):
+            errors.append({"file": path.name, "error": err})
         if isinstance(data, dict):
-            return data, path.name
-    return {}, None
+            return data, path.name, errors
+    return {}, None, errors
 
 
 def _load_shadow_series(shadow_data_dir: Path, rooms: dict[str, Any], now: float, window_s: int = 7200) -> dict[str, list[dict[str, Any]]]:
@@ -1336,7 +1352,45 @@ def _infer_next_command(
             "in_flight": in_flight,
         }
 
-    # 2. Selected command in current cycle
+    # 2. Permit inactive — continuous_pilot.cycle() exits before advancing unsent
+    # transactions or dispatching any new command when read_permit() is inactive.
+    # (Already-sent in-flight commands above are still displayed while awaiting echo.)
+    if not permit_info.get("active"):
+        has_queued_tx = any(
+            m.get("phase") == "initial"
+            for tx in ledger["active_transactions"]
+            if tx["group"] not in ledger["locks"]["holds"]
+            for m in tx.get("members") or ()
+        )
+        summary = permit_info.get("reason") or "控制许可未开启或已过期，控制器处于只读暂停状态。"
+        if has_queued_tx:
+            summary += "（账本中存在待续步的开机初值事务，但在许可重新生效前不会下发。）"
+        return {
+            "stage": "paused_or_locked",
+            "stage_label": "已暂停 · 许可未生效",
+            "headline": "当前不会下发任何指令",
+            "summary": summary,
+            "confidence": "none",
+            "action": None,
+            "eta_seconds": None,
+            "eta_note": "需先启用有效控制许可",
+            "waiting_for_new_report": False,
+            "blockers": [
+                {
+                    "code": "permit_inactive",
+                    "label": "实机控制许可",
+                    "detail": permit_info.get("reason") or "未启用",
+                    "met": False,
+                    "remaining_s": None,
+                    "progress_pct": 0,
+                }
+            ],
+            "candidates": formatted_candidates,
+            "rejections": [{"action": k, "reason": v} for k, v in rejection_map.items()],
+            "in_flight": None,
+        }
+
+    # 3. Selected command in current cycle
     selected = control.get("selected")
     if isinstance(selected, list) and len(selected) >= 4:
         action = _make_action_payload(
@@ -1358,7 +1412,7 @@ def _infer_next_command(
             "in_flight": None,
         }
 
-    # 3. Queued multi-step transaction (e.g. post-start initial setpoint / safety easing)
+    # 4. Queued multi-step transaction (e.g. post-start initial setpoint / safety easing)
     for tx in ledger["active_transactions"]:
         if tx["group"] in ledger["locks"]["holds"]:
             continue
@@ -1421,33 +1475,6 @@ def _infer_next_command(
                         "in_flight": None,
                     }
 
-    # 4. Permit inactive
-    if not permit_info.get("active"):
-        return {
-            "stage": "paused_or_locked",
-            "stage_label": "已暂停 · 许可未生效",
-            "headline": "当前不会下发任何指令",
-            "summary": permit_info.get("reason") or "控制许可未开启或已过期，控制器处于只读暂停状态。",
-            "confidence": "none",
-            "action": None,
-            "eta_seconds": None,
-            "eta_note": "需先启用有效控制许可",
-            "waiting_for_new_report": False,
-            "blockers": [
-                {
-                    "code": "permit_inactive",
-                    "label": "实机控制许可",
-                    "detail": permit_info.get("reason") or "未启用",
-                    "met": False,
-                    "remaining_s": None,
-                    "progress_pct": 0,
-                }
-            ],
-            "candidates": formatted_candidates,
-            "rejections": [{"action": k, "reason": v} for k, v in rejection_map.items()],
-            "in_flight": None,
-        }
-
     # 5. Candidate generated but blocked by final_gate
     if raw_candidates and raw_rejections:
         first = raw_candidates[0]
@@ -1489,14 +1516,23 @@ def _infer_next_command(
         red_wait = float(policy.get("reduction_wait_seconds", 180))
         low_obs_wait = float(policy.get("lower_output_observe_seconds", 180))
 
+        handoff_selected_at = _num(handoff.get("selected_at"))
+
+        def _matches_current_handoff(cmd: dict[str, Any], purpose_name: str) -> bool:
+            if cmd["room"] != blocker_room or cmd["purpose"] != purpose_name or cmd["status"] != "proxy_echo":
+                return False
+            if handoff_selected_at is None:
+                return True
+            cmd_ctrl = cmd.get("control")
+            cmd_handoff_at = _num(cmd_ctrl.get("handoff_at")) if isinstance(cmd_ctrl, dict) else None
+            return cmd_handoff_at is not None and abs(cmd_handoff_at - handoff_selected_at) <= 1e-6
+
         if phase == "verify_reduction" and blocker_room:
             action = _make_action_payload(
                 blocker_room, "mode", "off", "handoff_off", rooms_cfg, actuators_by_room
             )
-            last_red = next(
-                (c for c in reversed(commands) if c["room"] == blocker_room and c["purpose"] == "handoff_reduce" and c["status"] == "proxy_echo"),
-                None,
-            )
+            # `commands` is already sorted newest-first; match the current handoff's selected_at.
+            last_red = next((c for c in commands if _matches_current_handoff(c, "handoff_reduce")), None)
             if last_red and last_red["proxy_at"] is not None:
                 elapsed = max(0.0, now - last_red["proxy_at"])
                 rem = max(0.0, red_wait - elapsed)
@@ -1524,10 +1560,7 @@ def _infer_next_command(
                 action, _ = _predict_zone_action(
                     owner_zone, actuators, actuators_by_room, rooms_cfg, closed_loop, policy, receiver_room
                 )
-            last_off = next(
-                (c for c in reversed(commands) if c["room"] == blocker_room and c["purpose"] == "handoff_off" and c["status"] == "proxy_echo"),
-                None,
-            )
+            last_off = next((c for c in commands if _matches_current_handoff(c, "handoff_off")), None)
             if last_off and last_off["proxy_at"] is not None:
                 elapsed = max(0.0, now - last_off["proxy_at"])
                 rem = max(0.0, low_obs_wait - elapsed)
@@ -2026,11 +2059,19 @@ def collect_snapshot(paths: DashboardPaths, *, now: float | None = None) -> dict
     """Assemble a complete, read-only dashboard snapshot from runtime files."""
     now_ts = time.time() if now is None else float(now)
     policy, rooms_cfg, topology, cfg_meta = _load_config(paths)
+    read_errors: list[dict[str, str]] = list(cfg_meta.get("read_errors") or [])
     permit_raw, permit_info = _load_permit(paths.pilot_data_dir, now_ts)
-    journal, journal_file = _load_journal(paths.pilot_data_dir, permit_raw)
+    journal, journal_file, journal_errors = _load_journal(paths.pilot_data_dir, permit_raw)
+    read_errors.extend(journal_errors)
     status_raw, status_err = _read_json(paths.pilot_data_dir / "status.json")
-    startup_raw, _ = _read_json(paths.pilot_data_dir / "startup.json")
-    audit_raw = _tail_jsonl(paths.pilot_data_dir / "live-audit.jsonl", max_lines=80)
+    if status_err is not None:
+        read_errors.append({"file": "status.json", "error": status_err})
+    startup_raw, startup_err = _read_json(paths.pilot_data_dir / "startup.json")
+    if startup_err is not None:
+        read_errors.append({"file": "startup.json", "error": startup_err})
+    audit_raw, audit_err = _tail_jsonl(paths.pilot_data_dir / "live-audit.jsonl", max_lines=80)
+    if audit_err is not None:
+        read_errors.append({"file": "live-audit.jsonl", "error": audit_err})
     shadow_status, _ = _read_json(paths.shadow_output_dir / "shadow-status.json")
     shadow_health, _ = _read_json(paths.shadow_output_dir / "shadow-health.json")
     neural_status, _ = _read_json(paths.neural_output_dir / "neural-shadow-status.json")
@@ -2051,7 +2092,12 @@ def collect_snapshot(paths: DashboardPaths, *, now: float | None = None) -> dict
             merged_control.update({k: v for k, v in control.items() if v is not None})
             control = merged_control
 
-    if topology is None and control.get("topology") and cfg_meta.get("topology_example_exists"):
+    if (
+        topology is None
+        and not cfg_meta.get("topology_live_present")
+        and control.get("topology")
+        and cfg_meta.get("topology_example_exists")
+    ):
         topo_ex, _ = _read_json(paths.shadow_config_dir / "topology.example.json")
         if isinstance(topo_ex, dict):
             topology = topo_ex
@@ -2145,6 +2191,7 @@ def collect_snapshot(paths: DashboardPaths, *, now: float | None = None) -> dict
             "status_ts": status_ts,
             "status_age_s": round(status_age_s, 1) if status_age_s is not None else None,
             "status_error": status_err,
+            "read_errors": read_errors,
             "cycle_interval_s": CYCLE_INTERVAL_SECONDS,
             "next_cycle_in_s": next_cycle_in_s,
             "health": health,

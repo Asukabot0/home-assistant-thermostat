@@ -7,9 +7,15 @@ services:
     restart: unless-stopped
     read_only: true
     tmpfs: ["/tmp:size=16m,mode=1777"]
+    # Existing controller journals (continuous-*.json, startup.json) and site configs
+    # (rooms.json, topology.json) are created with mode 0600 by heating-pilot (UID 0)
+    # and release_local.py (host user). Dropping all capabilities except read-only
+    # DAC_READ_SEARCH while mounting every volume :ro allows reading those 0600 files
+    # without granting any write capability.
+    user: "${DASHBOARD_USER:-0:0}"
     cap_drop: [ALL]
+    cap_add: [DAC_READ_SEARCH]
     security_opt: [no-new-privileges:true]
-    user: "65534:65534"
     mem_limit: 128m
     pids_limit: 64
     environment:

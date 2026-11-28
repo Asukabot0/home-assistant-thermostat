@@ -181,6 +181,217 @@ class DashboardCollectorTests(unittest.TestCase):
             self.assertEqual(snap["next_command"]["action"]["purpose"], "initial_safety_easing")
             self.assertEqual(snap["next_command"]["action"]["to_value"], 24)
 
+    def test_inactive_permit_blocks_queued_transaction_forecast_but_keeps_inflight(self):
+        with TemporaryDirectory() as tmp:
+            paths = self._empty_paths(Path(tmp))
+            paths.pilot_data_dir.mkdir(parents=True)
+            now = 1_764_300_000.0
+            # Permit is disabled while an `initial` transaction remains in the journal
+            (paths.pilot_data_dir / "live-permit.json").write_text(
+                json.dumps({
+                    "enabled": False,
+                    "start": int(now - 3600),
+                    "end": None,
+                    "rooms": {"bedroom": ["heat", 24, "auto"], "living": ["heat", 23, "auto"], "study": ["heat", 23, "auto"]},
+                }),
+                encoding="utf-8",
+            )
+            journal_path = paths.pilot_data_dir / f"continuous-{int(now - 3600)}.json"
+            journal_data = {
+                "start": int(now - 3600),
+                "baselines": {"bedroom": ["heat", 24, "auto"], "living": ["heat", 23, "auto"], "study": ["heat", 23, "auto"]},
+                "holds": {},
+                "manual_holds": {},
+                "parked": {},
+                "commands": [],
+                "transitions": {
+                    "bedroom": {
+                        "id": now - 10,
+                        "mode": "heat",
+                        "ready_at": now + 4,
+                        "members": {"bedroom": {"phase": "initial", "target": 24.0}},
+                    }
+                },
+                "closed_loop": {},
+            }
+            journal_path.write_text(json.dumps(journal_data), encoding="utf-8")
+            (paths.pilot_data_dir / "status.json").write_text(
+                json.dumps({
+                    "at": "2026-11-28T06:00:00+00:00",
+                    "status": "实机控制已暂停或验证窗口已结束",
+                    "rooms": {
+                        "bedroom": {"room_c": 23.2, "target_c": 24.0, "mode_reported": "heat", "setpoint_reported": 28, "power_w": 300, "ready": True, "power_age_s": 5, "temperature_age_s": 20},
+                    },
+                    "control": {"at": now - 2, "topology": "site-1", "need": "heat", "owner": "sleep", "zones": {}},
+                }),
+                encoding="utf-8",
+            )
+
+            snap = collect_snapshot(paths, now=now)
+            self.assertEqual(snap["next_command"]["stage"], "paused_or_locked")
+            self.assertIsNone(snap["next_command"]["action"])
+
+            # Already-sent accepted command still renders as in_flight even if permit was just disabled
+            journal_data["commands"].append({
+                "room": "bedroom",
+                "kind": "mode",
+                "value": "heat",
+                "before": ["off", None, "auto"],
+                "sent_at": now - 20,
+                "status": "accepted",
+                "purpose": "energy_start",
+                "expected": ["heat"],
+            })
+            journal_path.write_text(json.dumps(journal_data), encoding="utf-8")
+            snap_inflight = collect_snapshot(paths, now=now)
+            self.assertEqual(snap_inflight["next_command"]["stage"], "in_flight")
+
+    def test_handoff_countdown_anchors_to_current_handoff_newest_first(self):
+        with TemporaryDirectory() as tmp:
+            paths = self._empty_paths(Path(tmp))
+            paths.pilot_data_dir.mkdir(parents=True)
+            now = 1_764_300_000.0
+            (paths.pilot_data_dir / "live-permit.json").write_text(
+                json.dumps({
+                    "enabled": True,
+                    "start": int(now - 7200),
+                    "end": None,
+                    "rooms": {"bedroom": ["heat", 22, "auto"], "living": ["cool", 25, "auto"], "study": ["off", None, "auto"]},
+                }),
+                encoding="utf-8",
+            )
+            old_handoff_at = now - 3600
+            cur_handoff_at = now - 80
+            journal_path = paths.pilot_data_dir / f"continuous-{int(now - 7200)}.json"
+            journal_data = {
+                "start": int(now - 7200),
+                "baselines": {"bedroom": ["heat", 22, "auto"], "living": ["cool", 25, "auto"], "study": ["off", None, "auto"]},
+                "holds": {},
+                "manual_holds": {},
+                "parked": {},
+                "transitions": {},
+                "commands": [
+                    # Older completed handoff for the same blocker ("living")
+                    {
+                        "room": "living",
+                        "kind": "temperature",
+                        "value": 25,
+                        "before": ["cool", 24, "auto"],
+                        "sent_at": old_handoff_at + 2,
+                        "proxy_at": old_handoff_at + 5,
+                        "status": "proxy_echo",
+                        "purpose": "handoff_reduce",
+                        "control": {"zone": "lounge", "mode": "cool", "handoff_at": old_handoff_at},
+                    },
+                    {
+                        "room": "living",
+                        "kind": "mode",
+                        "value": "off",
+                        "before": ["cool", 25, "auto"],
+                        "sent_at": old_handoff_at + 200,
+                        "proxy_at": old_handoff_at + 205,
+                        "status": "proxy_echo",
+                        "purpose": "handoff_off",
+                        "control": {"zone": "lounge", "mode": "cool", "handoff_at": old_handoff_at},
+                    },
+                    # Current handoff's fresh reduction echoed 40s ago -> 140s remaining of 180s window
+                    {
+                        "room": "living",
+                        "kind": "temperature",
+                        "value": 26,
+                        "before": ["cool", 25, "auto"],
+                        "sent_at": now - 44,
+                        "proxy_at": now - 40,
+                        "status": "proxy_echo",
+                        "purpose": "handoff_reduce",
+                        "control": {"zone": "lounge", "mode": "cool", "handoff_at": cur_handoff_at},
+                    },
+                ],
+                "closed_loop": {},
+            }
+            journal_path.write_text(json.dumps(journal_data), encoding="utf-8")
+
+            def write_status(phase: str):
+                (paths.pilot_data_dir / "status.json").write_text(
+                    json.dumps({
+                        "at": "2026-11-28T06:00:00+00:00",
+                        "status": "持续实机控制运行中",
+                        "rooms": {
+                            "bedroom": {"room_c": 23.1, "target_c": 24.0, "mode_reported": "heat", "setpoint_reported": 22, "power_w": 200, "ready": True, "power_age_s": 5, "temperature_age_s": 20, "zone": "sleep"},
+                            "living": {"room_c": 24.7, "target_c": 24.0, "mode_reported": "cool", "setpoint_reported": 26, "power_w": 210, "ready": True, "power_age_s": 5, "temperature_age_s": 20, "zone": "lounge"},
+                        },
+                        "control": {
+                            "at": now - 2,
+                            "topology": "site-1",
+                            "need": "heat",
+                            "owner": "sleep",
+                            "conflict": True,
+                            "elected": "bedroom",
+                            "feasible": {"sleep": ["bedroom"]},
+                            "handoff": {
+                                "owner": "sleep",
+                                "receiver": "bedroom",
+                                "blocker": "living",
+                                "direction": "heat",
+                                "phase": phase,
+                                "reason": "observe_both_sensors_after_reduction",
+                                "selected_at": cur_handoff_at,
+                            },
+                            "zones": {
+                                "sleep": {"key": "sleep", "measured": 23.1, "target": 24.0, "error": 0.9, "at": now - 20, "quality": "fresh", "paused": False, "intent": "recover", "reason": "confirmed_bias", "direction": "heat", "qualified": True},
+                                "lounge": {"key": "lounge", "measured": 24.7, "target": 24.0, "error": -0.7, "at": now - 20, "quality": "fresh", "paused": False, "intent": "limited", "reason": "conflicting_priority", "direction": "cool", "qualified": True},
+                            },
+                        },
+                    }),
+                    encoding="utf-8",
+                )
+
+            write_status("verify_reduction")
+            snap_red = collect_snapshot(paths, now=now)
+            self.assertEqual(snap_red["next_command"]["stage"], "handoff_waiting")
+            # Must anchor to current handoff's reduction (40s ago => 140s remaining), NOT the 3600s-old one (0s)
+            self.assertAlmostEqual(snap_red["next_command"]["eta_seconds"], 140.0, places=1)
+
+            # In verify_exit with NO handoff_off for cur_handoff_at yet, must NOT borrow old_handoff_at's handoff_off
+            write_status("verify_exit")
+            snap_no_off = collect_snapshot(paths, now=now)
+            self.assertIsNone(snap_no_off["next_command"]["eta_seconds"])
+
+            # Once current handoff's handoff_off echoes 30s ago -> 150s remaining
+            journal_data["commands"].append({
+                "room": "living",
+                "kind": "mode",
+                "value": "off",
+                "before": ["cool", 26, "auto"],
+                "sent_at": now - 33,
+                "proxy_at": now - 30,
+                "status": "proxy_echo",
+                "purpose": "handoff_off",
+                "control": {"zone": "lounge", "mode": "cool", "handoff_at": cur_handoff_at},
+            })
+            journal_path.write_text(json.dumps(journal_data), encoding="utf-8")
+            snap_exit = collect_snapshot(paths, now=now)
+            self.assertAlmostEqual(snap_exit["next_command"]["eta_seconds"], 150.0, places=1)
+
+    def test_unreadable_private_config_reports_error_instead_of_silent_example_fallback(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            cfg_dir = root / "shadow-cfg"
+            cfg_dir.mkdir()
+            (cfg_dir / "rooms.example.json").write_text(json.dumps({"bedroom": {"name": "Example"}}), encoding="utf-8")
+            # Existing rooms.json that fails to read/parse must NOT silently fall back to rooms.example.json
+            (cfg_dir / "rooms.json").write_text("{corrupt", encoding="utf-8")
+            paths = DashboardPaths(
+                shadow_config_dir=cfg_dir,
+                pilot_data_dir=root / "pilot-data",
+                shadow_data_dir=root / "shadow-data",
+                shadow_output_dir=root / "climate-shadow",
+                neural_output_dir=root / "neural-shadow",
+            )
+            snap = collect_snapshot(paths, now=1_764_300_000.0)
+            self.assertTrue(any(e["file"] == "rooms.json" for e in snap["controller"]["read_errors"]))
+            self.assertEqual(snap["actuators"], [])
+
     def test_legacy_pre_topology_mode_produces_zone_views(self):
         with TemporaryDirectory() as tmp:
             paths = self._empty_paths(Path(tmp))
@@ -361,6 +572,8 @@ class DashboardIsolationAuditTests(unittest.TestCase):
         text = compose_path.read_text(encoding="utf-8")
         self.assertIn("read_only: true", text)
         self.assertIn("cap_drop: [ALL]", text)
+        self.assertIn("cap_add: [DAC_READ_SEARCH]", text)
+        self.assertNotIn("DAC_OVERRIDE", text)
         self.assertIn("no-new-privileges:true", text)
         self.assertNotIn("private", text)
         self.assertNotIn("home-assistant.env", text)

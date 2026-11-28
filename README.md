@@ -49,7 +49,7 @@ Preview with built-in simulated state-machine scenarios (explicit opt-in only):
 PYTHONPATH="$PWD/home-assistant" python3 -B -m dashboard --demo
 ```
 
-Or run as a hardened read-only Docker Compose sidecar from `home-assistant/`:
+Or run as a hardened read-only Docker Compose sidecar from `home-assistant/` (uses `read_only: true`, `:ro` mounts, and `cap_drop: [ALL]` with read-only `DAC_READ_SEARCH` so it can read the `0600` journals and site configs created by `heating-pilot` and `release_local.py` without write capability):
 
 ```sh
 cd home-assistant
