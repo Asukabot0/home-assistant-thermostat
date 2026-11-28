@@ -576,8 +576,11 @@ def coordinate(live, readings, ready, state, now, configurations, connected, top
         -(abs(zones[key]["error"]) + min(zones[key]["duration"]/duration, 4)*0.2), key))
     # Check controllability independently from zone temperature. Foreign-zone
     # equipment can act only when its physical area is observed and protected.
+    known_groups = {unit["lock_group"] for unit in units.values()}
+    orphan_hold = any(key not in known_groups for key in state["holds"])
     uncertain = {zone for a in state["commands"] if a["status"] == "unconfirmed" and a["room"] in units
-                 and units[a["room"]]["lock_group"] in state["holds"] for zone in units[a["room"]]["influences"]}
+                 and (orphan_hold or units[a["room"]]["lock_group"] in state["holds"])
+                 for zone in units[a["room"]]["influences"]}
     control_ready = ready if control_ready is None else control_ready
     feasible = {key: [r for r in sorted(connected) if control_ready.get(r) and key in units[r]["influences"] and key not in uncertain
                        and zones[units[r]["zone"]]["quality"] == "fresh" and not zones[units[r]["zone"]]["paused"]

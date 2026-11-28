@@ -767,6 +767,43 @@ class ThreeZoneStarTopologyTests(unittest.TestCase):
         self.assertEqual((state["commands"][-1]["room"],state["commands"][-1]["value"],state["commands"][-1]["purpose"]),
                          ("study","cool","energy_start"))
 
+    def test_orphaned_legacy_lock_group_hold_fails_closed_across_controller_and_learning(self):
+        import house_dispatch
+        import steady_learning
+
+        self.scene(bed=("off",24,24.0,8),lounge=("off",24,24.0,8),study=("off",24,25.2,8))
+        self.h.update_state(holds={"living_study":"伴侣回报超时或与指令不一致，已暂停复发"})
+        state=self.qualify()
+        self.assertEqual(state["commands"],[])
+        self.assertEqual(self.h.calls,[])
+        self.assertIn("living_study",state["holds"])
+
+        readings={room: pilot.room_advice(room,self.h.live[room]["signature"][0],offsets=self.h.live[room]["offsets"],
+                                          feedback=self.h.live[room],house_since=0) for room in self.rooms}
+        gate=house_dispatch.final_gate(("study","mode","cool","energy_start"),self.h.now,self.h.live,readings,
+                                       set(self.rooms),state,self.rooms,topology=self.topology,trace=self.trace())
+        self.assertEqual(gate,"存在未归属当前锁组的暂停记录，已暂停发令")
+
+        virtual={"state":"auto","shared_attrs":json.dumps({"preset_mode":"标准"})}
+        self.assertIsNone(steady_learning.learning_active(
+            {"start":1,"holds":state["holds"],"manual_holds":{},"isolated_rooms":[]},
+            "study",virtual,100,lock_group="study",active_lock_groups={"bedroom","living","study"}))
+
+    def test_orphaned_transition_group_still_supports_initial_safety_easing_and_cleanup(self):
+        self.scene(bed=("off",24,24.0,8),lounge=("heat",28,24.0,300),study=("off",24,24.0,8))
+        self.h.update_state(transitions={
+            "living_study": {
+                "id": self.h.now - 10,
+                "mode": "heat",
+                "ready_at": self.h.now - 1,
+                "members": {"living": {"phase": "initial", "target": 24.0, "control": {"zone": "lounge", "target": 24.0}}},
+            }
+        })
+        state=self.run_cycle(20)
+        self.assertEqual((state["commands"][-1]["room"],state["commands"][-1]["value"],state["commands"][-1]["purpose"]),
+                         ("living",24,"initial_safety_easing"))
+        self.assertEqual(state["commands"][-1]["transaction"],self.h.now - 30)
+
     def test_shadow_helpers_stop_coupling_living_and_study_when_sensors_are_independent(self):
         import cadence
         import service
@@ -788,6 +825,20 @@ class ThreeZoneStarTopologyTests(unittest.TestCase):
         service.coordinate(proposals,self.legacy_rooms)
         self.assertTrue(proposals["living"]["hypothetical_send"])
         self.assertFalse(proposals["study"]["hypothetical_send"])
+        self.assertIn("客厅与书房",proposals["study"]["reason"])
+
+        custom_rooms={
+            "bedroom":{"name":"Bedroom","temperature":"sensor.shared_bs"},
+            "living":{"name":"Living room","temperature":"sensor.living_only"},
+            "study":{"name":"Study","temperature":"sensor.shared_bs"},
+        }
+        custom_proposals={
+            "bedroom":{"mode":"cool","source_fresh":True,"send_after":100,"hypothetical_send":True,"reason":"ok"},
+            "study":{"mode":"cool","source_fresh":True,"send_after":120,"hypothetical_send":True,"reason":"ok"},
+        }
+        service.coordinate(custom_proposals,custom_rooms)
+        self.assertFalse(custom_proposals["study"]["hypothetical_send"])
+        self.assertIn("Bedroom与Study",custom_proposals["study"]["reason"])
 
         with TemporaryDirectory() as tmp:
             journal=Path(tmp)

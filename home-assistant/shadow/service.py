@@ -404,7 +404,7 @@ def continuous_entity(recorder, entity, since, end, qualifies):
     ))
 
 
-def load_room(db, rooms, recorder, code, config, tick, actual_beep, shared_simulated_beep, session=None, *, lock_group=None):
+def load_room(db, rooms, recorder, code, config, tick, actual_beep, shared_simulated_beep, session=None, *, lock_group=None, active_lock_groups=None):
     # Read ordinary observational snapshots using each room's configured sensor.
     history = rooms.execute("SELECT * FROM samples WHERE room=? AND tick BETWEEN ? AND ? ORDER BY tick",
                             (code, tick - HISTORY, tick)).fetchall()
@@ -500,13 +500,13 @@ def load_room(db, rooms, recorder, code, config, tick, actual_beep, shared_simul
         activity = identify(tick, latest, [point for point in recent if point[0] >= tick - 900], model, history)
     else:
         activity = Activity("未知", "未知", "等待该分钟的 HA 观测")
-    active_since = (learning_active(session, code, virtual, tick, lock_group=lock_group)
+    active_since = (learning_active(session, code, virtual, tick, lock_group=lock_group, active_lock_groups=active_lock_groups)
                     if source_fresh and fresh_power and not power_without_room_sample else None)
     learning_power_span = bands.get("learning", {}).get("seconds", 0)
     if active_since is not None and learning_power_span >= EPISODE_SECONDS:
         since = tick - EPISODE_SECONDS
         auto = continuous_entity(recorder, thermostat, since, tick+60,
-                                 lambda row: learning_active(session, code, row, tick, lock_group=lock_group) is not None
+                                 lambda row: learning_active(session, code, row, tick, lock_group=lock_group, active_lock_groups=active_lock_groups) is not None
                                  and (fields := json.loads(row["shared_attrs"] or "{}")).get("temperature_entity_id") == attrs.get("temperature_entity_id")
                                  and numeric(fields.get("temperature")) == latest["desired"]
                                  and power_context(fields, config["power"]) == context)
@@ -608,8 +608,10 @@ def coordinate(current, config=None):
                 room.update(hypothetical_send=False, send_after=None, reason="共享参考温度存在方向冲突或数据过期")
             continue
         _, *waiting = sorted(proposals, key=lambda item: item["send_after"])
+        label = ("客厅与书房" if set(group) == set(SHARED_ROOMS)
+                 else "与".join((config or {}).get(room, {}).get("name", room) for room in group))
         for room in waiting:
-            room.update(hypothetical_send=False, send_after=None, reason="客厅与书房共享参考温度，本轮只计一条建议")
+            room.update(hypothetical_send=False, send_after=None, reason=f"{label}共享参考温度，本轮只计一条建议")
 
 
 def daily(db, today):
@@ -823,10 +825,12 @@ def cycle(db, config, tick, *, release_commit=None, now=None):
                 shared_ticks[room] = latest_shared
         recorded = latest_beeps(db, now, shared_groups=groups)
         lock_groups = room_lock_groups(config)
+        active_groups = set(lock_groups.values())
         session = learning_session(JOURNALS, tick)
         db.execute("SAVEPOINT input_snapshot")
         data = {room: load_room(db, rooms, recorder, room, settings, tick, recorded.get(room),
-                                shared_ticks.get(room), session, lock_group=lock_groups.get(room))
+                                shared_ticks.get(room), session, lock_group=lock_groups.get(room),
+                                active_lock_groups=active_groups)
                 for room, settings in config.items()}
         if awaiting_inputs and any(d["power_evidence_status"] in LATE_RECORDER
                                    for d in data.values()):
