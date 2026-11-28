@@ -328,10 +328,13 @@ def unpowered(now, peer, need, zone, live, readings, actions, policy):
                  *(a["proxy_at"] for a in actions if a["room"] == peer and is_strengthening(a))])
     grace = policy.get("assignment_power_grace_seconds", 240)
     since = (shadow.get("power_evidence") or {}).get("bands", {}).get("low", {}).get("since")
-    # Past the window a quiet unit is strengthened first, which starts a new window.
+    # Another unit can start only after the feedback wait that follows this request,
+    # so the window runs one more wait past it. Later, a quiet unit is strengthened
+    # first, which opens a new window.
+    end = max(grace, policy["feedback_wait_seconds"]) + policy["feedback_wait_seconds"]
     return (setting is not None and zone["measured"] is not None
             and DIRECTION[need]*(setting-zone["measured"]) > policy["tracking_band"]+TEMP_EPSILON
-            and grace <= now-asked <= grace+policy["feedback_wait_seconds"]
+            and grace <= now-asked <= end
             and since is not None and since <= asked
             and quiet_power(now, live[peer], shadow, grace, after=asked))
 

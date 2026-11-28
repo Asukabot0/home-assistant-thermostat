@@ -94,10 +94,11 @@ class UnifiedCycleTests(unittest.TestCase):
         self.assertEqual(self.h.calls[-1][1].get("temperature"),23)
 
     def test_running_unit_without_power_does_not_hold_the_zone_assignment(self):
-        for case, asked_ago, low_since in (("never_ran", 700, -60), ("ran_then_idle", 700, 200),
-                                           ("just_started", 120, -60), ("asked_long_ago", 2000, -60),
+        for case, asked_ago, low_since in (("never_ran", 700, -60), ("never_ran", 1000, -60), ("ran_then_idle", 700, 200),
+                                           ("just_started", 120, -60), ("within_feedback_wait", 400, -60),
+                                           ("asked_long_ago", 1300, -60), ("asked_long_ago", 2000, -60),
                                            ("no_off_reference", 700, -60)):
-            with self.subTest(case=case):
+            with self.subTest(case=case, asked_ago=asked_ago):
                 self.h.journal.unlink(missing_ok=True)
                 self.h.calls.clear()
                 self.scene(bed=("off", 25, 24.0, 8), lounge=("cool", 24, 24.9, 8), study=("off", 24, 24.9, 8))
@@ -130,6 +131,9 @@ class UnifiedCycleTests(unittest.TestCase):
                 elif case == "just_started":
                     self.assertEqual(commands, [])
                     self.assertEqual(last["rooms"]["study"]["status"], "maintain_existing_zone_assignment")
+                elif case == "within_feedback_wait":
+                    self.assertEqual(commands, [])
+                    self.assertEqual(last["rooms"]["study"]["status"], "wait_opposite_or_observation")
                 else:
                     self.assertEqual(commands, [("living", "zone_strengthen", 23)])
 
