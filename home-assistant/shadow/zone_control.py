@@ -43,7 +43,7 @@ def add_points(row, observation, identity, now, policy):
     return points
 
 
-def track(row, observation, target, estimate, paused, now, policy):
+def track(row, observation, target, estimate, paused, now, policy, bands=None):
     measured = observation["value"]
     episode = row.get("recovery") or {}
     result = {"measured": measured, "target": target, "at": observation["at"], "quality": observation["quality"],
@@ -53,13 +53,17 @@ def track(row, observation, target, estimate, paused, now, policy):
     if target is None or observation["quality"] != "fresh":
         return result
     error = target-measured
-    band = policy["tracking_band"]
+
+    def band_for(gap):
+        return (bands or {}).get("heat" if gap > 0 else "cool", policy["tracking_band"])
+
+    band = band_for(error)
     result["error"] = error
     if abs(error) <= band+TEMP_EPSILON:
         if episode:
             inside = []
             for at, value in reversed(row["points"]):
-                if at <= episode["last_outside"] or abs(value-target) > band+TEMP_EPSILON:
+                if at <= episode["last_outside"] or abs(value-target) > band_for(target-value)+TEMP_EPSILON:
                     break
                 inside.append(at)
             span = inside[0]-inside[-1] if inside else 0
@@ -68,7 +72,7 @@ def track(row, observation, target, estimate, paused, now, policy):
                           reason="verify_stable_recovery" if not paused else "zone_paused")
             projected = measured+(estimate["delta"] if estimate else 0)
             moving_out = (estimate is not None and abs(estimate["delta"])-estimate["uncertainty"] >= policy["minimum_progress_c"]
-                          and abs(projected-target) > band+TEMP_EPSILON)
+                          and abs(projected-target) > band_for(target-projected)+TEMP_EPSILON)
             if len(inside) < 2 or span < policy["recovery_settle_seconds"] or moving_out:
                 return result
             row.pop("recovery", None)
@@ -147,9 +151,38 @@ def setting_effect(actions, now, observations, topology, state, policy, readings
                          "learning_version": topology["learning_versions"][action["room"]]}
 
 
+SEASON_DEFAULTS = {"cooling_season_enter_c": 26, "cooling_season_exit_c": 22, "heating_season_enter_c": 14,
+                   "heating_season_exit_c": 18, "off_season_band_c": 1.5, "season_memory_seconds": 21600}
+
+
+def season(environment, state, now, policy=POLICY):
+    """Classify cooling or heating weather from fresh environment points, with hysteresis."""
+    limits = {key: policy.get(key, value) for key, value in SEASON_DEFAULTS.items()}
+    memory = state.get("season") or {"mode": None}
+    values = [row["value"] for row in environment.values() if row["quality"] == "fresh"]
+    if values:
+        outdoor = median(values)
+        mode = memory["mode"]
+        if (mode == "cool" and outdoor < limits["cooling_season_exit_c"]
+                or mode == "heat" and outdoor > limits["heating_season_exit_c"]):
+            mode = None
+        if mode is None:
+            mode = ("cool" if outdoor >= limits["cooling_season_enter_c"] else
+                    "heat" if outdoor <= limits["heating_season_enter_c"] else None)
+        memory = {"mode": mode, "outdoor_c": outdoor, "at": now}
+    elif memory["mode"] is not None and now-memory["at"] > limits["season_memory_seconds"]:
+        memory = {"mode": None}
+    state["season"] = memory
+    opposite = {"cool": "heat", "heat": "cool"}.get(memory["mode"])
+    band = max(policy["tracking_band"], limits["off_season_band_c"])
+    return memory, {opposite: band} if opposite else {}
+
+
 def observations(topology, live, inputs, state, actions, paused, now, policy=POLICY, *, readings=None):
     by_sensor = {key: sensor_reading(s, live, inputs, now) for key, s in topology["sensors"].items()
                  if s.get("enabled", True)}
+    environment = {k: v for k, v in by_sensor.items() if topology["sensors"][k]["role"] == "environment"}
+    _, bands = season(environment, state, now, policy)
     previous = state.get("definition")
     state["definition"] = topology["fingerprint"]
     trackers = state.setdefault("trackers", {})
@@ -189,7 +222,7 @@ def observations(topology, live, inputs, state, actions, paused, now, policy=POL
         memory["zone_version"] = definition
         changed = max((a["proxy_at"] for a in actions if key in topology["actuators"][a["room"]]["influences"]), default=0)
         forecast = trend(points, max(changed, memory["changed_at"]), now, policy) if ref["quality"] == "fresh" else None
-        result = track(memory, ref, target, forecast, is_paused, now, policy)
+        result = track(memory, ref, target, forecast, is_paused, now, policy, bands)
         result.update(source_version=identity, observation_definition=definition, source=ref["source"], primary=zone["primary"],
                       primary_reading=primary, inputs=sensors,
                       constraints={k: s for k, s in sensors.items() if topology["sensors"][k]["role"] == "constraint"})
@@ -204,7 +237,6 @@ def observations(topology, live, inputs, state, actions, paused, now, policy=POL
             and entry["source_version"] == out[entry["zone"]]["source_version"]
             and entry.get("learning_version") == topology["learning_versions"].get(entry["unit"])}
     setting_effect(actions, now, out, topology, state, policy, readings or {})
-    environment = {k: v for k, v in by_sensor.items() if topology["sensors"][k]["role"] == "environment"}
     return out, environment
 
 
@@ -487,7 +519,7 @@ def coordinate(live, readings, ready, state, now, configurations, connected, top
     if owner != contender:
         local.update(owner=owner, selected_at=now)
     trace.update(topology=topology["observation_version"], definition=topology["fingerprint"], zones=zones,
-                 environment=environment, owner=owner, demand_order=demands, feasible=feasible, output_evidence=output,
+                 environment=environment, season=local.get("season"), owner=owner, demand_order=demands, feasible=feasible, output_evidence=output,
                  risks={}, equipment={}, observations_after={}, action_scopes=scopes, energy_scores=energy_scores,
                  recent_effects=list(local.get("effects", {}).values())[-8:], uncertain_zones=sorted(uncertain),
                  handoff=handoff, conflict=contest, yielding_blocks=blocked, elected=elected)

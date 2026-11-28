@@ -12,7 +12,7 @@ from live_evidence import attach
 from service import power_evidence
 from steady_learning import record_episode
 from topology import configure, extra_inputs
-from zone_control import observations
+from zone_control import observations, season
 
 
 pilot=fixture.pilot
@@ -346,6 +346,50 @@ class UnifiedCycleTests(unittest.TestCase):
         self.assertEqual(self.trace()["unmet"],{"lounge":"no_comfort_safe_assignment","sleep":"no_comfort_safe_assignment"})
         last=next(x.kwargs for x in reversed(self.audit.call_args_list) if x.args==("cycle",) and "rooms" in x.kwargs)
         self.assertEqual(last["rooms"]["bedroom"]["status"],"no_comfort_safe_assignment")
+
+    def test_cooling_weather_does_not_turn_a_slightly_cool_zone_into_heating_demand(self):
+        for outdoor, contested in ((None, True), (30, False)):
+            with self.subTest(outdoor=outdoor):
+                self.h.journal.unlink(missing_ok=True)
+                self.h.calls.clear()
+                self.scene(bed=("off", 25, 23.4, 8), lounge=("off", 25, 24.8, 8), study=("off", 25, 24.8, 8))
+                bedroom = self.h.live["bedroom"]
+                bedroom.pop("outdoor", None)
+                if outdoor is not None:
+                    bedroom.update(outdoor=outdoor, outdoor_report_at=self.h.now, outdoor_source=["sensor.outdoor", "fixture"])
+
+                started = self.qualify()
+
+                trace = self.trace()
+                self.assertEqual(trace["conflict"], contested)
+                self.assertEqual(trace["zones"]["sleep"]["qualified"], contested)
+                self.assertEqual((started["commands"][0]["purpose"], started["commands"][0]["value"],
+                                  started["commands"][0]["control"]["zone"]), ("energy_start", "cool", "lounge"))
+                if not contested:
+                    self.assertEqual(trace["season"]["mode"], "cool")
+                    self.assertEqual(trace["zones"]["sleep"]["intent"], "maintain")
+                for _ in range(10):
+                    for row in self.h.live.values():
+                        row["adapter"]["power"] = 8 if row["adapter"]["mode"] == "off" else 300
+                    if outdoor is not None:
+                        bedroom["outdoor_report_at"] = self.h.now
+                    self.run_cycle(600)
+                    self.assertEqual(self.trace()["conflict"], contested)
+                trace = self.trace()
+                self.assertEqual(trace["owner"], None if contested else "lounge")
+                self.assertEqual("sleep" in trace["unmet"], contested)
+
+    def test_season_needs_fresh_weather_and_keeps_hysteresis(self):
+        fresh = lambda value: {"outdoor": {"value": value, "quality": "fresh"}}
+        memory = {}
+        self.assertEqual(season(fresh(25), memory, 0), ({"mode": None, "outdoor_c": 25, "at": 0}, {}))
+        self.assertEqual(season(fresh(27), memory, 60)[1], {"heat": 1.5})
+        self.assertEqual(season(fresh(23), memory, 120)[0]["mode"], "cool")
+        self.assertEqual(season({"outdoor": {"value": 30, "quality": "stale"}}, memory, 3000)[0]["mode"], "cool")
+        self.assertEqual(season({}, memory, 120+21601)[0]["mode"], None)
+        season(fresh(27), memory, 30000)
+        self.assertEqual(season(fresh(21.5), memory, 30060)[0]["mode"], None)
+        self.assertEqual(season(fresh(10), memory, 30120)[1], {"cool": 1.5})
 
     def test_heat_and_cool_recovery_survive_single_boundary_report_and_restart(self):
         for mode, outside, boundary, relapse, settled, setting in (
