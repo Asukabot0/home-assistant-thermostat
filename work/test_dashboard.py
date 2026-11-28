@@ -610,6 +610,24 @@ class DashboardCollectorTests(unittest.TestCase):
             demo_zones = {z["zone"]: z for z in demo_snap["state_machines"]["zone_states"]}
             self.assertEqual(demo_zones["lounge"]["label"], "客厅 / 书房区 (lounge)")
 
+            # Orphaned legacy hold (living_study) under 3-zone topology must surface on actuators and fault health
+            (pilot_dir / f"continuous-{int(now - 3600)}.json").write_text(
+                json.dumps({
+                    "start": int(now - 3600),
+                    "baselines": {"bedroom": ["off", None, "auto"], "living": ["cool", 25, "auto"], "study": ["cool", 24, "auto"]},
+                    "holds": {"living_study": "伴侣回报超时或与指令不一致，已暂停复发"},
+                    "manual_holds": {},
+                    "parked": {},
+                    "transitions": {},
+                    "commands": [],
+                    "closed_loop": {},
+                }),
+                encoding="utf-8",
+            )
+            snap_orphan = collect_snapshot(paths, now=now)
+            self.assertEqual(snap_orphan["controller"]["health"], "fault_locked")
+            self.assertTrue(all(a["hold_reason"] and "living_study" in a["hold_reason"] for a in snap_orphan["actuators"]))
+
             # Live 3-zone status without mounted topology.json must not falsely adopt 2-zone topology.example.json
             (cfg_dir / "topology.json").unlink()
             (cfg_dir / "topology.example.json").write_text(EXAMPLE_TOPOLOGY.read_text(encoding="utf-8"), encoding="utf-8")
@@ -618,6 +636,28 @@ class DashboardCollectorTests(unittest.TestCase):
             no_topo_zones = {z["zone"]: z for z in snap_no_topo["state_machines"]["zone_states"]}
             self.assertEqual(no_topo_zones["lounge"]["label"], "客厅区 (lounge)")
             self.assertEqual(no_topo_zones["office"]["label"], "书房区 (office)")
+
+            # A customized 2-zone deployment (observation_version != "site-1") must also NOT fall back to example weights
+            (pilot_dir / "status.json").write_text(
+                json.dumps({
+                    "at": "2026-11-28T09:00:00+00:00",
+                    "status": "持续实机控制运行中",
+                    "rooms": {
+                        "bedroom": {"room_c": 24.0, "target_c": 24.0, "mode_reported": "off", "setpoint_reported": None, "power_w": 5, "ready": True, "power_age_s": 10, "temperature_age_s": 20, "zone": "sleep"},
+                        "living": {"room_c": 24.4, "target_c": 24.0, "mode_reported": "cool", "setpoint_reported": 25, "power_w": 150, "ready": True, "power_age_s": 10, "temperature_age_s": 20, "zone": "lounge"},
+                    },
+                    "control": {
+                        "at": now - 5, "topology": "site-custom-2", "need": "hold", "owner": None,
+                        "zones": {
+                            "sleep": {"key": "sleep", "measured": 24.0, "target": 24.0, "error": 0.0, "at": now - 20, "quality": "fresh", "paused": False, "intent": "maintain", "reason": "near_target", "qualified": False},
+                            "lounge": {"key": "lounge", "measured": 24.4, "target": 24.0, "error": -0.4, "at": now - 20, "quality": "fresh", "paused": False, "intent": "observe", "reason": "waiting_reports_or_dwell", "qualified": False},
+                        },
+                    },
+                }),
+                encoding="utf-8",
+            )
+            snap_custom_2 = collect_snapshot(paths, now=now)
+            self.assertFalse(snap_custom_2["topology"]["present"])
 
 
 class DashboardHTTPServerTests(unittest.TestCase):

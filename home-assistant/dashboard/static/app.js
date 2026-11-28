@@ -29,7 +29,7 @@
     recover: {
       title: "Recover · 恢复",
       color: "#fb923c",
-      desc: "持续偏差已由独立测温证实且温度未在可信回归；作为当前优先服务区 (owner) 可在动作后观察窗与门禁通过后执行按需启机或小步加码。",
+      desc: "持续偏差已由独立测温证实且温度未在可信回归；作为当前优先区 (owner) 可在动作后观察窗与门禁通过后执行按需启机或小步加码。",
     },
     maintain: {
       title: "Maintain · 维持",
@@ -589,7 +589,7 @@
       detail.appendChild(el("span", { style: "color:var(--text-muted)", text: "当前双区无冷热反向冲突，双向交接状态机处于空闲待命状态。" }));
       return;
     }
-    detail.appendChild(el("span", { class: "badge badge-warn", text: `优先区: ${ho.owner || "—"}` }));
+    detail.appendChild(el("span", { class: "badge badge-warn", text: `当前优先区: ${ho.owner || "—"}` }));
     detail.appendChild(el("span", { class: "badge badge-accent", text: `接收机: ${ho.receiver || "—"}` }));
     detail.appendChild(el("span", { class: "badge badge-danger", text: `待退出对侧机: ${ho.blocker || "—"}` }));
     if (ho.elapsed_s !== null && ho.elapsed_s !== undefined) {
@@ -821,8 +821,8 @@
         z.is_owner
           ? el("span", {
               class: "badge badge-warn",
-              title: "本轮偏差最显著且存在可行设备的优先调度区（动态选举，非固定拓扑主区）",
-              text: "优先服务区 (Owner)",
+              title: "本轮偏差最显著且存在可行设备的当前优先区（动态选举，非固定拓扑主区）",
+              text: "当前优先区 (Owner)",
             })
           : null,
         z.paused ? el("span", { class: "badge badge-danger", text: "已暂停" }) : null,

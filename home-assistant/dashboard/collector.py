@@ -83,7 +83,7 @@ HANDOFF_PHASE_LABELS = {
     "verify_reduction": "核验减载效果 (VerifyReduction)",
     "exit": "对侧停机 (Exit)",
     "verify_exit": "核验停机低耗 (VerifyExit)",
-    "serve": "交接完成 · 服务优先区 (Serve)",
+    "serve": "交接完成 · 服务当前优先区 (Serve)",
 }
 
 HANDOFF_REASON_LABELS = {
@@ -944,15 +944,27 @@ def _build_actuators(
         if extra not in ordered_rooms:
             ordered_rooms.append(extra)
 
+    lock_groups_by_room: dict[str, str] = {}
+    for room in ordered_rooms:
+        unit = topo_actuators.get(room) if isinstance(topo_actuators.get(room), dict) else {}
+        lock_groups_by_room[room] = str(
+            unit.get("lock_group")
+            or (room if topology is not None else "living_study" if room in {"living", "study"} else room)
+        )
+    known_lock_groups = set(lock_groups_by_room.values())
+    orphan_holds = {k: v for k, v in holds.items() if k not in known_lock_groups}
+    orphan_hold_reason = (
+        f"存在未归属当前锁组的暂停记录（{'、'.join(sorted(orphan_holds))}），请核对后清理或启用新许可"
+        if orphan_holds
+        else None
+    )
+
     actuators: list[dict[str, Any]] = []
     for room in ordered_rooms:
         cfg = rooms_cfg.get(room) if isinstance(rooms_cfg.get(room), dict) else {}
         detail = status_rooms.get(room) if isinstance(status_rooms.get(room), dict) else {}
         unit = topo_actuators.get(room) if isinstance(topo_actuators.get(room), dict) else {}
-        lock_group = str(
-            unit.get("lock_group")
-            or (room if topology is not None else "living_study" if room in {"living", "study"} else room)
-        )
+        lock_group = lock_groups_by_room[room]
         home_zone = (
             detail.get("zone")
             or unit.get("zone")
@@ -1036,7 +1048,7 @@ def _build_actuators(
             "parked": mode == "off" and parked_info is not None,
             "parked_info": parked_info,
             "output_credible": bool(output_evidence.get(room)),
-            "hold_reason": holds.get(lock_group),
+            "hold_reason": holds.get(lock_group) or orphan_hold_reason,
             "manual_hold_reason": manual_holds.get(room),
             "isolated": room in isolated,
             "status_code": status_code,
@@ -1656,7 +1668,7 @@ def _infer_next_command(
                 blockers.append({
                     "code": "both_zone_reports",
                     "label": "双区独立新测温反馈",
-                    "detail": "需优先区与对侧区域在减载回显后均产生新测温上报",
+                    "detail": "需当前优先区与对侧区域在减载回显后均产生新测温上报",
                     "met": False,
                     "remaining_s": None,
                     "progress_pct": 0,
@@ -2275,7 +2287,10 @@ def collect_snapshot(paths: DashboardPaths, *, now: float | None = None) -> dict
         control_zones = control.get("zones") if isinstance(control.get("zones"), dict) else {}
         if isinstance(topo_ex, dict):
             ex_zones = topo_ex.get("zones") if isinstance(topo_ex.get("zones"), dict) else {}
-            if not control_zones or set(control_zones).issubset(ex_zones):
+            if (
+                control.get("topology") == topo_ex.get("observation_version")
+                and (not control_zones or set(control_zones).issubset(ex_zones))
+            ):
                 topology = topo_ex
                 cfg_meta["topology_from_example"] = True
 
