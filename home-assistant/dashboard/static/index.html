@@ -1,0 +1,164 @@
+<!DOCTYPE html>
+<html lang="zh-CN" data-theme="dark">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>三房恒温控制器 · 状态机与指令监控台</title>
+  <link rel="icon" type="image/svg+xml" href="/assets/favicon.svg" />
+  <link rel="stylesheet" href="/assets/styles.css" />
+</head>
+<body>
+  <div id="demo-banner" class="demo-banner hidden" role="region" aria-label="演示模式场景切换">
+    <div class="demo-banner-inner">
+      <div class="demo-label">
+        <span class="badge badge-warn">DEMO 演示模式</span>
+        <span>以下为内置模拟状态机场景（非实机数据），点击切换不同工况：</span>
+      </div>
+      <div id="scenario-pills" class="scenario-pills"></div>
+    </div>
+  </div>
+
+  <header class="topbar">
+    <div class="topbar-left">
+      <div class="brand">
+        <span class="brand-dot" id="health-dot"></span>
+        <div>
+          <div class="brand-title">
+            三房恒温控制器监控台
+            <span class="badge badge-ro">只读</span>
+          </div>
+          <div class="brand-sub" id="controller-status-text">正在加载控制器状态…</div>
+        </div>
+      </div>
+    </div>
+
+    <div class="topbar-metrics">
+      <div class="kpi-chip">
+        <span class="kpi-label">健康状态</span>
+        <span class="kpi-value" id="kpi-health">—</span>
+      </div>
+      <div class="kpi-chip">
+        <span class="kpi-label">全屋需求</span>
+        <span class="kpi-value" id="kpi-need">—</span>
+      </div>
+      <div class="kpi-chip">
+        <span class="kpi-label">当前主区</span>
+        <span class="kpi-value" id="kpi-owner">—</span>
+      </div>
+      <div class="kpi-chip">
+        <span class="kpi-label">室外气温</span>
+        <span class="kpi-value" id="kpi-outdoor">—</span>
+      </div>
+      <div class="kpi-chip">
+        <span class="kpi-label">下次巡检</span>
+        <span class="kpi-value mono" id="kpi-next-cycle">—</span>
+      </div>
+    </div>
+
+    <div class="topbar-actions">
+      <span class="stream-pill" id="stream-status">连接中…</span>
+      <button type="button" class="icon-btn" id="btn-refresh" title="立即刷新">刷新</button>
+      <button type="button" class="icon-btn" id="btn-theme" title="切换深浅色主题">亮色</button>
+    </div>
+  </header>
+
+  <main class="container">
+    <div id="offline-notice" class="alert-banner hidden"></div>
+
+    <!-- HERO: Next Command + Zone Closed-Loop State Machine -->
+    <section class="grid-hero">
+      <article class="card card-next" id="next-command-card">
+        <div class="card-head">
+          <div>
+            <h2 class="card-title">下一个指令与发令管线</h2>
+            <p class="card-subtitle">基于当前状态机、在途回执、保护门禁与政策计时器实时推演</p>
+          </div>
+          <span class="stage-pill" id="next-stage-badge">—</span>
+        </div>
+        <div id="next-command-body" class="next-body"></div>
+      </article>
+
+      <article class="card card-sm-main">
+        <div class="card-head">
+          <div>
+            <h2 class="card-title">区域闭环状态机</h2>
+            <p class="card-subtitle">实时高亮各区域当前所处状态与驻留设备（点击节点查看流转规则）</p>
+          </div>
+          <span class="badge badge-muted mono" id="ctrl-mode-badge">—</span>
+        </div>
+        <div class="svg-wrap" id="zone-sm-svg-wrap"></div>
+        <div class="sm-inspector" id="zone-sm-inspector">
+          点击上方任意状态节点，可查看该状态的进入与退出条件。
+        </div>
+      </article>
+    </section>
+
+    <!-- SECONDARY STATE MACHINES: Handoff + Ledger/Transactions/Locks -->
+    <section class="grid-two">
+      <article class="card">
+        <div class="card-head">
+          <div>
+            <h2 class="card-title">双向需求交接状态机</h2>
+            <p class="card-subtitle">冷热双向冲突时：先对侧减载、核验反馈、停机证实低耗，再服务主区</p>
+          </div>
+          <span class="badge" id="handoff-phase-badge">—</span>
+        </div>
+        <div class="svg-wrap" id="handoff-sm-svg-wrap"></div>
+        <div id="handoff-detail" class="sub-detail"></div>
+      </article>
+
+      <article class="card">
+        <div class="card-head">
+          <div>
+            <h2 class="card-title">执行账本 · 事务与安全保护锁</h2>
+            <p class="card-subtitle">串行回执（prepared → accepted → proxy_echo）、多步事务与停机保护计时</p>
+          </div>
+          <span class="badge" id="ledger-phase-badge">—</span>
+        </div>
+        <div id="ledger-pipeline" class="ledger-pipeline"></div>
+        <div id="locks-and-tx-body" class="locks-body"></div>
+      </article>
+    </section>
+
+    <!-- ZONES LIVE SITUATION -->
+    <section class="section-block">
+      <div class="section-header">
+        <h2>区域实时态势与温度追踪</h2>
+        <span class="section-hint">跟踪带 ±0.3℃ · 理想带 ±0.5℃ · 舒适带 ±0.7℃</span>
+      </div>
+      <div id="zones-grid" class="zones-grid"></div>
+    </section>
+
+    <!-- ACTUATORS & POWER EVIDENCE -->
+    <section class="section-block">
+      <div class="section-header">
+        <h2>空调设备实况与功率证据</h2>
+        <span class="section-hint">软限保护 · 实时功率分带 · 邻区舒适风险 · 维持设温学习</span>
+      </div>
+      <div id="actuators-grid" class="actuators-grid"></div>
+    </section>
+
+    <!-- TABBED HISTORY / EVIDENCE / POLICY -->
+    <section class="card section-block">
+      <div class="tabs-bar" role="tablist">
+        <button type="button" class="tab-btn active" data-tab="commands" role="tab">指令账本与随访 <span class="tab-count" id="count-commands">0</span></button>
+        <button type="button" class="tab-btn" data-tab="audit" role="tab">逐轮审计时间线 <span class="tab-count" id="count-audit">0</span></button>
+        <button type="button" class="tab-btn" data-tab="shadow" role="tab">24h 影子评估与学习</button>
+        <button type="button" class="tab-btn" data-tab="policy" role="tab">策略参数与许可详情</button>
+      </div>
+
+      <div class="tab-panel active" id="tab-commands"></div>
+      <div class="tab-panel" id="tab-audit"></div>
+      <div class="tab-panel" id="tab-shadow"></div>
+      <div class="tab-panel" id="tab-policy"></div>
+    </section>
+  </main>
+
+  <footer class="footer">
+    <div id="footer-meta">只读监控前端 · 无 Home Assistant 写权限与发令通道</div>
+    <div id="footer-updated" class="mono">最后同步：—</div>
+  </footer>
+
+  <script src="/assets/app.js" defer></script>
+</body>
+</html>

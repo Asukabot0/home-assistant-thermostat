@@ -33,4 +33,27 @@ Automatic stops and subsequent starts require an independently verified local of
 
 Use `topology.example.json` to configure sensors, zones and equipment influence. See [unified control and evidence scheduling](docs/unified-control.md) for the state machine, production deployment, rollback and telemetry installation.
 
+## Web dashboard (read-only)
+
+`home-assistant/dashboard/` provides a zero-dependency, strictly read-only web frontend and HTTP/SSE server for inspecting the controller's state machines (zone closed-loop, bidirectional handoff, command ledger/transactions, and safety locks), live zone & actuator telemetry, and the predicted or queued next command with live gate countdowns. It mounts all controller data read-only and has no Home Assistant credentials or actuation path.
+
+Run against local runtime files (default live read-only mode, `http://127.0.0.1:8780`):
+
+```sh
+PYTHONPATH="$PWD/home-assistant" python3 -B -m dashboard
+```
+
+Preview with built-in simulated state-machine scenarios (explicit opt-in only):
+
+```sh
+PYTHONPATH="$PWD/home-assistant" python3 -B -m dashboard --demo
+```
+
+Or run as a hardened read-only Docker Compose sidecar from `home-assistant/`:
+
+```sh
+cd home-assistant
+docker compose -f compose.dashboard.yaml up -d
+```
+
 Production credentials, equipment identifiers, unreduced telemetry, command journals and backups belong in the local runtime files excluded by `.gitignore`.
