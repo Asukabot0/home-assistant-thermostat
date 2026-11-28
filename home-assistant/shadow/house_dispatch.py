@@ -44,6 +44,8 @@ def final_gate(candidate, now, live, readings, connected, state, configurations,
             or feedback["native_authorized"] is not False or group in state["holds"]
             or not shadow["witness"] == "matched" or not shadow["followup_complete"]
             or room in state["manual_holds"]
+            or now < state.get("external_overrides", {}).get(room, {}).get("until", 0)
+            or now < max(state.get("start_failures", {}).get(room, {}).get(k, 0) for k in ("retry_at", "hold_until"))
             or list(feedback["signature"][:3]) != state["baselines"][room]):
         return "等待可信回报或人工恢复"
     if topology is None and (flag := matching_feedback(now, feedback, shadow["sample"], target, reversal=kind == "mode" and value != "off")):
