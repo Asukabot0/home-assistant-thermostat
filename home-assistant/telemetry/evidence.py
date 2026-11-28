@@ -26,8 +26,9 @@ COMMAND_FIELDS = "room kind value before sent_at status purpose transaction targ
 SHADOW_FIELDS = "power_evidence_status observed_at power_report_at power_report_w watts low_power_cutoff reversal_low_cutoff low_power_seconds above_low_seconds above_high_seconds power_evidence measured target temperature_report_at temperature_source reported_mode from_setpoint source_fresh outdoor model model_at release_commit policy_revision learning_error"
 SAMPLE_FIELDS = "room tick measured desired reported adapter_mode watts outdoor temp_report quality"
 DECISION_FIELDS += " season zone_model"
-ZONE_FIELDS += " fusion model_trend"
-MODEL_FIELDS = "active ready used updates settled unscored sigma mae coverage ratio std failover estimated offset pairs"
+ZONE_FIELDS += " fusion model_trend model_hold"
+MODEL_FIELDS = ("active ready ready_running used updates settled unscored running_settled sigma sigma_running mae running_mae coverage "
+                "ratio std trusted errors error failover estimated offset pairs")
 NESTED = set((ZONE_FIELDS + " " + ROOM_FIELDS + " " + DECISION_FIELDS + " " + COMMAND_FIELDS + " " + MODEL_FIELDS +
     " mode started_at off_at mode_started_at phase members ready_at id target zone source last_report bands threshold floor since seconds context low high above_low learning count delta uncertainty from to value report_span reports fresh interval_seconds watt_hours useful improvement thermal_delta start_c end_c ended_at covered_seconds weather_c served_zone last_increase own_command zone_report power_at deviation projected_adverse point influence temperature_report_at power_report_at room_age_s power_age_s reported watts room_c temperature_c definition before_c unit episode_count at code_sha256 config_sha256 step mode provenance local zone_reason time start finish enabled until reason virtual_mode context sensors limits centers_w edges_w counts samples span_minutes fit file function line status expires expected started last_power context_changed old new phases targets owner receiver blocker blocker_definition blocker_version selected_at handoff_at handoff_phase learning_version previous command_at retry_at hold_until 5 15").split())
 WORDS = re.compile(r"^[a-z][a-z0-9_]{0,55}$")
@@ -89,7 +90,8 @@ class PublicSchema:
             self.aliases.setdefault(item["lock_group"], self.id("group", item["lock_group"]))
         self.codes = {"reason", "status", "error", "event", "intent", "direction", "mode", "purpose", "outcome", "quality",
                       "zone_reason", "zone_intent", "house_need", "need", "normal_need", "power_evidence_status", "kind",
-                      "topology", "observation_version", "phase", "file", "function", "state", "mode_reported", "reported_mode"}
+                      "topology", "observation_version", "phase", "file", "function", "state", "mode_reported", "reported_mode",
+                      "model_hold"}
 
     def id(self, kind, value):
         return kind + "_" + hmac.new(self.key, str(value).encode(), sha256).hexdigest()[:16]
