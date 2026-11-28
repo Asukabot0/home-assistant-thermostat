@@ -796,10 +796,25 @@ class ThreeZoneStarTopologyTests(unittest.TestCase):
             self.assertIn("living",beeps)
             self.assertNotIn("study",beeps)
 
+            # Without topology.json, room_lock_groups must still match continuous_pilot.group() ("living_study")
+            # even when living and study use independent temperature sensors.
+            fake_rooms_path=journal/"rooms.json"
+            with patch.object(service,"CONFIG",fake_rooms_path):
+                fallback_groups=service.room_lock_groups(self.rooms)
+            self.assertEqual(fallback_groups,{"bedroom":"bedroom","living":"living_study","study":"living_study"})
+
+            # With topology.json present, room_lock_groups uses each actuator's configured lock_group.
+            (journal/"topology.json").write_bytes(THREE_ZONE_EXAMPLE.read_bytes())
+            with patch.object(service,"CONFIG",fake_rooms_path):
+                topo_groups=service.room_lock_groups(self.rooms)
+            self.assertEqual(topo_groups,{"bedroom":"bedroom","living":"living","study":"study"})
+
         session={"start":1,"holds":{"living":"fixture"},"manual_holds":{},"isolated_rooms":[]}
         virtual={"state":"auto","shared_attrs":json.dumps({"preset_mode":"标准"})}
         self.assertIsNone(steady_learning.learning_active(session,"living",virtual,100,lock_group="living"))
         self.assertEqual(steady_learning.learning_active(session,"study",virtual,100,lock_group="study"),1)
+        legacy_session={"start":1,"holds":{"living_study":"fixture"},"manual_holds":{},"isolated_rooms":[]}
+        self.assertIsNone(steady_learning.learning_active(legacy_session,"study",virtual,100,lock_group=fallback_groups["study"]))
 
 
 

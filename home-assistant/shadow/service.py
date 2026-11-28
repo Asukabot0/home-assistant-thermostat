@@ -590,8 +590,7 @@ def room_lock_groups(config):
                 return {room: unit.get("lock_group") or room for room, unit in actuators.items() if isinstance(unit, dict)}
         except (OSError, json.JSONDecodeError, AttributeError):
             pass
-    shared = {room for group in shared_sensor_groups(config) for room in group}
-    return {room: ("living_study" if room in shared and room in SHARED_ROOMS else room) for room in config}
+    return {room: ("living_study" if room in SHARED_ROOMS else room) for room in config}
 
 
 def coordinate(current, config=None):
