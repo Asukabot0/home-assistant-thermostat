@@ -12,7 +12,7 @@ from live_evidence import attach
 from service import power_evidence
 from steady_learning import record_episode
 from topology import configure, extra_inputs
-from zone_control import observations
+from zone_control import observations, trend
 
 
 pilot=fixture.pilot
@@ -138,8 +138,8 @@ class UnifiedCycleTests(unittest.TestCase):
         self.assertNotIn("bedroom", trace["feasible"]["lounge"])
         self.assertEqual(self.h.calls, [])
 
-    def test_auxiliary_initial_uses_home_target_and_requires_continuing_recovery(self):
-        for measured, initial in ((23.4, 23), (22.7, None)):
+    def test_auxiliary_initial_starts_milder_than_home_target_and_requires_continuing_recovery(self):
+        for measured, initial in ((23.4, 24), (22.7, None)):
             with self.subTest(measured=measured):
                 self.h.journal.unlink(missing_ok=True)
                 self.h.calls.clear()
@@ -210,17 +210,69 @@ class UnifiedCycleTests(unittest.TestCase):
                 self.assertEqual(settled["commands"][-1]["status"], "proxy_echo")
                 self.assertEqual(len(self.h.calls), 1)
 
-    def test_comfort_overrun_respects_minimum_runtime_and_current_observations(self):
-        for case in ("minimum_runtime", "stale_temperature", "before_mode_change", "stale_power"):
+    def test_comfort_overrun_within_minimum_runtime_eases_then_stops_when_dormant(self):
+        self.scene(bed=("cool", 24, 23.0, 538))
+        bedroom = self.h.live["bedroom"]
+        self.h.recent_adjustment("bedroom", 23, ago=5)
+        bedroom["adapter"]["last_mode_change"] = self.h.now - 100
+        self.h.observe("bedroom", new_report=False)
+
+        eased = self.h.snapshot()
+
+        self.assertEqual(self.h.calls, [("services/climate/set_temperature", {
+            "entity_id": pilot.ROOMS["bedroom"]["adapter"], "temperature": 26})])
+        self.assertEqual(eased["commands"][-1]["purpose"], "min_run_easing")
+        self.assertEqual(self.trace()["rejections"], [])
+        echoed = self.run_cycle(20, cache=("bedroom", "living", "study"))
+        self.assertEqual(echoed["commands"][-1]["status"], "proxy_echo")
+        self.assertEqual(len(self.h.calls), 1)
+
+        bedroom["adapter"]["power"] = 8
+        stopped = self.run_cycle(900, bed=23.2)
+
+        self.assertEqual(self.h.calls[-1], ("services/climate/set_hvac_mode", {
+            "entity_id": pilot.ROOMS["bedroom"]["adapter"], "hvac_mode": "off"}))
+        self.assertEqual(stopped["commands"][-1]["purpose"], "energy_off")
+
+    def test_assistance_without_owner_eases_instead_of_running_on(self):
+        self.scene(bed=("cool", 23, 24.0, 402), lounge=("off", 24, 24.9, 8), study=("off", 24, 24.9, 8))
+        self.h.update_state(manual_holds={"living": "fixture", "study": "fixture"}, commands=[{
+            "room": "bedroom", "kind": "temperature", "value": 23, "before": ["cool", 24, "auto"],
+            "sent_at": self.h.now-2500, "proxy_at": self.h.now-2500, "purpose": "zone_strengthen",
+            "status": "proxy_echo", "followup": {}, "control": {"zone": "lounge"}}])
+
+        eased = self.run_cycle()
+
+        self.assertIsNone(self.trace()["owner"])
+        self.assertEqual((eased["commands"][-1]["purpose"], eased["commands"][-1]["value"]), ("zone_reduce", 24))
+
+    def test_trend_after_strengthening_is_anchored_on_last_prior_report(self):
+        points = [[0, 24.4], [600, 24.4], [1300, 23.9]]
+        self.assertIsNone(trend(points, 700, 1310, pilot.POLICY))
+        anchored = trend(points, 700, 1310, pilot.POLICY, anchored=True)
+        self.assertEqual((anchored["from"], anchored["reports"]), (600, 2))
+        self.assertLess(anchored["delta"], -0.4)
+
+    def test_comfort_overrun_at_weakest_setting_still_respects_minimum_runtime(self):
+        self.scene(bed=("cool", 26, 23.0, 538))
+        self.h.recent_adjustment("bedroom", 25, ago=5)
+        self.h.live["bedroom"]["adapter"]["last_mode_change"] = self.h.now - 100
+        self.h.observe("bedroom", new_report=False)
+
+        self.h.snapshot()
+
+        self.assertEqual(self.h.calls, [])
+        self.assertIn([["bedroom", "mode", "off", "energy_off"], "等待本机最短运行时间"], self.trace()["rejections"])
+
+    def test_comfort_overrun_respects_current_observations(self):
+        for case in ("stale_temperature", "before_mode_change", "stale_power"):
             with self.subTest(case=case):
                 self.h.journal.unlink(missing_ok=True)
                 self.h.calls.clear()
                 self.scene(bed=("cool", 24, 23.0, 538))
                 bedroom = self.h.live["bedroom"]
                 self.h.recent_adjustment("bedroom", 23, ago=5)
-                if case == "minimum_runtime":
-                    bedroom["adapter"]["last_mode_change"] = self.h.now - 100
-                elif case == "stale_temperature":
+                if case == "stale_temperature":
                     bedroom["temperature_report_at"] = self.h.now - 1201
                 elif case == "before_mode_change":
                     bedroom["adapter"]["last_mode_change"] = self.h.now - 930
@@ -232,9 +284,6 @@ class UnifiedCycleTests(unittest.TestCase):
                 self.h.snapshot()
 
                 self.assertEqual(self.h.calls, [])
-                if case == "minimum_runtime":
-                    self.assertIn([["bedroom", "mode", "off", "energy_off"], "等待本机最短运行时间"],
-                                  self.trace()["rejections"])
 
     def test_start_inherited_setting_is_safe_and_target_change_keeps_confirmed_mode(self):
         self.scene(bed=("off",22,23.4,8))
@@ -310,7 +359,7 @@ class UnifiedCycleTests(unittest.TestCase):
         self.assertEqual(memory["trackers"]["alpha"]["changed_at"],self.h.now)
 
     def test_opposed_real_cycle_yields_then_observes_and_serves_each_zone(self):
-        self.scene(bed=("heat",22,23.4,300),lounge=("cool",25,24.6,300),study=("off",25,24.6,8))
+        self.scene(bed=("heat",22,23.5,300),lounge=("cool",25,24.5,300),study=("off",25,24.5,8))
         reduced=self.qualify()
         self.assertEqual([(a["room"],a["value"],a["purpose"]) for a in reduced["commands"]],[("bedroom",21,"handoff_reduce")])
         self.run_cycle(20,cache=("bedroom","living","study"))

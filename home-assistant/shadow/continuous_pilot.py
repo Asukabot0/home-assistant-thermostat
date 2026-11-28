@@ -24,7 +24,7 @@ from pilot_gate import ROOMS, matching_feedback, room_advice, room_feedback
 from service import CONFIG, encode, local
 from live_evidence import attach as attach_power
 from topology import extra_inputs, read_topology
-from zone_control import allows_assistance, coordinate as coordinate_zones, learned_initial
+from zone_control import allows_assistance, assistance_initial, coordinate as coordinate_zones, learned_initial
 
 
 PERMIT = DATA_DIR / "continuous-permit.json"
@@ -397,7 +397,9 @@ def assess(live, state, now, advise_room=room_advice, *, trial=True, isolated=()
                     or zone["source_version"] != binding.get("source_version") or zone["target"] != binding.get("target")):
                 continue
             home_zone = trace["zones"][TOPOLOGY["actuators"][room]["zone"]]
-            initial = learned_initial(room, mode, home_zone, state["closed_loop"], ROOMS[room]["soft_limits"][mode])
+            initial = (learned_initial(room, mode, home_zone, state["closed_loop"], ROOMS[room]["soft_limits"][mode])
+                       if zone_name == home_zone["key"] else
+                       assistance_initial(mode, home_zone, ROOMS[room]["soft_limits"][mode]))
             target = home_zone["target"]
             trace["feasible"].setdefault(zone_name, []).append(room)
             trace["action_scopes"][room] = dict(binding, before_c=zone["measured"], at=zone["at"])

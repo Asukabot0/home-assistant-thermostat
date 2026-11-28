@@ -29,6 +29,7 @@
   "min_run_seconds": 900,
   "min_off_seconds": 300,
   "reversal_run_seconds": 3600,
+  "assistance_initial_offset": 1,
   "tracking_band": 0.3,
   "tracking_dwell_seconds": 1200,
   "tracking_report_span_seconds": 600,

@@ -11,8 +11,14 @@ from service import metered_interval
 DIRECTION = {"heat": 1, "cool": -1}
 
 
-def trend(points, after, now, policy):
-    recent = [p for p in points if p[0] > after and p[0] >= now-policy["sparse_trend_window_seconds"]]
+def trend(points, after, now, policy, *, anchored=False):
+    window = now-policy["sparse_trend_window_seconds"]
+    recent = [p for p in points if p[0] > after and p[0] >= window]
+    # The last report before a strengthening command anchors the first
+    # response, so sparse sensors can show an overshoot one report earlier.
+    anchor = next((p for p in reversed(points) if p[0] <= after), None) if anchored else None
+    if recent and anchor is not None and anchor[0] >= window:
+        recent.insert(0, anchor)
     slopes = [(v2-v1)/(t2-t1) for i, (t1, v1) in enumerate(recent) for t2, v2 in recent[i+1:]
               if t2-t1 >= policy["minimum_trend_span_seconds"]]
     if not slopes or now-recent[-1][0] > policy["sparse_report_age_seconds"]:
@@ -187,8 +193,12 @@ def observations(topology, live, inputs, state, actions, paused, now, policy=POL
                         entry.update(source_version=identity, learning_version=topology["learning_versions"][entry["unit"]])
         points = add_points(memory, ref, identity, now, policy)
         memory["zone_version"] = definition
-        changed = max((a["proxy_at"] for a in actions if key in topology["actuators"][a["room"]]["influences"]), default=0)
-        forecast = trend(points, max(changed, memory["changed_at"]), now, policy) if ref["quality"] == "fresh" else None
+        latest = max((a for a in actions if key in topology["actuators"][a["room"]]["influences"]),
+                     key=lambda a: a["proxy_at"], default=None)
+        changed = latest["proxy_at"] if latest else 0
+        forecast = (trend(points, max(changed, memory["changed_at"]), now, policy,
+                          anchored=changed > memory["changed_at"] and is_strengthening(latest))
+                    if ref["quality"] == "fresh" else None)
         result = track(memory, ref, target, forecast, is_paused, now, policy)
         result.update(source_version=identity, observation_definition=definition, source=ref["source"], primary=zone["primary"],
                       primary_reading=primary, inputs=sensors,
@@ -216,6 +226,15 @@ def learned_initial(room, mode, zone, state, limits, policy=POLICY):
     chosen = round(zone["target"])
     if learned and learned["source_version"] == zone["source_version"] and learned["target"] == zone["target"]:
         chosen = max(chosen-policy["ordinary_step"], min(chosen+policy["ordinary_step"], learned["setpoint"]))
+    return max(bounds[0], min(bounds[1], chosen))
+
+
+def assistance_initial(mode, home_zone, limits, policy=POLICY):
+    """Start cross-zone help weaker than the home target so the home zone is not driven past it."""
+    bounds = setpoint_bounds(limits)
+    if bounds is None or home_zone["target"] is None:
+        return None
+    chosen = round(home_zone["target"]) - DIRECTION[mode]*policy.get("assistance_initial_offset", 1)
     return max(bounds[0], min(bounds[1], chosen))
 
 
@@ -586,11 +605,30 @@ def coordinate(live, readings, ready, state, now, configurations, connected, top
             continue
         direction = DIRECTION[mode]
         current_excess = direction*(local_zone["measured"]-local_zone["target"])
-        if (current_excess > policy["comfort_band"] + TEMP_EPSILON and output[room]
+        quiet = quiet_power(now, live[room], row, policy["lower_output_observe_seconds"])
+        eased = own is not None and own["kind"] == "temperature" and not is_strengthening(own)
+        weakest = bounds[1] if mode == "cool" else bounds[0]
+
+        def stop_or_ease(reason):
+            # While the minimum run time blocks a stop, the weakest soft-limit
+            # setting is the only way to end active output immediately.
+            if (now-live[room]["adapter"]["last_mode_change"] < policy["min_run_seconds"]
+                    and setting != weakest and not increases_output(mode, setting, weakest)):
+                candidates.append((0, rank, room, "temperature", weakest, "min_run_easing"))
+                reasons[room] = "ease_within_minimum_runtime"
+            else:
+                candidates.append((0, rank, room, "mode", "off", "energy_off"))
+                reasons[room] = reason
+
+        if (current_excess > policy["comfort_band"] + TEMP_EPSILON
                 and local_zone["at"] > live[room]["adapter"]["last_mode_change"]):
-            candidates.append((0, rank, room, "mode", "off", "energy_off"))
-            reasons[room] = "exit_local_comfort_overrun"
-            continue
+            if output[room]:
+                stop_or_ease("exit_local_comfort_overrun")
+                continue
+            if quiet and eased:
+                candidates.append((0, rank, room, "mode", "off", "energy_off"))
+                reasons[room] = "exit_eased_dormant_overrun"
+                continue
         local_prediction = local_zone["trend"]
         expected = (current_excess+direction*local_prediction["delta"]-local_prediction["uncertainty"]
                     if local_prediction else current_excess)
@@ -605,11 +643,12 @@ def coordinate(live, readings, ready, state, now, configurations, connected, top
                      and any(output[p] and p != room and modes[p] == mode and units[p]["zone"] == home for p in output))
         previous_zone = (own.get("control") or {}).get("zone", home) if own else home
         assistance_limited = previous_zone != home and current_excess >= policy["tracking_band"] - TEMP_EPSILON
-        reducing = (direct or red_risk or assistance_limited or expected > policy["tracking_band"]+TEMP_EPSILON
-                    or blocks_needed or redundant)
+        # Help for another zone ends with that zone's ownership unless the home zone needs this mode itself.
+        assistance_orphaned = (previous_zone != home and owner != previous_zone
+                               and not (local_zone["qualified"] and local_zone["direction"] == mode))
+        reducing = (direct or red_risk or assistance_limited or assistance_orphaned
+                    or expected > policy["tracking_band"]+TEMP_EPSILON or blocks_needed or redundant)
         low = power.get("bands", {}).get("low", {})
-        quiet = quiet_power(now, live[room], row, policy["lower_output_observe_seconds"])
-        eased = own is not None and own["kind"] == "temperature" and not is_strengthening(own)
         return_after = response_ready(now, local_zone, own, policy["reduction_wait_seconds"])
         if own and quiet and low["since"] > own["proxy_at"]:
             return_after = return_after or now-own["proxy_at"] >= policy["reduction_wait_seconds"]
@@ -622,10 +661,12 @@ def coordinate(live, readings, ready, state, now, configurations, connected, top
             proposed = (bounds[1] if mode == "heat" and setting > bounds[1] else bounds[0]
                         if mode == "cool" and setting < bounds[0] else
                         automatic_setpoint(setting, -direction*policy["ordinary_step"], configurations[room]["soft_limits"][mode]))
-            if ((blocks_needed and quiet) or (output[room] and (eased or proposed is None) and
-                                             (blocks_needed or red_risk or redundant or current_excess > policy["ideal_band"]))):
+            if blocks_needed and quiet:
                 candidates.append((0, rank, room, "mode", "off", "energy_off"))
-                reasons[room] = "exit_dormant_opposition" if quiet else "exit_contrary_or_risky_output"
+                reasons[room] = "exit_dormant_opposition"
+            elif output[room] and (eased or proposed is None) and (
+                    blocks_needed or red_risk or redundant or current_excess > policy["ideal_band"]):
+                stop_or_ease("exit_contrary_or_risky_output")
             elif output[room] and proposed is not None:
                 candidates.append((1, rank, room, "temperature", proposed, "zone_reduce"))
                 reasons[room] = ("high_power_overrun" if direct else "reduce_at_assistance_limit" if assistance_limited
