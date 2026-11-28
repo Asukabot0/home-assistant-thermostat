@@ -15,7 +15,7 @@ Key invariants:
 """
 from __future__ import annotations
 
-from bisect import bisect_right
+from bisect import bisect_left, bisect_right
 from collections import Counter, defaultdict
 from contextlib import closing, contextmanager
 from dataclasses import dataclass, field
@@ -46,13 +46,24 @@ from .config import (
     load_site_config_from_effective_telemetry,
     load_site_config_from_files,
     shadow_model,
-    telemetry_evidence,
 )
 
 MAX_POWER_GAP_SECONDS = 120.0
 DEFAULT_SETTLE_WINDOW_SECONDS = 300.0
 DEFAULT_MIN_WH_COVERAGE = 1.0
 MODE_LIST = ("off", "heat", "cool")
+
+POWER_SOURCE_PRIMARY_LEDGER = "primary:ledger"
+POWER_SOURCE_PRIMARY_RECORDER = "primary:recorder"
+POWER_SOURCE_FALLBACK_LEDGER = "fallback:ledger"
+POWER_SOURCE_FALLBACK_RECORDER = "fallback:recorder"
+
+POWER_SOURCE_PRIORITY: dict[str, int] = {
+    POWER_SOURCE_PRIMARY_LEDGER: 0,
+    POWER_SOURCE_PRIMARY_RECORDER: 1,
+    POWER_SOURCE_FALLBACK_LEDGER: 2,
+    POWER_SOURCE_FALLBACK_RECORDER: 3,
+}
 
 
 def _num(val: Any) -> float | None:
@@ -131,6 +142,7 @@ class PowerReport:
     observer_epoch: str
     report_at: float
     watts: float | None
+    source_role: str = "primary"  # "primary" or "fallback"
 
 
 @dataclass(frozen=True)
@@ -182,6 +194,8 @@ class PowerIntegration:
     gap_seconds: float
     has_gap: bool
     n_intervals: int
+    source_covered_seconds: tuple[tuple[str, float], ...] = ()
+    last_used_report_at: float | None = None
 
     @property
     def full_interval_wh(self) -> float | None:
@@ -189,6 +203,11 @@ class PowerIntegration:
         if self.wh is None or self.has_gap:
             return None
         return self.wh
+
+    @property
+    def covered_by_source(self) -> dict[str, float]:
+        """Covered seconds broken down by source class (primary:ledger, primary:recorder, etc.)."""
+        return dict(self.source_covered_seconds)
 
 
 @dataclass
@@ -279,6 +298,87 @@ def deduplicate_temp_reports(raw_reports: list[TempReport]) -> tuple[list[TempRe
     return deduped, skipped
 
 
+def classify_power_report(
+    rep: PowerReport,
+    *,
+    primary_entity: str | None = None,
+    fallback_entity: str | None = None,
+) -> tuple[str, str]:
+    """Classify a power report into (source_role, source_class) for priority ordering."""
+    if primary_entity is not None and rep.source_entity == primary_entity:
+        role = "primary"
+    elif fallback_entity is not None and rep.source_entity == fallback_entity:
+        role = "fallback"
+    else:
+        role = "fallback" if rep.source_role == "fallback" else "primary"
+    is_recorder = rep.observer_epoch == "recorder"
+    if role == "primary":
+        return role, (POWER_SOURCE_PRIMARY_RECORDER if is_recorder else POWER_SOURCE_PRIMARY_LEDGER)
+    return role, (POWER_SOURCE_FALLBACK_RECORDER if is_recorder else POWER_SOURCE_FALLBACK_LEDGER)
+
+
+def _epoch_sort_key(epoch: str, max_report_at: float) -> tuple[int, float, str]:
+    """Order epochs within the same tier: ISO/numeric timestamps first (chronologically), then non-ISO labels by max_report_at."""
+    ts = _ts(epoch)
+    if ts is not None:
+        return (1, ts, epoch)
+    return (0, max_report_at, epoch)
+
+
+def _subtract_covered(
+    left: float,
+    right: float,
+    covered: list[tuple[float, float]],
+    covered_rights: list[float],
+) -> list[tuple[float, float]]:
+    """Return uncovered sub-intervals of [left, right] after subtracting sorted disjoint covered spans."""
+    if right <= left + 1e-12:
+        return []
+    remain: list[tuple[float, float]] = []
+    cur = left
+    idx = bisect_right(covered_rights, cur)
+    n = len(covered)
+    while idx < n:
+        c_left, c_right = covered[idx]
+        if c_left >= right - 1e-12:
+            break
+        if c_left > cur + 1e-12:
+            remain.append((cur, c_left))
+        if c_right > cur:
+            cur = c_right
+        if cur >= right - 1e-12:
+            break
+        idx += 1
+    if right - cur > 1e-12:
+        remain.append((cur, right))
+    return remain
+
+
+def _add_covered_span(
+    covered: list[tuple[float, float]],
+    covered_rights: list[float],
+    left: float,
+    right: float,
+) -> None:
+    """Insert [left, right] into sorted disjoint covered spans and coalesce adjacent spans."""
+    if right <= left + 1e-12:
+        return
+    idx = bisect_right(covered_rights, left - 1e-12)
+    if idx > 0 and covered[idx - 1][1] >= left - 1e-12:
+        idx -= 1
+    new_l, new_r = left, right
+    end_idx = idx
+    n = len(covered)
+    while end_idx < n and covered[end_idx][0] <= new_r + 1e-12:
+        if covered[end_idx][0] < new_l:
+            new_l = covered[end_idx][0]
+        if covered[end_idx][1] > new_r:
+            new_r = covered[end_idx][1]
+        end_idx += 1
+    covered[idx:end_idx] = [(new_l, new_r)]
+    covered_rights[idx:end_idx] = [new_r]
+
+
 def deduplicate_power_reports(raw_reports: list[PowerReport]) -> tuple[list[PowerReport], int]:
     """Deduplicate by (unit, source_entity, observer_epoch, report_at).
 
@@ -294,15 +394,174 @@ def deduplicate_power_reports(raw_reports: list[PowerReport]) -> tuple[list[Powe
         watts = rep.watts
         if watts is not None and (not math.isfinite(watts) or watts < 0.0 or watts > 10000.0):
             watts = None
+        role = "fallback" if rep.source_role == "fallback" else "primary"
         key = (rep.unit, rep.source_entity, rep.observer_epoch, int(round(rep.report_at * 1_000_000)))
         if key in merged:
             skipped += 1
             if watts is None and merged[key].watts is not None:
-                merged[key] = PowerReport(rep.unit, rep.source_entity, rep.observer_epoch, rep.report_at, None)
+                merged[key] = PowerReport(rep.unit, rep.source_entity, rep.observer_epoch, rep.report_at, None, role)
         else:
-            merged[key] = PowerReport(rep.unit, rep.source_entity, rep.observer_epoch, rep.report_at, watts)
+            merged[key] = PowerReport(rep.unit, rep.source_entity, rep.observer_epoch, rep.report_at, watts, role)
     deduped = sorted(merged.values(), key=lambda r: (r.report_at, r.observer_epoch, r.source_entity))
     return deduped, skipped
+
+
+def merge_power_ranges(
+    reports: list[PowerReport],
+    start: float,
+    end: float,
+    *,
+    max_gap_s: float = MAX_POWER_GAP_SECONDS,
+    primary_entity: str | None = None,
+    fallback_entity: str | None = None,
+    causal_cutoff: float | None = None,
+) -> list[tuple[float, float, float, str, float]]:
+    """Build sorted, disjoint, priority-merged power intervals over [start, end].
+
+    Returns tuples of (left, right, watts, source_class, closing_report_at).
+
+    Invariants:
+    - Priority order: primary:ledger (0) > primary:recorder (1) > fallback:ledger (2) > fallback:recorder (3).
+    - Higher-priority coverage is NEVER overwritten or tail-truncated by lower-priority streams;
+      lower priority may only fill true uncovered holes.
+    - Overlapping epochs within the same priority tier resolve in favor of the newer epoch while
+      strictly preserving unoverlapped prefixes and tails (e.g. [0,60] overlapped by [10,20] keeps [20,60]).
+    - Adjacent reports never bridge across watts=None, gaps > max_gap_s, different sources, or different epochs.
+    - A higher-tier watts=None on the same physical source entity prevents lower-tier same-entity bridging.
+    - When causal_cutoff is provided and primary is live at causal_cutoff, fallback does not fill the
+      open in-flight primary tail (t_live, causal_cutoff].
+    """
+    if end <= start or max_gap_s <= 0.0:
+        return []
+
+    _missing = object()
+    series_map: dict[tuple[int, str, str, str], dict[float, float | None]] = defaultdict(dict)
+    none_by_entity_tier: dict[tuple[str, int], set[float]] = defaultdict(set)
+
+    # Track latest primary ledger/recorder report <= causal_cutoff for live-tail guard.
+    latest_pl_ts: float | None = None
+    latest_pl_w: float | None = None
+    latest_pr_ts: float | None = None
+    latest_pr_w: float | None = None
+
+    lo_bound = start - max_gap_s - 1e-6
+    hi_bound = end + max_gap_s + 1e-6
+
+    for rep in reports:
+        if not math.isfinite(rep.report_at):
+            continue
+        if rep.report_at < lo_bound or rep.report_at > hi_bound:
+            continue
+        if causal_cutoff is not None and rep.report_at > causal_cutoff:
+            continue
+        watts = rep.watts
+        if watts is not None and (not math.isfinite(watts) or watts < 0.0 or watts > 10000.0):
+            watts = None
+        _, source_class = classify_power_report(
+            rep,
+            primary_entity=primary_entity,
+            fallback_entity=fallback_entity,
+        )
+        tier = POWER_SOURCE_PRIORITY[source_class]
+        skey = (tier, source_class, rep.source_entity, rep.observer_epoch)
+        prev = series_map[skey].get(rep.report_at, _missing)
+        if prev is _missing or watts is None:
+            series_map[skey][rep.report_at] = watts
+        if watts is None:
+            none_by_entity_tier[(rep.source_entity, tier)].add(rep.report_at)
+
+        if causal_cutoff is not None:
+            if tier == 0:
+                if latest_pl_ts is None or rep.report_at > latest_pl_ts:
+                    latest_pl_ts = rep.report_at
+                    latest_pl_w = watts
+                elif rep.report_at == latest_pl_ts and watts is None:
+                    latest_pl_w = None
+            elif tier == 1:
+                if latest_pr_ts is None or rep.report_at > latest_pr_ts:
+                    latest_pr_ts = rep.report_at
+                    latest_pr_w = watts
+                elif rep.report_at == latest_pr_ts and watts is None:
+                    latest_pr_w = None
+
+    if not series_map:
+        return []
+
+    live_primary_ts: float | None = None
+    if causal_cutoff is not None:
+        if (
+            latest_pl_ts is not None
+            and latest_pl_w is not None
+            and 0.0 <= causal_cutoff - latest_pl_ts <= max_gap_s
+        ):
+            live_primary_ts = latest_pl_ts
+        elif (
+            latest_pr_ts is not None
+            and latest_pr_w is not None
+            and 0.0 <= causal_cutoff - latest_pr_ts <= max_gap_s
+            and not (latest_pl_ts is not None and latest_pl_w is None and latest_pl_ts >= latest_pr_ts)
+        ):
+            live_primary_ts = latest_pr_ts
+
+    # Pre-build sorted higher-tier same-entity None timestamps so lower tiers cannot bridge across outages.
+    higher_none_cache: dict[tuple[str, int], list[float]] = {}
+    streams_by_tier: dict[int, list[tuple[tuple[int, float, str], list[tuple[float, float, float, str, float]]]]] = (
+        defaultdict(list)
+    )
+
+    for (tier, source_class, source_entity, observer_epoch), series in series_map.items():
+        if len(series) < 2:
+            continue
+        cache_key = (source_entity, tier)
+        blockers = higher_none_cache.get(cache_key)
+        if blockers is None:
+            merged_nones: set[float] = set()
+            for other_tier in range(tier):
+                merged_nones.update(none_by_entity_tier.get((source_entity, other_tier), ()))
+            blockers = sorted(merged_nones)
+            higher_none_cache[cache_key] = blockers
+
+        values = sorted(series.items())
+        max_rep = values[-1][0]
+        stream_intervals: list[tuple[float, float, float, str, float]] = []
+        for (a, w), (b, v) in zip(values, values[1:]):
+            if w is None or v is None or w < 0.0 or v < 0.0:
+                continue
+            dt = b - a
+            if not (0.0 < dt <= max_gap_s):
+                continue
+            if blockers:
+                b_idx = bisect_left(blockers, a)
+                if b_idx < len(blockers) and blockers[b_idx] <= b:
+                    continue
+            left = max(a, start)
+            right = min(b, end)
+            if tier >= 2 and live_primary_ts is not None:
+                right = min(right, live_primary_ts)
+            if right > left + 1e-12:
+                stream_intervals.append((left, right, float(w), source_class, b))
+        if stream_intervals:
+            streams_by_tier[tier].append((_epoch_sort_key(observer_epoch, max_rep), stream_intervals))
+
+    accepted: list[tuple[float, float, float, str, float]] = []
+    covered: list[tuple[float, float]] = []
+    covered_rights: list[float] = []
+
+    for tier in (0, 1, 2, 3):
+        tier_streams = streams_by_tier.get(tier)
+        if not tier_streams:
+            continue
+        # Newer observer epoch takes precedence within the same priority tier, preserving unoverlapped tails.
+        tier_streams.sort(key=lambda item: item[0], reverse=True)
+        for _epoch_key, stream_intervals in tier_streams:
+            for left, right, watts, source_class, closing_ts in stream_intervals:
+                uncovered = _subtract_covered(left, right, covered, covered_rights)
+                for u_left, u_right in uncovered:
+                    accepted.append((u_left, u_right, watts, source_class, closing_ts))
+                    _add_covered_span(covered, covered_rights, u_left, u_right)
+
+    accepted.sort(key=lambda x: (x[0], x[1]))
+    return accepted
 
 
 def integrate_power_interval(
@@ -311,8 +570,11 @@ def integrate_power_interval(
     end: float,
     *,
     max_gap_s: float = MAX_POWER_GAP_SECONDS,
+    primary_entity: str | None = None,
+    fallback_entity: str | None = None,
+    causal_cutoff: float | None = None,
 ) -> PowerIntegration:
-    """Integrate electrical Wh over [start, end] reusing evidence.power_ranges semantics.
+    """Integrate electrical Wh over [start, end] using priority, tail-preserving interval merge.
 
     Missing or gapped intervals are excluded from coverage and NEVER counted as 0 Wh.
     """
@@ -320,43 +582,36 @@ def integrate_power_interval(
     if expected <= 0.0:
         return PowerIntegration(None, 0.0, 0.0, 0.0, 0.0, True, 0)
 
-    # Filter to reports that could bracket [start, end].
-    bracketed = [
-        {"observer_epoch": f"{r.source_entity}|{r.observer_epoch}", "report_at": r.report_at, "watts": r.watts}
-        for r in reports
-        if start - max_gap_s <= r.report_at <= end + max_gap_s
-    ]
-    if not bracketed:
+    intervals = merge_power_ranges(
+        reports,
+        start,
+        end,
+        max_gap_s=max_gap_s,
+        primary_entity=primary_entity,
+        fallback_entity=fallback_entity,
+        causal_cutoff=causal_cutoff,
+    )
+    if not intervals:
         return PowerIntegration(None, 0.0, expected, 0.0, expected, True, 0)
 
-    if abs(max_gap_s - telemetry_evidence.MAX_POWER_GAP) < 1e-9:
-        intervals = telemetry_evidence.power_ranges(bracketed, start, end)
-    else:
-        epochs: dict[str, dict[float, float | None]] = defaultdict(dict)
-        for row in bracketed:
-            epochs[row["observer_epoch"]][row["report_at"]] = row["watts"]
-        raw_ranges = []
-        for series in epochs.values():
-            values = sorted(series.items())
-            for (a, w), (b, v) in zip(values, values[1:]):
-                left, right = max(a, start), min(b, end)
-                if w is not None and v is not None and w >= 0 and v >= 0 and 0 < b - a <= max_gap_s and right > left:
-                    raw_ranges.append((left, right, w))
-        raw_ranges.sort()
-        intervals = []
-        for item in raw_ranges:
-            if intervals and item[0] < intervals[-1][1]:
-                left, _, watts = intervals[-1]
-                intervals[-1] = (left, item[0], watts)
-            intervals.append(item)
+    covered = 0.0
+    watt_seconds = 0.0
+    by_source: dict[str, float] = {}
+    last_used_report_at: float | None = None
+    for left, right, watts, source_class, closing_ts in intervals:
+        dur = max(0.0, right - left)
+        covered += dur
+        watt_seconds += dur * watts
+        by_source[source_class] = by_source.get(source_class, 0.0) + dur
+        if last_used_report_at is None or closing_ts > last_used_report_at:
+            last_used_report_at = closing_ts
 
-    covered = sum(max(0.0, b - a) for a, b, _ in intervals)
     covered = min(covered, expected)
-    watt_seconds = sum(max(0.0, b - a) * float(w) for a, b, w in intervals)
-    coverage_ratio = covered / expected if expected > 0 else 0.0
+    coverage_ratio = covered / expected if expected > 0.0 else 0.0
     gap_seconds = max(0.0, expected - covered)
     has_gap = coverage_ratio < 1.0 - 1e-6
     wh = (watt_seconds / 3600.0) if covered > 0.0 else None
+    source_tuple = tuple(sorted(by_source.items(), key=lambda kv: POWER_SOURCE_PRIORITY.get(kv[0], 99)))
     return PowerIntegration(
         wh=wh,
         covered_seconds=covered,
@@ -365,6 +620,8 @@ def integrate_power_interval(
         gap_seconds=gap_seconds,
         has_gap=has_gap,
         n_intervals=len(intervals),
+        source_covered_seconds=source_tuple,
+        last_used_report_at=last_used_report_at,
     )
 
 
@@ -515,6 +772,7 @@ def ingest_production_readonly(
                     unit = power_entity_to_unit.get(src)
                     if unit is None:
                         continue
+                    act = site.actuator_by_name(unit)
                     raw_power.append(
                         PowerReport(
                             unit=unit,
@@ -522,6 +780,7 @@ def ingest_production_readonly(
                             observer_epoch=str(row["observer_epoch"]),
                             report_at=float(row["report_at"]),
                             watts=_num(row["watts"]),
+                            source_role="primary" if src == act.power_entity else "fallback",
                         )
                     )
             if "decisions" in tables:
@@ -580,15 +839,19 @@ def ingest_production_readonly(
                     pe = val.get("power_evidence") or {}
                     pctx = pe.get("context")
                     if p_rep is not None and isinstance(pctx, list) and len(pctx) == 2:
-                        raw_power.append(
-                            PowerReport(
-                                unit=unit,
-                                source_entity=str(pctx[0]),
-                                observer_epoch=str(pctx[1]),
-                                report_at=p_rep,
-                                watts=p_w,
+                        psrc = str(pctx[0])
+                        act = site.actuator_by_name(unit)
+                        if psrc == act.power_entity or (act.power_fallback and psrc == act.power_fallback):
+                            raw_power.append(
+                                PowerReport(
+                                    unit=unit,
+                                    source_entity=psrc,
+                                    observer_epoch=str(pctx[1]),
+                                    report_at=p_rep,
+                                    watts=p_w,
+                                    source_role="primary" if psrc == act.power_entity else "fallback",
+                                )
                             )
-                        )
                     proxy_by_unit[unit].append(
                         ProxyStateEvent(
                             unit=unit,
@@ -734,6 +997,7 @@ def ingest_production_readonly(
                                 )
                         elif entity in power_entity_to_unit:
                             unit = power_entity_to_unit[entity]
+                            act = site.actuator_by_name(unit)
                             raw_power.append(
                                 PowerReport(
                                     unit=unit,
@@ -741,6 +1005,7 @@ def ingest_production_readonly(
                                     observer_epoch="recorder",
                                     report_at=rep_ts,
                                     watts=_num(row["state"]),
+                                    source_role="primary" if entity == act.power_entity else "fallback",
                                 )
                             )
                         elif entity in adapter_entity_to_unit:
@@ -880,15 +1145,19 @@ def ingest_production_readonly(
                                 pctx = uinfo.get("power_context")
                                 prep = _ts(uinfo.get("power_report_at"))
                                 if isinstance(pctx, list) and len(pctx) == 2 and prep is not None:
-                                    raw_power.append(
-                                        PowerReport(
-                                            unit=uname,
-                                            source_entity=str(pctx[0]),
-                                            observer_epoch=str(pctx[1]),
-                                            report_at=prep,
-                                            watts=_num(uinfo.get("power_w")),
+                                    psrc = str(pctx[0])
+                                    act = site.actuator_by_name(uname)
+                                    if psrc == act.power_entity or (act.power_fallback and psrc == act.power_fallback):
+                                        raw_power.append(
+                                            PowerReport(
+                                                unit=uname,
+                                                source_entity=psrc,
+                                                observer_epoch=str(pctx[1]),
+                                                report_at=prep,
+                                                watts=_num(uinfo.get("power_w")),
+                                                source_role="primary" if psrc == act.power_entity else "fallback",
+                                            )
                                         )
-                                    )
                                 status_str = str(uinfo.get("status", ""))
                                 proxy_by_unit[uname].append(
                                     ProxyStateEvent(
@@ -995,13 +1264,50 @@ def ingest_evidence_archives(
                     rep_at = _ts(row.get("report_at"))
                     if rep_at is None:
                         continue
+                    act = site.actuator_by_name(unit)
+                    raw_src = row.get("source")
+                    src = str(raw_src) if raw_src not in {None, ""} else act.power_entity
+                    if src == act.power_entity:
+                        role = "primary"
+                    elif act.power_fallback and src == act.power_fallback:
+                        role = "fallback"
+                    elif archive_kind == "telemetry":
+                        continue
+                    else:
+                        role = "primary"
                     raw_power.append(
                         PowerReport(
                             unit=unit,
-                            source_entity=str(row.get("source", site.actuator_by_name(unit).power_entity)),
+                            source_entity=src,
                             observer_epoch=str(row.get("observer_epoch", "default")),
                             report_at=rep_at,
                             watts=_num(row.get("watts")),
+                            source_role=role,
+                        )
+                    )
+
+            # Recorder power states (tagged as observer_epoch="recorder" and source_role="primary"/"fallback")
+            for member in ("raw/recorder-states.jsonl", "context/recorder-states.jsonl"):
+                for row in _read_jsonl(zf, member):
+                    src = str(row.get("source", ""))
+                    unit = power_entity_to_unit.get(src)
+                    if unit is None:
+                        continue
+                    rep_at = _ts(row.get("reported_at"))
+                    if rep_at is None:
+                        rep_at = _ts(row.get("updated_at"))
+                    if rep_at is None:
+                        continue
+                    act = site.actuator_by_name(unit)
+                    role = "primary" if src == act.power_entity else "fallback"
+                    raw_power.append(
+                        PowerReport(
+                            unit=unit,
+                            source_entity=src,
+                            observer_epoch="recorder",
+                            report_at=rep_at,
+                            watts=_num(row.get("value")),
+                            source_role=role,
                         )
                     )
 
@@ -1289,6 +1595,7 @@ def save_canonical_snapshot(history: CanonicalHistory, out_dir: Path) -> Path:
                 "observer_epoch": r.observer_epoch,
                 "report_at": r.report_at,
                 "watts": r.watts,
+                "source_role": r.source_role,
             }
             for reps in history.power_reports.values()
             for r in reps
@@ -1379,6 +1686,7 @@ def ingest_canonical_snapshot(snapshot_dir: Path) -> CanonicalHistory:
             observer_epoch=str(r["observer_epoch"]),
             report_at=float(r["report_at"]),
             watts=_num(r.get("watts")),
+            source_role=str(r.get("source_role", "primary")),
         )
         for r in read_jsonl("power_reports.jsonl")
     ]
@@ -1448,7 +1756,29 @@ def _finalize_canonical(
 ) -> CanonicalHistory:
     dedup_temp, skip_t = deduplicate_temp_reports(raw_temp)
     dedup_env, skip_e = deduplicate_temp_reports(raw_env)
-    dedup_power, skip_p = deduplicate_power_reports(raw_power)
+
+    normalized_power: list[PowerReport] = []
+    act_by_unit = {a.name: a for a in site.actuators}
+    for rep in raw_power:
+        act = act_by_unit.get(rep.unit)
+        if act is None:
+            continue
+        role, _ = classify_power_report(
+            rep,
+            primary_entity=act.power_entity,
+            fallback_entity=act.power_fallback,
+        )
+        if role != rep.source_role:
+            rep = PowerReport(
+                unit=rep.unit,
+                source_entity=rep.source_entity,
+                observer_epoch=rep.observer_epoch,
+                report_at=rep.report_at,
+                watts=rep.watts,
+                source_role=role,
+            )
+        normalized_power.append(rep)
+    dedup_power, skip_p = deduplicate_power_reports(normalized_power)
 
     zone_temp: dict[str, list[TempReport]] = {z.name: [] for z in site.zones}
     for rep in dedup_temp:
@@ -1713,10 +2043,32 @@ class _HistoryIndex:
 
         self.power_reports: dict[str, list[PowerReport]] = {}
         self.power_ts: dict[str, list[float]] = {}
+        self.power_by_tier: dict[str, dict[int, list[PowerReport]]] = {}
+        self.power_tier_ts: dict[str, dict[int, list[float]]] = {}
         for u in self.site.unit_names:
+            act = self.site.actuator_by_name(u)
             reps = sorted(history.power_reports.get(u, ()), key=lambda r: r.report_at)
             self.power_reports[u] = reps
             self.power_ts[u] = [r.report_at for r in reps]
+            tiers: dict[int, list[PowerReport]] = {0: [], 1: [], 2: [], 3: []}
+            for r in reps:
+                role, sclass = classify_power_report(
+                    r,
+                    primary_entity=act.power_entity,
+                    fallback_entity=act.power_fallback,
+                )
+                norm_r = (
+                    r
+                    if r.source_role == role
+                    else PowerReport(r.unit, r.source_entity, r.observer_epoch, r.report_at, r.watts, role)
+                )
+                tiers[POWER_SOURCE_PRIORITY[sclass]].append(norm_r)
+            self.power_by_tier[u] = {}
+            self.power_tier_ts[u] = {}
+            for tier_idx, treps in tiers.items():
+                ordered = sorted(treps, key=lambda r: (r.report_at, 1 if r.watts is None else 0, r.observer_epoch))
+                self.power_by_tier[u][tier_idx] = ordered
+                self.power_tier_ts[u][tier_idx] = [r.report_at for r in ordered]
 
         self.proxy_states: dict[str, list[ProxyStateEvent]] = {}
         self.proxy_ts: dict[str, list[float]] = {}
@@ -1765,15 +2117,45 @@ class _HistoryIndex:
             return None
         return self.env_reports[ename][idx]
 
-    def latest_power(self, unit: str, cutoff: float) -> PowerReport | None:
-        idx = bisect_right(self.power_ts[unit], cutoff) - 1
-        return self.power_reports[unit][idx] if idx >= 0 else None
+    def latest_power(self, unit: str, cutoff: float, *, max_age_s: float = MAX_POWER_GAP_SECONDS) -> PowerReport | None:
+        """Return the highest-priority causally available power report at or before cutoff.
+
+        Priority: primary:ledger (0) > primary:recorder (1) > fallback:ledger (2) > fallback:recorder (3).
+        """
+        cands: list[PowerReport | None] = []
+        for tier_idx in (0, 1, 2, 3):
+            ts_list = self.power_tier_ts[unit][tier_idx]
+            idx = bisect_right(ts_list, cutoff) - 1
+            cands.append(self.power_by_tier[unit][tier_idx][idx] if idx >= 0 else None)
+
+        def _is_fresh_valid(rep: PowerReport | None) -> bool:
+            if rep is None or rep.watts is None:
+                return False
+            age = cutoff - rep.report_at
+            return -60.0 <= age <= max_age_s
+
+        c0, c1, c2, c3 = cands
+        if _is_fresh_valid(c0):
+            return c0
+        if _is_fresh_valid(c1):
+            if not (c0 is not None and c0.watts is None and c0.report_at >= c1.report_at):
+                return c1
+        if _is_fresh_valid(c2):
+            return c2
+        if _is_fresh_valid(c3):
+            if not (c2 is not None and c2.watts is None and c2.report_at >= c3.report_at):
+                return c3
+
+        for cand in (c0, c1, c2, c3):
+            if cand is not None:
+                return cand
+        return None
 
     def power_slice(self, unit: str, start: float, end: float, *, max_gap_s: float = MAX_POWER_GAP_SECONDS) -> list[PowerReport]:
         lo = bisect_right(self.power_ts[unit], start - max_gap_s - 1e-6)
         # Include one prior point if needed
         lo = max(0, lo - 1)
-        hi = bisect_right(self.power_ts[unit], end + max_gap_s)
+        hi = bisect_right(self.power_ts[unit], end + max_gap_s + 1e-6)
         return self.power_reports[unit][lo:hi]
 
     def latest_proxy(self, unit: str, cutoff: float) -> ProxyStateEvent | None:
@@ -2041,9 +2423,32 @@ def extract_history_window(
             p_w = latest_p.watts if (latest_p is not None and not p_missing) else float("nan")
             # Causal power integration strictly inside (bin_start, bin_end] using reports <= bin_end.
             p_slice = [r for r in index.power_slice(u, bin_start, bin_end) if r.report_at <= bin_end]
-            p_int = integrate_power_interval(p_slice, bin_start, bin_end)
+            p_int = integrate_power_interval(
+                p_slice,
+                bin_start,
+                bin_end,
+                primary_entity=act_map.power_entity,
+                fallback_entity=act_map.power_fallback,
+                causal_cutoff=bin_end,
+            )
+            p_role = (
+                classify_power_report(
+                    latest_p,
+                    primary_entity=act_map.power_entity,
+                    fallback_entity=act_map.power_fallback,
+                )[0]
+                if latest_p is not None
+                else None
+            )
+            p_is_primary = not p_missing and p_role == "primary"
             off_ceil = act_map.verified_off_ceiling_w if act_map.verified_off_ceiling_w is not None else 15.0
-            above_off = 1.0 if (not math.isnan(p_w) and p_w > off_ceil) else 0.0
+            if p_missing:
+                above_off = 0.0
+            elif p_is_primary:
+                above_off = 1.0 if p_w > off_ceil else 0.0
+            else:
+                # Never compare fallback meter watts against a primary-only verified_off_ceiling_w.
+                above_off = float("nan")
 
             u_acts = [a for a in bin_actions if a.unit == u]
             act_sp_delta = 0.0
@@ -2066,7 +2471,8 @@ def extract_history_window(
             hold_or_iso = bool(proxy and (proxy.manual_hold or proxy.failure_hold or proxy.isolated))
             if proxy and proxy.manual_hold:
                 bin_manual = True
-            if proxy and (proxy.uncertain or (mode == "off" and not math.isnan(p_w) and p_w > max(80.0, off_ceil * 5))):
+            off_anomaly_w = max(80.0, off_ceil * 5) if p_is_primary else 80.0
+            if proxy and (proxy.uncertain or (mode == "off" and not math.isnan(p_w) and p_w > off_anomaly_w)):
                 bin_uncertain = True
 
             X[k, col : col + 4] = oh
@@ -2135,10 +2541,12 @@ def extract_history_window(
     t0_unit_setpoints: dict[str, float | None] = {}
     t0_unit_watts: dict[str, float | None] = {}
     t0_unit_power_report_at: dict[str, float | None] = {}
+    t0_unit_power_source: dict[str, str | None] = {}
     t0_unit_holds: dict[str, dict[str, bool]] = {}
     t0_unit_last_action_at: dict[str, float | None] = {}
     recent_actions = index.actions_in_window(cutoff_ts - 900.0, cutoff_ts)
     for u in spec.unit_names:
+        act_map = site.actuator_by_name(u)
         ev = index.latest_proxy(u, cutoff_ts)
         t0_unit_modes[u] = ev.mode if ev else None
         t0_unit_setpoints[u] = ev.setpoint if ev else None
@@ -2152,6 +2560,15 @@ def extract_history_window(
         pfresh = pr is not None and pr.watts is not None and -60.0 <= (cutoff_ts - pr.report_at) <= MAX_POWER_GAP_SECONDS
         t0_unit_watts[u] = pr.watts if pfresh else None
         t0_unit_power_report_at[u] = pr.report_at if pr is not None else None
+        t0_unit_power_source[u] = (
+            classify_power_report(
+                pr,
+                primary_entity=act_map.power_entity,
+                fallback_entity=act_map.power_fallback,
+            )[1]
+            if pr is not None
+            else None
+        )
         u_hist_acts = [a for a in index.actions if a.unit == u and a.at <= cutoff_ts]
         t0_unit_last_action_at[u] = u_hist_acts[-1].at if u_hist_acts else None
 
@@ -2169,6 +2586,7 @@ def extract_history_window(
         "unit_setpoints": t0_unit_setpoints,
         "unit_watts": t0_unit_watts,
         "unit_power_report_at": t0_unit_power_report_at,
+        "unit_power_source": t0_unit_power_source,
         "unit_holds": t0_unit_holds,
         "unit_last_action_at": t0_unit_last_action_at,
         "post_action_15m": len(recent_actions) > 0,
@@ -2356,8 +2774,15 @@ def build_dataset(
             total_wh_acc = 0.0
             min_cov = 1.0
             for u_idx, u in enumerate(spec.unit_names):
+                act_map = site.actuator_by_name(u)
                 pslice = index.power_slice(u, t0, t0 + h_s)
-                pint = integrate_power_interval(pslice, t0, t0 + h_s)
+                pint = integrate_power_interval(
+                    pslice,
+                    t0,
+                    t0 + h_s,
+                    primary_entity=act_map.power_entity,
+                    fallback_entity=act_map.power_fallback,
+                )
                 y_ucov[u_idx, h_idx] = float(pint.coverage_ratio)
                 min_cov = min(min_cov, pint.coverage_ratio)
                 full_wh = pint.full_interval_wh
@@ -2365,10 +2790,7 @@ def build_dataset(
                     y_uwh[u_idx, h_idx] = float(full_wh)
                     y_uval[u_idx, h_idx] = True
                     total_wh_acc += float(full_wh)
-                    closing_ts = max(
-                        (r.report_at for r in pslice if r.report_at <= t0 + h_s + MAX_POWER_GAP_SECONDS),
-                        default=t0 + h_s,
-                    )
+                    closing_ts = pint.last_used_report_at if pint.last_used_report_at is not None else (t0 + h_s)
                     actual_max_label_ts = max(actual_max_label_ts, float(closing_ts))
                 else:
                     unit_whs_valid = False
@@ -2445,13 +2867,21 @@ def build_dataset(
     # Power coverage over full observed span
     power_cov_summary = {}
     for u in spec.unit_names:
-        pint = integrate_power_interval(history.power_reports.get(u, []), t_min, t_max)
+        act_map = site.actuator_by_name(u)
+        pint = integrate_power_interval(
+            history.power_reports.get(u, []),
+            t_min,
+            t_max,
+            primary_entity=act_map.power_entity,
+            fallback_entity=act_map.power_fallback,
+        )
         power_cov_summary[u] = {
             "unique_reports": len(history.power_reports.get(u, [])),
             "coverage_ratio": round(pint.coverage_ratio, 4),
             "covered_seconds": round(pint.covered_seconds, 1),
             "gap_seconds": round(pint.gap_seconds, 1),
             "covered_wh": round(pint.wh, 3) if pint.wh is not None else None,
+            "covered_seconds_by_source": {k: round(v, 1) for k, v in pint.source_covered_seconds},
         }
 
     # Mode distribution across aligned samples

@@ -597,8 +597,15 @@ class ShadowRuntime:
                     tot_wh_sum = 0.0
                     min_cov = 1.0
                     for u in self.spec.unit_names:
+                        act_map = self.site.actuator_by_name(u)
                         pslice = index.power_slice(u, cutoff_ts, horizon_end)
-                        pint = integrate_power_interval(pslice, cutoff_ts, horizon_end)
+                        pint = integrate_power_interval(
+                            pslice,
+                            cutoff_ts,
+                            horizon_end,
+                            primary_entity=act_map.power_entity,
+                            fallback_entity=act_map.power_fallback,
+                        )
                         full_wh = pint.full_interval_wh
                         u_valid = full_wh is not None and pint.coverage_ratio >= effective_min_cov
                         min_cov = min(min_cov, pint.coverage_ratio)
@@ -614,6 +621,7 @@ class ShadowRuntime:
                             "gap_seconds": round(pint.gap_seconds, 1),
                             "has_gap": pint.has_gap,
                             "label_valid": u_valid,
+                            "covered_seconds_by_source": {k: round(v, 1) for k, v in pint.source_covered_seconds},
                         }
 
                     actual_total_wh = round(tot_wh_sum, 3) if all_units_valid else None
