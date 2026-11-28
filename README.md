@@ -59,3 +59,7 @@ docker compose -f compose.dashboard.yaml up -d
 Security note: the dashboard has no built-in authentication and binds `127.0.0.1:8780` by default. Do **not** expose it directly to a LAN via `DASHBOARD_BIND=0.0.0.0` unless placed behind an authenticating reverse proxy (or accessed over SSH port forwarding / Tailscale).
 
 Production credentials, equipment identifiers, unreduced telemetry, command journals and backups belong in the local runtime files excluded by `.gitignore`.
+
+## Decisions
+
+Decisions are recorded entry by entry in the [decision ledger](docs/decision-ledger.md). `AGENTS.md` defines what to record and how.
