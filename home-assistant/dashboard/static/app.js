@@ -29,7 +29,7 @@
     recover: {
       title: "Recover · 恢复",
       color: "#fb923c",
-      desc: "持续偏差已由独立测温证实且温度未在可信回归；作为主区 (owner) 可在动作后观察窗与门禁通过后执行按需启机或小步加码。",
+      desc: "持续偏差已由独立测温证实且温度未在可信回归；作为当前优先服务区 (owner) 可在动作后观察窗与门禁通过后执行按需启机或小步加码。",
     },
     maintain: {
       title: "Maintain · 维持",
@@ -253,7 +253,12 @@
       })
     );
 
-    document.getElementById("kpi-owner").textContent = ctrl.owner ? `${ctrl.owner}${ctrl.lead ? ` / ${ctrl.lead}` : ""}` : "无（维持）";
+    const zonesList = snap.state_machines?.zone_states || [];
+    const ownerZone = zonesList.find((z) => z.zone === ctrl.owner);
+    const ownerLabel = ownerZone ? ownerZone.label : ctrl.owner;
+    document.getElementById("kpi-owner").textContent = ctrl.owner
+      ? `${ownerLabel}${ctrl.lead ? ` · ${ctrl.lead}` : ""}`
+      : "无（维持）";
 
     const envEntries = Object.values(ctrl.environment || {});
     const freshEnv = envEntries.find((e) => e && e.value !== null && e.quality === "fresh") || envEntries[0];
@@ -534,7 +539,7 @@
       { id: "verify_reduction", x: 238, y: 20, w: 108, h: 52, t: "VerifyRed", s: "核验减载" },
       { id: "exit", x: 364, y: 20, w: 86, h: 52, t: "Exit", s: "对侧停机" },
       { id: "verify_exit", x: 468, y: 20, w: 102, h: 52, t: "VerifyExit", s: "核验低耗" },
-      { id: "serve", x: 588, y: 20, w: 78, h: 52, t: "Serve", s: "服务主区" },
+      { id: "serve", x: 588, y: 20, w: 78, h: 52, t: "Serve", s: "服务优先区" },
     ];
 
     let svg = `<svg class="sm-svg" viewBox="0 -12 680 156" role="img" aria-label="双向需求交接状态机">
@@ -584,7 +589,7 @@
       detail.appendChild(el("span", { style: "color:var(--text-muted)", text: "当前双区无冷热反向冲突，双向交接状态机处于空闲待命状态。" }));
       return;
     }
-    detail.appendChild(el("span", { class: "badge badge-warn", text: `主区: ${ho.owner || "—"}` }));
+    detail.appendChild(el("span", { class: "badge badge-warn", text: `优先区: ${ho.owner || "—"}` }));
     detail.appendChild(el("span", { class: "badge badge-accent", text: `接收机: ${ho.receiver || "—"}` }));
     detail.appendChild(el("span", { class: "badge badge-danger", text: `待退出对侧机: ${ho.blocker || "—"}` }));
     if (ho.elapsed_s !== null && ho.elapsed_s !== undefined) {
@@ -813,7 +818,13 @@
 
       const badges = el("div", { style: "display:flex; flex-wrap:wrap; gap:5px; justify-content:flex-end;" }, [
         el("span", { class: `badge ${intentBadgeClass(z.state)}`, text: z.state_label }),
-        z.is_owner ? el("span", { class: "badge badge-warn", text: "当前主区 Owner" }) : null,
+        z.is_owner
+          ? el("span", {
+              class: "badge badge-warn",
+              title: "本轮偏差最显著且存在可行设备的优先调度区（动态选举，非固定拓扑主区）",
+              text: "优先服务区 (Owner)",
+            })
+          : null,
         z.paused ? el("span", { class: "badge badge-danger", text: "已暂停" }) : null,
       ]);
 
@@ -916,11 +927,23 @@
         ? el("span", { class: "badge badge-ok", text: "可控就绪" })
         : el("span", { class: "badge badge-warn", text: "待就绪" });
 
+      const influenceSummary = Object.entries(a.influences || {})
+        .map(([zk, w]) => `${zk}:${w}`)
+        .join(" / ");
+      const subParts = [`本区 ${a.zone}`];
+      if (a.served_zone && a.served_zone !== a.zone) {
+        subParts.push(`当前协助 ${a.served_zone}`);
+      }
+      if (influenceSummary) {
+        subParts.push(`影响 ${influenceSummary}`);
+      }
+      subParts.push(`锁组 ${a.lock_group}`);
+
       card.appendChild(
         el("div", { class: "zone-top" }, [
           el("div", {}, [
             el("h3", { class: "card-title", text: a.name }),
-            el("div", { class: "card-subtitle mono", text: `本区 ${a.zone} · 服务 ${a.served_zone} · 锁组 ${a.lock_group}` }),
+            el("div", { class: "card-subtitle mono", text: subParts.join(" · ") }),
           ]),
           el("div", { style: "display:flex; gap:5px; flex-wrap:wrap; justify-content:flex-end;" }, [
             el("span", { class: `badge ${modeBadgeClass(a.mode)}`, text: a.mode_label }),
@@ -1108,7 +1131,7 @@
         el("tr", {}, [
           el("th", { text: "时间" }),
           el("th", { text: "事件类型" }),
-          el("th", { text: "全屋需求 / 主区" }),
+          el("th", { text: "全屋需求 / 优先区" }),
           el("th", { text: "摘要" }),
         ]),
       ])
@@ -1245,6 +1268,48 @@
         ]),
       ])
     );
+
+    const topo = snap.topology || {};
+    if (topo.present || (topo.zones && topo.zones.length)) {
+      const sourceNote = !topo.present
+        ? "未挂载 topology.json（仅按运行态推断）"
+        : topo.from_example
+        ? "示例拓扑回退 (topology.example.json)"
+        : `topology.json (${topo.observation_version || "—"})`;
+      const zonesText = (topo.zones || [])
+        .map((z) => `${z.label} ← ${(z.actuators || []).join(", ") || "无设备"}`)
+        .join(" ｜ ") || "—";
+      const connsText = (topo.connections || []).length
+        ? topo.connections
+            .map((c) => `${c.from_label} ↔ ${c.to_label}${c.coupling !== null && c.coupling !== undefined ? ` (${c.coupling})` : ""}`)
+            .join(" ｜ ")
+        : "无跨区连通边";
+      const opp = topo.opposite_operation || {};
+      const oppText = opp.enabled
+        ? `已允许（跨区耦合上限 ${opp.max_cross_influence ?? 0.1}）`
+        : "已禁止（各区不反向运行）";
+      panel.appendChild(el("h4", { style: "margin:10px 0 8px; font-size:13px;", text: "房间拓扑与连通关系" }));
+      panel.appendChild(
+        el("div", { class: "kv-grid", style: "margin-bottom:14px;" }, [
+          el("div", { class: "kv-item" }, [
+            el("div", { class: "kv-k", text: "拓扑配置来源" }),
+            el("div", { class: "kv-v mono", text: sourceNote }),
+          ]),
+          el("div", { class: "kv-item" }, [
+            el("div", { class: "kv-k", text: "区域与归属设备" }),
+            el("div", { class: "kv-v", text: zonesText }),
+          ]),
+          el("div", { class: "kv-item" }, [
+            el("div", { class: "kv-k", text: "区域连通与耦合" }),
+            el("div", { class: "kv-v", text: connsText }),
+          ]),
+          el("div", { class: "kv-item" }, [
+            el("div", { class: "kv-k", text: "跨区反向运行" }),
+            el("div", { class: "kv-v", text: oppText }),
+          ]),
+        ])
+      );
+    }
 
     panel.appendChild(el("h4", { style: "margin:10px 0 8px; font-size:13px;", text: "当前生效策略参数 (house_policy.json)" }));
     const grid = el("div", { class: "kv-grid" });

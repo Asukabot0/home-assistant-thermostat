@@ -41,8 +41,8 @@
         <span class="kpi-label">全屋需求</span>
         <span class="kpi-value" id="kpi-need">—</span>
       </div>
-      <div class="kpi-chip">
-        <span class="kpi-label">当前主区</span>
+      <div class="kpi-chip" title="本轮动态选出的优先服务区域（非固定拓扑主区）">
+        <span class="kpi-label">优先服务区</span>
         <span class="kpi-value" id="kpi-owner">—</span>
       </div>
       <div class="kpi-chip">
@@ -99,7 +99,7 @@
         <div class="card-head">
           <div>
             <h2 class="card-title">双向需求交接状态机</h2>
-            <p class="card-subtitle">冷热双向冲突时：先对侧减载、核验反馈、停机证实低耗，再服务主区</p>
+            <p class="card-subtitle">冷热双向冲突时：先对侧减载、核验反馈、停机证实低耗，再服务优先区</p>
           </div>
           <span class="badge" id="handoff-phase-badge">—</span>
         </div>
@@ -144,7 +144,7 @@
         <button type="button" class="tab-btn active" data-tab="commands" role="tab">指令账本与随访 <span class="tab-count" id="count-commands">0</span></button>
         <button type="button" class="tab-btn" data-tab="audit" role="tab">逐轮审计时间线 <span class="tab-count" id="count-audit">0</span></button>
         <button type="button" class="tab-btn" data-tab="shadow" role="tab">24h 影子评估与学习</button>
-        <button type="button" class="tab-btn" data-tab="policy" role="tab">策略参数与许可详情</button>
+        <button type="button" class="tab-btn" data-tab="policy" role="tab">拓扑、策略与许可</button>
       </div>
 
       <div class="tab-panel active" id="tab-commands"></div>
