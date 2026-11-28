@@ -285,7 +285,7 @@
     if (readErrors.length > 0) {
       notice.className = "alert-banner danger";
       const list = readErrors.map((e) => `${e.file} (${e.error})`).join("、");
-      notice.textContent = `部分控制器运行文件读取失败或权限不足：${list}。请检查只读挂载与容器权限（compose.dashboard.yaml 已配置 DAC_READ_SEARCH 以读取 0600 账本与配置）。`;
+      notice.textContent = `部分控制器运行文件读取失败或权限不足：${list}。请检查只读挂载路径与文件属主权限（与 heating-pilot 使用相同 UID 即可读取 0600 账本与配置）。`;
     } else if (!ctrl.data_present) {
       notice.className = "alert-banner";
       notice.textContent = "未在挂载目录检测到实机控制器输出（pilot-data/status.json）。若要在本地预览各状态机效果，可使用 `--demo` 参数启动演示模式。";
@@ -793,6 +793,13 @@
   }
 
   function renderZones(snap) {
+    const bandHint = document.querySelector(".section-hint");
+    if (bandHint && snap.policy) {
+      const tb = snap.policy.tracking_band ?? 0.3;
+      const ib = snap.policy.ideal_band ?? 0.5;
+      const cb = snap.policy.comfort_band ?? 0.7;
+      bandHint.textContent = `跟踪带 ±${tb}℃ · 理想带 ±${ib}℃ · 舒适带 ±${cb}℃`;
+    }
     const grid = document.getElementById("zones-grid");
     grid.replaceChildren();
     const zones = snap.state_machines?.zone_states || [];

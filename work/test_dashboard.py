@@ -256,7 +256,7 @@ class DashboardCollectorTests(unittest.TestCase):
                     "enabled": True,
                     "start": int(now - 7200),
                     "end": None,
-                    "rooms": {"bedroom": ["heat", 22, "auto"], "living": ["cool", 25, "auto"], "study": ["off", None, "auto"]},
+                    "rooms": {"bedroom": ["heat", 22, "auto"], "living": ["cool", 25, "auto"], "study": ["cool", 25, "auto"]},
                 }),
                 encoding="utf-8",
             )
@@ -392,6 +392,107 @@ class DashboardCollectorTests(unittest.TestCase):
             self.assertTrue(any(e["file"] == "rooms.json" for e in snap["controller"]["read_errors"]))
             self.assertEqual(snap["actuators"], [])
 
+    def test_permit_validation_matches_controller_and_respects_permit_inactive(self):
+        with TemporaryDirectory() as tmp:
+            paths = self._empty_paths(Path(tmp))
+            paths.pilot_data_dir.mkdir(parents=True)
+            now = 1_764_300_000.0
+            (paths.pilot_data_dir / "status.json").write_text(
+                json.dumps({"at": "2026-11-28T06:00:00+00:00", "status": "持续实机控制运行中", "rooms": {}, "control": {"at": now - 5, "topology": "site-1", "zones": {}}}),
+                encoding="utf-8",
+            )
+
+            # 1. Invalid baseline tuple ("off", None, "auto") must be rejected like continuous_pilot.read_permit()
+            (paths.pilot_data_dir / "live-permit.json").write_text(
+                json.dumps({
+                    "enabled": True, "start": int(now - 3600), "end": None,
+                    "rooms": {"bedroom": ["heat", 22, "auto"], "living": ["cool", 25, "auto"], "study": ["off", None, "auto"]},
+                }),
+                encoding="utf-8",
+            )
+            snap_bad_sig = collect_snapshot(paths, now=now)
+            self.assertFalse(snap_bad_sig["controller"]["permit"]["active"])
+            self.assertEqual(snap_bad_sig["controller"]["health"], "paused")
+
+            # 2. Invalid isolated_rooms entry must be rejected
+            (paths.pilot_data_dir / "live-permit.json").write_text(
+                json.dumps({
+                    "enabled": True, "start": int(now - 3600), "end": None,
+                    "isolated_rooms": ["nonexistent_room"],
+                    "rooms": {"bedroom": ["heat", 22, "auto"], "living": ["cool", 25, "auto"], "study": ["cool", 25, "auto"]},
+                }),
+                encoding="utf-8",
+            )
+            snap_bad_iso = collect_snapshot(paths, now=now)
+            self.assertFalse(snap_bad_iso["controller"]["permit"]["active"])
+
+            # 3. Valid permit file, but controller itself emitted `permit_inactive` in live-audit.jsonl -> trust controller
+            (paths.pilot_data_dir / "live-permit.json").write_text(
+                json.dumps({
+                    "enabled": True, "start": int(now - 3600), "end": None,
+                    "rooms": {"bedroom": ["heat", 22, "auto"], "living": ["cool", 25, "auto"], "study": ["cool", 25, "auto"]},
+                }),
+                encoding="utf-8",
+            )
+            (paths.pilot_data_dir / "live-audit.jsonl").write_text(
+                json.dumps({"at": now - 3, "event": "cycle", "outcome": "permit_inactive"}) + "\n",
+                encoding="utf-8",
+            )
+            snap_ctrl_paused = collect_snapshot(paths, now=now)
+            self.assertFalse(snap_ctrl_paused["controller"]["permit"]["active"])
+            self.assertEqual(snap_ctrl_paused["controller"]["health"], "paused")
+            self.assertEqual(snap_ctrl_paused["next_command"]["stage"], "paused_or_locked")
+
+    def test_predict_zone_action_respects_capable_peer_and_energy_scores(self):
+        with TemporaryDirectory() as tmp:
+            paths = self._empty_paths(Path(tmp))
+            paths.pilot_data_dir.mkdir(parents=True)
+            now = 1_764_300_000.0
+            (paths.pilot_data_dir / "live-permit.json").write_text(
+                json.dumps({
+                    "enabled": True, "start": int(now - 3600), "end": None,
+                    "rooms": {"bedroom": ["heat", 22, "auto"], "living": ["heat", 23, "auto"], "study": ["heat", 22, "auto"]},
+                }),
+                encoding="utf-8",
+            )
+            # Study is parked (off), living is running heat@23 (still has room up to 25).
+            # Even if study had a lower energy score, living is capable so dashboard must predict strengthening living, not starting study.
+            (paths.pilot_data_dir / f"continuous-{int(now - 3600)}.json").write_text(
+                json.dumps({
+                    "start": int(now - 3600),
+                    "baselines": {"bedroom": ["heat", 22, "auto"], "living": ["heat", 23, "auto"], "study": ["off", None, "auto"]},
+                    "holds": {}, "manual_holds": {}, "transitions": {}, "commands": [],
+                    "parked": {"study": {"off_at": now - 900, "mode": "heat", "started_at": now - 5000}},
+                    "closed_loop": {},
+                }),
+                encoding="utf-8",
+            )
+            (paths.pilot_data_dir / "status.json").write_text(
+                json.dumps({
+                    "at": "2026-11-28T06:00:00+00:00",
+                    "status": "持续实机控制运行中",
+                    "rooms": {
+                        "bedroom": {"room_c": 24.0, "target_c": 24.0, "mode_reported": "heat", "setpoint_reported": 22, "power_w": 120, "ready": True, "power_age_s": 5, "temperature_age_s": 20, "zone": "sleep"},
+                        "living": {"room_c": 23.3, "target_c": 24.0, "mode_reported": "heat", "setpoint_reported": 23, "power_w": 180, "ready": True, "power_age_s": 5, "temperature_age_s": 20, "zone": "lounge"},
+                        "study": {"room_c": 23.3, "target_c": 24.0, "mode_reported": "off", "setpoint_reported": None, "power_w": 8, "ready": True, "power_age_s": 5, "temperature_age_s": 20, "zone": "lounge"},
+                    },
+                    "control": {
+                        "at": now - 5, "topology": "site-1", "need": "heat", "owner": "lounge",
+                        "feasible": {"lounge": ["study", "living"]},
+                        "energy_scores": {"study": 100.0, "living": 200.0},
+                        "zones": {
+                            "sleep": {"key": "sleep", "measured": 24.0, "target": 24.0, "error": 0.0, "at": now - 20, "quality": "fresh", "paused": False, "intent": "maintain", "reason": "near_target", "qualified": False},
+                            "lounge": {"key": "lounge", "measured": 23.3, "target": 24.0, "error": 0.7, "at": now - 20, "quality": "fresh", "paused": False, "intent": "recover", "reason": "confirmed_bias", "direction": "heat", "qualified": True},
+                        },
+                    },
+                }),
+                encoding="utf-8",
+            )
+            snap = collect_snapshot(paths, now=now)
+            self.assertEqual(snap["next_command"]["action"]["room"], "living")
+            self.assertEqual(snap["next_command"]["action"]["purpose"], "zone_strengthen")
+            self.assertEqual(snap["next_command"]["action"]["to_value"], 24)
+
     def test_legacy_pre_topology_mode_produces_zone_views(self):
         with TemporaryDirectory() as tmp:
             paths = self._empty_paths(Path(tmp))
@@ -520,6 +621,30 @@ class DashboardHTTPServerTests(unittest.TestCase):
         finally:
             conn.close()
 
+    def test_sse_client_limit_and_snapshot_cache(self):
+        port = self._start_server(
+            ServerConfig(host="127.0.0.1", port=0, demo=True, stream_interval_s=1.0, cache_ttl_s=5.0, max_sse_clients=1)
+        )
+        # Rapid /api/snapshot calls within cache_ttl_s share the same cached snapshot timestamp
+        _, _, b1 = self._request(port, "GET", "/api/snapshot")
+        _, _, b2 = self._request(port, "GET", "/api/snapshot")
+        self.assertEqual(json.loads(b1)["generated_at"], json.loads(b2)["generated_at"])
+
+        # Open 1st SSE stream (consumes the single slot), verify 2nd concurrent SSE stream receives 503
+        c1 = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+        try:
+            c1.request("GET", "/api/stream")
+            r1 = c1.getresponse()
+            self.assertEqual(r1.status, 200)
+            self.assertEqual(r1.readline().decode("utf-8").strip(), "event: snapshot")
+            r1.readline()  # consume data line
+
+            status2, headers2, _ = self._request(port, "GET", "/api/stream")
+            self.assertEqual(status2, 503)
+            self.assertEqual(headers2.get("Retry-After"), "5")
+        finally:
+            c1.close()
+
     def test_live_server_ignores_scenario_param(self):
         with TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -570,18 +695,21 @@ class DashboardIsolationAuditTests(unittest.TestCase):
         compose_path = HA_DIR / "compose.dashboard.yaml"
         self.assertTrue(compose_path.is_file())
         text = compose_path.read_text(encoding="utf-8")
-        self.assertIn("read_only: true", text)
-        self.assertIn("cap_drop: [ALL]", text)
-        self.assertIn("cap_add: [DAC_READ_SEARCH]", text)
-        self.assertNotIn("DAC_OVERRIDE", text)
-        self.assertIn("no-new-privileges:true", text)
-        self.assertNotIn("private", text)
-        self.assertNotIn("home-assistant.env", text)
-        self.assertNotIn("homeassistant_default", text)
+        non_comment = "\n".join(line for line in text.splitlines() if not line.lstrip().startswith("#"))
+        self.assertIn("read_only: true", non_comment)
+        self.assertIn("cap_drop: [ALL]", non_comment)
+        self.assertNotIn("cap_add", non_comment)
+        self.assertNotIn("DAC_READ_SEARCH", non_comment)
+        self.assertNotIn("DAC_OVERRIDE", non_comment)
+        self.assertIn("no-new-privileges:true", non_comment)
+        self.assertIn("127.0.0.1", non_comment)
+        self.assertNotIn("private", non_comment)
+        self.assertNotIn("home-assistant.env", non_comment)
+        self.assertNotIn("homeassistant_default", non_comment)
 
         in_volumes = False
         mounts = []
-        for line in text.splitlines():
+        for line in non_comment.splitlines():
             stripped = line.strip()
             if stripped == "volumes:":
                 in_volumes = True
@@ -589,11 +717,66 @@ class DashboardIsolationAuditTests(unittest.TestCase):
             if in_volumes:
                 if stripped.startswith("- "):
                     mounts.append(stripped[2:].strip())
-                elif stripped and not stripped.startswith("#"):
+                elif stripped:
                     in_volumes = False
         self.assertGreaterEqual(len(mounts), 4)
         for m in mounts:
             self.assertTrue(m.endswith(":ro"), f"Dashboard volume mount must be read-only: {m}")
+
+    def test_controller_codes_covered_by_dashboard_labels(self):
+        from dashboard import collector
+
+        def value_strings(node: ast.AST) -> set[str]:
+            if isinstance(node, ast.Constant) and isinstance(node.value, str):
+                return {node.value}
+            if isinstance(node, ast.IfExp):
+                return value_strings(node.body) | value_strings(node.orelse)
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr == "get" and len(node.args) >= 2:
+                return value_strings(node.args[1])
+            return set()
+
+        purposes: set[str] = set()
+        outcomes: set[str] = set()
+        actuator_reasons: set[str] = set()
+        handoff_phases: set[str] = set()
+        handoff_reasons: set[str] = set()
+
+        for filename in ("zone_control.py", "continuous_pilot.py", "house_dispatch.py"):
+            tree = ast.parse((HA_DIR / "shadow" / filename).read_text(encoding="utf-8"), filename=filename)
+            for node in ast.walk(tree):
+                if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr == "append":
+                    if isinstance(node.func.value, ast.Name) and node.func.value.id == "candidates" and node.args:
+                        tup = node.args[0]
+                        if isinstance(tup, ast.Tuple) and len(tup.elts) == 6:
+                            purposes |= {s for s in value_strings(tup.elts[5]) if s.isascii()}
+                if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "audit":
+                    for kw in node.keywords:
+                        if kw.arg == "outcome":
+                            outcomes |= value_strings(kw.value)
+                if filename == "zone_control.py" and isinstance(node, ast.Assign):
+                    for tgt in node.targets:
+                        if isinstance(tgt, ast.Subscript) and isinstance(tgt.value, ast.Name) and tgt.value.id == "reasons":
+                            actuator_reasons |= {s for s in value_strings(node.value) if s.isascii() and "_" in s}
+                if filename == "zone_control.py" and isinstance(node, ast.Call):
+                    if (isinstance(node.func, ast.Name) and node.func.id == "dict") or (
+                        isinstance(node.func, ast.Attribute) and node.func.attr == "update"
+                    ):
+                        kw_map = {kw.arg: kw.value for kw in node.keywords if kw.arg}
+                        if "phase" in kw_map:
+                            handoff_phases |= value_strings(kw_map["phase"])
+                            if "reason" in kw_map:
+                                handoff_reasons |= value_strings(kw_map["reason"])
+
+        self.assertTrue(purposes)
+        self.assertTrue(outcomes)
+        self.assertTrue(actuator_reasons)
+        self.assertTrue(handoff_phases)
+        self.assertEqual(purposes - set(collector.PURPOSE_LABELS), set())
+        self.assertEqual(outcomes - set(collector.OUTCOME_LABELS), set())
+        all_reason_labels = set(collector.ACTUATOR_STATUS_LABELS) | set(collector.HANDOFF_REASON_LABELS) | set(collector.ZONE_REASON_LABELS)
+        self.assertEqual(actuator_reasons - all_reason_labels, set())
+        self.assertEqual(handoff_phases - set(collector.HANDOFF_PHASE_LABELS), set())
+        self.assertEqual(handoff_reasons - set(collector.HANDOFF_REASON_LABELS), set())
 
 
 if __name__ == "__main__":

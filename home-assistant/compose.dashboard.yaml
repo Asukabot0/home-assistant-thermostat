@@ -7,14 +7,11 @@ services:
     restart: unless-stopped
     read_only: true
     tmpfs: ["/tmp:size=16m,mode=1777"]
-    # Existing controller journals (continuous-*.json, startup.json) and site configs
-    # (rooms.json, topology.json) are created with mode 0600 by heating-pilot (UID 0)
-    # and release_local.py (host user). Dropping all capabilities except read-only
-    # DAC_READ_SEARCH while mounting every volume :ro allows reading those 0600 files
-    # without granting any write capability.
+    # Match compose.pilot.yaml's identity (UID 0 with cap_drop: [ALL], no cap_add)
+    # so the dashboard can read the exact same 0600 journals and configs without
+    # adding privileged capabilities such as CAP_DAC_READ_SEARCH.
     user: "${DASHBOARD_USER:-0:0}"
     cap_drop: [ALL]
-    cap_add: [DAC_READ_SEARCH]
     security_opt: [no-new-privileges:true]
     mem_limit: 128m
     pids_limit: 64
@@ -34,6 +31,8 @@ services:
       - ./shadow-data:/shadow-data:ro
       - ../outputs/climate-shadow:/shadow-output:ro
       - ../outputs/neural-shadow:/neural-output:ro
+    # Keep bound to loopback by default: the dashboard has no built-in authentication.
+    # Do not set DASHBOARD_BIND=0.0.0.0 on an untrusted LAN without an authenticating reverse proxy.
     ports:
       - "${DASHBOARD_BIND:-127.0.0.1}:${DASHBOARD_PORT:-8780}:8780"
     logging:

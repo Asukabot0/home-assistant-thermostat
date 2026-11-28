@@ -49,11 +49,13 @@ Preview with built-in simulated state-machine scenarios (explicit opt-in only):
 PYTHONPATH="$PWD/home-assistant" python3 -B -m dashboard --demo
 ```
 
-Or run as a hardened read-only Docker Compose sidecar from `home-assistant/` (uses `read_only: true`, `:ro` mounts, and `cap_drop: [ALL]` with read-only `DAC_READ_SEARCH` so it can read the `0600` journals and site configs created by `heating-pilot` and `release_local.py` without write capability):
+Or run as a hardened read-only Docker Compose sidecar from `home-assistant/` (uses `read_only: true`, `:ro` mounts, `user: 0:0`, and `cap_drop: [ALL]` with no added capabilities — matching `compose.pilot.yaml` so it can read the same `0600` journals and site configs without weakening container isolation):
 
 ```sh
 cd home-assistant
 docker compose -f compose.dashboard.yaml up -d
 ```
+
+Security note: the dashboard has no built-in authentication and binds `127.0.0.1:8780` by default. Do **not** expose it directly to a LAN via `DASHBOARD_BIND=0.0.0.0` unless placed behind an authenticating reverse proxy (or accessed over SSH port forwarding / Tailscale).
 
 Production credentials, equipment identifiers, unreduced telemetry, command journals and backups belong in the local runtime files excluded by `.gitignore`.

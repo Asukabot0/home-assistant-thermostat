@@ -63,7 +63,7 @@ ZONE_REASON_LABELS = {
     "data_missing": "测温数据缺失或已过期",
     "zone_paused": "该区域已暂停自动控制",
     "verify_stable_recovery": "已回到目标带内，等待连续稳定确认",
-    "near_target": "处于目标 ±0.3℃ 跟踪带内，稳定维持",
+    "near_target": "处于目标跟踪带内，稳定维持",
     "returning": "温度趋势正在可信回归，暂缓加码",
     "confirmed_bias": "持续偏差已由独立测温上报证实",
     "waiting_reports_or_dwell": "正在累计持续偏差时间与跨时段独立上报",
@@ -358,7 +358,12 @@ def _load_config(
     return policy, rooms, topology, meta
 
 
-def _load_permit(pilot_dir: Path, now: float) -> tuple[dict[str, Any] | None, dict[str, Any]]:
+def _load_permit(
+    pilot_dir: Path,
+    now: float,
+    rooms_cfg: dict[str, Any] | None = None,
+    topology: dict[str, Any] | None = None,
+) -> tuple[dict[str, Any] | None, dict[str, Any]]:
     raw = None
     source = None
     for filename in ("live-permit.json", "continuous-permit.json"):
@@ -398,22 +403,54 @@ def _load_permit(pilot_dir: Path, now: float) -> tuple[dict[str, Any] | None, di
 
     enabled = raw.get("enabled") is True
     start = _num(raw.get("start"))
-    end = _num(raw.get("end"))
-    trial = end is not None
-    isolated = list(raw.get("isolated_rooms") or []) if isinstance(raw.get("isolated_rooms"), list) else []
-    paused_zones = list(raw.get("paused_zones") or []) if isinstance(raw.get("paused_zones"), list) else []
+    end_raw = raw.get("end")
+    end = _num(end_raw) if end_raw is not None else None
+    trial = end_raw is not None
+    isolated_raw = raw.get("isolated_rooms", [])
+    paused_raw = raw.get("paused_zones", [])
+    isolated = list(isolated_raw) if isinstance(isolated_raw, list) else []
+    paused_zones = list(paused_raw) if isinstance(paused_raw, list) else []
+    permit_rooms = raw.get("rooms")
+    expected_rooms = set(rooms_cfg.keys()) if isinstance(rooms_cfg, dict) and rooms_cfg else None
+    topo_zones = topology.get("zones") if isinstance(topology, dict) and isinstance(topology.get("zones"), dict) else None
+
+    def _valid_baseline(sig: Any) -> bool:
+        if not isinstance(sig, list) or len(sig) != 3:
+            return False
+        mode, setpoint, _ = sig
+        if mode not in ACTIVE_MODES:
+            return False
+        val = _num(setpoint)
+        return val is not None and 16 <= val <= 30
+
     reason = None
     active = False
     if not enabled:
         reason = "许可开关 enabled=false（已暂停）"
     elif start is None:
         reason = "许可缺少有效起始时间"
+    elif end_raw is not None and end is None:
+        reason = "许可结束时间无效"
     elif source == "continuous-permit.json" and end is None:
         reason = "试点许可缺少结束时间"
     elif start > now:
         reason = "尚未到达许可生效时间"
     elif end is not None and now >= end:
         reason = "许可窗口已到期"
+    elif not isinstance(permit_rooms, dict) or not permit_rooms:
+        reason = "许可缺少有效的房间基线 (rooms)"
+    elif expected_rooms is not None and set(permit_rooms.keys()) != expected_rooms:
+        reason = "许可房间列表与 rooms.json 不一致"
+    elif any(not _valid_baseline(sig) for sig in permit_rooms.values()):
+        reason = "许可基线格式无效（须为 [cool|heat, 16..30, fan]）"
+    elif not isinstance(isolated_raw, list) or any(
+        not isinstance(r, str) or (expected_rooms is not None and r not in expected_rooms) for r in isolated_raw
+    ):
+        reason = "许可 isolated_rooms 包含无效设备"
+    elif not isinstance(paused_raw, list) or (
+        paused_raw and (topo_zones is None or any(not isinstance(z, str) or z not in topo_zones for z in paused_raw))
+    ):
+        reason = "许可 paused_zones 与当前拓扑区域不匹配"
     else:
         active = True
 
@@ -747,13 +784,18 @@ def _build_zone_states(
 
         dwell_rem = max(0.0, dwell_req - duration)
         span_rem = max(0.0, span_req - report_span)
+        track_band = _num(policy.get("tracking_band"))
+        if reason == "near_target" and track_band is not None:
+            reason_label = f"处于目标 ±{track_band:g}℃ 跟踪带内，稳定维持"
+        else:
+            reason_label = ZONE_REASON_LABELS.get(reason, reason)
         result.append({
             "zone": key,
             "label": _zone_display_name(key),
             "state": intent,
             "state_label": INTENT_LABELS.get(intent, intent),
             "reason": reason,
-            "reason_label": ZONE_REASON_LABELS.get(reason, reason),
+            "reason_label": reason_label,
             "direction": z.get("direction"),
             "direction_label": MODE_LABELS.get(str(z.get("direction")), "—") if z.get("direction") else "无方向需求",
             "qualified": bool(z.get("qualified")),
@@ -1203,49 +1245,89 @@ def _predict_zone_action(
         ]
     if not candidates_rooms:
         return None, None
-    if elected and elected in candidates_rooms:
-        chosen_room = elected
-    else:
-        candidates_rooms.sort(
-            key=lambda r: (
-                actuators_by_room[r]["zone"] != zone["zone"],
-                actuators_by_room[r]["mode"] != direction,
-                actuators_by_room[r]["priority"],
-                r,
-            )
+
+    effects_list = list((closed_loop.get("effects") or {}).values()) if isinstance(closed_loop.get("effects"), dict) else []
+
+    def _peer_capable(room_name: str) -> bool:
+        act_obj = actuators_by_room[room_name]
+        if act_obj["mode"] != direction or act_obj["setpoint"] is None:
+            return False
+        lim = (rooms_cfg.get(room_name) or {}).get("soft_limits", {}).get(direction)
+        space = _automatic_setpoint(act_obj["setpoint"], DIRECTION[direction], lim)
+        if space is None:
+            return False
+        last_eff = next(
+            (
+                v
+                for v in reversed(effects_list)
+                if isinstance(v, dict)
+                and v.get("unit") == room_name
+                and v.get("zone") == zone["zone"]
+                and _num(v.get("target")) == zone.get("target_c")
+            ),
+            None,
         )
-        chosen_room = candidates_rooms[0]
-    act = actuators_by_room[chosen_room]
-    mode = act["mode"]
-    limits = (rooms_cfg.get(chosen_room) or {}).get("soft_limits", {}).get(direction)
+        return last_eff is None or bool(last_eff.get("useful"))
+
+    # Match zone_control.py ranking: home zone, energy score (Wh/°C), priority, -influence.
+    def _rank_key(room_name: str) -> tuple[Any, ...]:
+        act_obj = actuators_by_room[room_name]
+        score = act_obj.get("energy_score_wh_per_c")
+        influence = _num((act_obj.get("influences") or {}).get(zone["zone"])) or 0.0
+        return (
+            act_obj["zone"] != zone["zone"],
+            round(score, 4) if score is not None else float("inf"),
+            act_obj["priority"],
+            -influence,
+            room_name,
+        )
+
+    if elected and elected in candidates_rooms:
+        ordered = [elected]
+    else:
+        ordered = sorted(candidates_rooms, key=_rank_key)
+        # Mirror zone_control.py's capable() guard: prefer an active capable same-mode
+        # peer over starting an off/parked unit.
+        active_capable = [r for r in ordered if _peer_capable(r)]
+        if active_capable:
+            ordered = active_capable + [r for r in ordered if r not in active_capable and actuators_by_room[r]["mode"] != "off"]
+
     step = float(policy.get("ordinary_step", 1))
     large_dev = float(policy.get("large_deviation", 2.0))
     large_step = float(policy.get("large_step", 2))
+    first_act = actuators_by_room[ordered[0]]
 
-    if mode == "off" and act["parked"]:
-        action = _make_action_payload(
-            chosen_room, "mode", direction, "energy_start", rooms_cfg, actuators_by_room, zone=zone["zone"]
-        )
-        return action, act
-    if mode == direction and act["setpoint"] is not None:
-        mag = step
-        trend = zone.get("trend")
-        err = abs(zone["error_c"]) if zone.get("error_c") is not None else 0.0
-        if (
-            not act["risks"]
-            and act["zone"] == zone["zone"]
-            and err >= large_dev
-            and trend is not None
-            and DIRECTION[direction] * trend["delta_10m_c"] <= 0
-        ):
-            mag = large_step
-        proposed = _automatic_setpoint(act["setpoint"], DIRECTION[direction] * mag, limits)
-        if proposed is not None:
+    for chosen_room in ordered:
+        act = actuators_by_room[chosen_room]
+        mode = act["mode"]
+        limits = (rooms_cfg.get(chosen_room) or {}).get("soft_limits", {}).get(direction)
+
+        if mode == "off" and act["parked"]:
+            if any(_peer_capable(peer) for peer in candidates_rooms if peer != chosen_room):
+                continue
             action = _make_action_payload(
-                chosen_room, "temperature", proposed, "zone_strengthen", rooms_cfg, actuators_by_room, zone=zone["zone"]
+                chosen_room, "mode", direction, "energy_start", rooms_cfg, actuators_by_room, zone=zone["zone"]
             )
             return action, act
-    return None, act
+        if mode == direction and act["setpoint"] is not None:
+            mag = step
+            trend = zone.get("trend")
+            err = abs(zone["error_c"]) if zone.get("error_c") is not None else 0.0
+            if (
+                not act["risks"]
+                and act["zone"] == zone["zone"]
+                and err >= large_dev
+                and trend is not None
+                and DIRECTION[direction] * trend["delta_10m_c"] <= 0
+            ):
+                mag = large_step
+            proposed = _automatic_setpoint(act["setpoint"], DIRECTION[direction] * mag, limits)
+            if proposed is not None:
+                action = _make_action_payload(
+                    chosen_room, "temperature", proposed, "zone_strengthen", rooms_cfg, actuators_by_room, zone=zone["zone"]
+                )
+                return action, act
+    return None, first_act
 
 
 def _infer_next_command(
@@ -1865,7 +1947,8 @@ def _infer_next_command(
             ),
             "summary": (
                 f"{az['label']}当前 {meas_str}（目标 {tgt_str}，偏差 {dlt_str}），"
-                f"需持续满 20 分钟且具备跨 10 分钟的独立测温上报才会转入恢复状态。"
+                f"需持续满 {_format_duration_zh(az['dwell']['required_s'])} 且具备跨 "
+                f"{_format_duration_zh(az['independent_reports']['required_span_s'])} 的独立测温上报才会转入恢复状态。"
             ),
             "confidence": "projected" if action else "none",
             "action": action,
@@ -1904,11 +1987,13 @@ def _infer_next_command(
                 "in_flight": None,
             }
         settle = oz["settling"]
+        track_band = _num(policy.get("tracking_band")) or 0.3
+        settle_req_txt = _format_duration_zh(settle["required_span_s"])
         return {
             "stage": "idle_maintain",
             "stage_label": "稳定确认中 · 暂不加码",
-            "headline": f"{oz['label']}已回到目标 ±0.3℃ 带内，确认稳定中",
-            "summary": f"已收到带内独立上报 {settle['reports']}/2 次，跨度 {_format_duration_zh(settle['span_s'])} / {_format_duration_zh(settle['required_span_s'])}。",
+            "headline": f"{oz['label']}已回到目标 ±{track_band:g}℃ 带内，确认稳定中",
+            "summary": f"已收到带内独立上报 {settle['reports']}/2 次，跨度 {_format_duration_zh(settle['span_s'])} / {settle_req_txt}。",
             "confidence": "none",
             "action": None,
             "eta_seconds": settle["remaining_span_s"],
@@ -1917,7 +2002,7 @@ def _infer_next_command(
             "blockers": [
                 {
                     "code": "recovery_settle",
-                    "label": "回归稳定确认 (≥2次上报且跨度≥10分钟)",
+                    "label": f"回归稳定确认 (≥2次上报且跨度≥{settle_req_txt})",
                     "detail": f"{settle['reports']} 次上报 · 跨度 {_format_duration_zh(settle['span_s'])} / {_format_duration_zh(settle['required_span_s'])}",
                     "met": settle["reports"] >= 2 and settle["remaining_span_s"] <= 0,
                     "remaining_s": settle["remaining_span_s"],
@@ -2060,9 +2145,6 @@ def collect_snapshot(paths: DashboardPaths, *, now: float | None = None) -> dict
     now_ts = time.time() if now is None else float(now)
     policy, rooms_cfg, topology, cfg_meta = _load_config(paths)
     read_errors: list[dict[str, str]] = list(cfg_meta.get("read_errors") or [])
-    permit_raw, permit_info = _load_permit(paths.pilot_data_dir, now_ts)
-    journal, journal_file, journal_errors = _load_journal(paths.pilot_data_dir, permit_raw)
-    read_errors.extend(journal_errors)
     status_raw, status_err = _read_json(paths.pilot_data_dir / "status.json")
     if status_err is not None:
         read_errors.append({"file": "status.json", "error": status_err})
@@ -2102,7 +2184,25 @@ def collect_snapshot(paths: DashboardPaths, *, now: float | None = None) -> dict
         if isinstance(topo_ex, dict):
             topology = topo_ex
 
+    permit_raw, permit_info = _load_permit(paths.pilot_data_dir, now_ts, rooms_cfg=rooms_cfg, topology=topology)
+    journal, journal_file, journal_errors = _load_journal(paths.pilot_data_dir, permit_raw)
+    read_errors.extend(journal_errors)
+
     status_ts = _num(control.get("at")) or _parse_ts(status.get("at"))
+    latest_cycle_ts = _num(latest_cycle.get("at")) if latest_cycle else None
+    controller_reports_inactive = (
+        status.get("status") == "实机控制已暂停或验证窗口已结束" and not status_rooms and not control
+    ) or (
+        latest_cycle is not None
+        and latest_cycle.get("outcome") == "permit_inactive"
+        and (status_ts is None or latest_cycle_ts is None or latest_cycle_ts >= status_ts - 5.0)
+    )
+    if permit_info["active"] and controller_reports_inactive:
+        permit_info = dict(
+            permit_info,
+            active=False,
+            reason="控制器本轮判定许可未生效 (permit_inactive)",
+        )
     status_age_s = max(0.0, now_ts - status_ts) if status_ts is not None else None
     stale = status_ts is None or (status_age_s is not None and status_age_s > STATUS_STALE_SECONDS)
     next_cycle_in_s = (

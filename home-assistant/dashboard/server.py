@@ -51,6 +51,8 @@ class ServerConfig:
     demo: bool = False
     default_scenario: str = "recover_strengthen"
     stream_interval_s: float = 2.0
+    cache_ttl_s: float = 1.0
+    max_sse_clients: int = 12
 
 
 class DashboardHTTPServer(ThreadingHTTPServer):
@@ -60,15 +62,33 @@ class DashboardHTTPServer(ThreadingHTTPServer):
     def __init__(self, server_address: tuple[str, int], config: ServerConfig):
         self.config = config
         self.shutdown_event = threading.Event()
+        self._cache_lock = threading.Lock()
+        self._cache: dict[str, tuple[float, dict[str, Any]]] = {}
+        self._sse_slots = threading.BoundedSemaphore(max(1, int(config.max_sse_clients)))
         super().__init__(server_address, DashboardRequestHandler)
 
     def get_snapshot(self, scenario: str | None = None) -> dict[str, Any]:
         if self.config.demo:
             chosen = scenario if scenario in SCENARIO_IDS else self.config.default_scenario
-            cfg_dir = self.config.paths.shadow_config_dir if self.config.paths else None
-            return build_demo_snapshot(chosen, config_dir=cfg_dir)
-        paths = self.config.paths or DashboardPaths.from_env()
-        return collect_snapshot(paths)
+            cache_key = f"demo:{chosen}"
+        else:
+            chosen = None
+            cache_key = "live"
+
+        ttl = max(0.0, float(self.config.cache_ttl_s))
+        now_mono = time.monotonic()
+        with self._cache_lock:
+            cached = self._cache.get(cache_key)
+            if cached is not None and ttl > 0 and now_mono - cached[0] < ttl:
+                return cached[1]
+            if self.config.demo:
+                cfg_dir = self.config.paths.shadow_config_dir if self.config.paths else None
+                snapshot = build_demo_snapshot(chosen or self.config.default_scenario, config_dir=cfg_dir)
+            else:
+                paths = self.config.paths or DashboardPaths.from_env()
+                snapshot = collect_snapshot(paths)
+            self._cache[cache_key] = (time.monotonic(), snapshot)
+            return snapshot
 
 
 class DashboardRequestHandler(BaseHTTPRequestHandler):
@@ -185,15 +205,26 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
         self._send_json({"error": "not_found"}, HTTPStatus.NOT_FOUND, head_only=head_only)
 
     def _serve_sse(self, scenario: str | None) -> None:
-        self.send_response(HTTPStatus.OK)
-        self.send_header("Content-Type", "text/event-stream; charset=utf-8")
-        self.send_header("Cache-Control", "no-cache")
-        self.send_header("Connection", "close")
-        self._send_security_headers()
-        self.end_headers()
-
-        interval = max(0.5, float(self.server.config.stream_interval_s))
+        if not self.server._sse_slots.acquire(blocking=False):
+            body = b'{"error":"too_many_stream_clients"}'
+            self.send_response(HTTPStatus.SERVICE_UNAVAILABLE)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Retry-After", "5")
+            self.send_header("Cache-Control", "no-store")
+            self._send_security_headers()
+            self.end_headers()
+            self.wfile.write(body)
+            return
         try:
+            self.send_response(HTTPStatus.OK)
+            self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+            self.send_header("Cache-Control", "no-cache")
+            self.send_header("Connection", "close")
+            self._send_security_headers()
+            self.end_headers()
+
+            interval = max(0.5, float(self.server.config.stream_interval_s))
             while not self.server.shutdown_event.is_set():
                 snapshot = self.server.get_snapshot(scenario)
                 payload = json.dumps(snapshot, ensure_ascii=False, allow_nan=False)
@@ -204,6 +235,8 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
                     break
         except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, OSError):
             return
+        finally:
+            self.server._sse_slots.release()
 
 
 def create_server(config: ServerConfig) -> DashboardHTTPServer:
