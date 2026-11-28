@@ -1,6 +1,7 @@
 """Estimate independent zones, track their targets and allocate safe equipment actions."""
 from statistics import median
 
+from fusion import fuse
 from house_policy import ACTIVE, POLICY, TEMP_EPSILON
 from model import automatic_setpoint, increases_output, numeric, setpoint_bounds
 from pilot_gate import credible_output, current_power_evidence
@@ -206,18 +207,14 @@ def observations(topology, live, inputs, state, actions, paused, now, policy=POL
     trackers = state.setdefault("trackers", {})
     for removed in trackers.keys()-topology["zones"].keys():
         del trackers[removed]
+    fusion_memory = state.setdefault("fusion", {})
+    for removed in fusion_memory.keys()-topology["zones"].keys():
+        del fusion_memory[removed]
     out = {}
     for key, zone in topology["zones"].items():
         primary = by_sensor[zone["primary"]]
-        ref = dict(primary)
+        ref, fusion = fuse(zone, topology, by_sensor, fusion_memory.setdefault(key, {}), now, policy)
         sensors = {k: by_sensor[k] for k in zone.get("sensors", ()) if k in by_sensor}
-        aux = {k: s for k, s in sensors.items() if topology["sensors"][k]["role"] == "auxiliary" and s["quality"] == "fresh"}
-        if primary["quality"] == "fresh" and zone.get("fusion") == "weighted" and aux:
-            weighted = [(primary["value"], 1), *((s["value"], topology["sensors"][k].get("weight", 1)) for k, s in aux.items())]
-            ref["value"] = sum(value*w for value, w in weighted)/sum(w for _, w in weighted)
-            # The primary clock drives control. Aux-only changes are retained as
-            # inputs but do not create an independent zone temperature report.
-            ref["source"] = [primary["source"], {k: s["source"] for k, s in aux.items()}]
         target = zone_target(zone, live, inputs)
         switched = inputs.get(zone.get("pause_entity"), {}).get("state")
         is_paused = key in paused or bool(zone.get("pause_entity") and switched != "off")
@@ -251,7 +248,8 @@ def observations(topology, live, inputs, state, actions, paused, now, policy=POL
         result = track(memory, ref, target, forecast, is_paused, now, policy)
         result.update(source_version=identity, observation_definition=definition, source=ref["source"], primary=zone["primary"],
                       primary_reading=primary, inputs=sensors,
-                      constraints={k: s for k, s in sensors.items() if topology["sensors"][k]["role"] == "constraint"})
+                      constraints={k: s for k, s in sensors.items() if topology["sensors"][k]["role"] == "constraint"},
+                      fusion=fusion)
         result["response_trend"] = response
         out[key] = result
     for room, modes in list(state.get("maintenance", {}).items()):
