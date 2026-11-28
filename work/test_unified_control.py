@@ -138,6 +138,19 @@ class UnifiedCycleTests(unittest.TestCase):
         self.assertNotIn("bedroom", trace["feasible"]["lounge"])
         self.assertEqual(self.h.calls, [])
 
+    def test_legacy_external_holds_release_local_units_for_their_own_zone(self):
+        self.scene(bed=("off", 25, 24.0, 8), lounge=("off", 24, 24.6, 8), study=("off", 24, 24.6, 8))
+        self.h.update_state(manual_holds={"living": pilot.LEGACY_EXTERNAL_HOLD, "study": pilot.LEGACY_EXTERNAL_HOLD})
+
+        started = self.qualify()
+
+        self.assertEqual(started["manual_holds"], {})
+        self.assertEqual(len(self.h.calls), 1)
+        command = started["commands"][-1]
+        self.assertIn(command["room"], {"living", "study"})
+        self.assertEqual((command["purpose"], command["value"], command["control"]["zone"]),
+                         ("energy_start", "cool", "lounge"))
+
     def test_auxiliary_initial_uses_home_target_and_requires_continuing_recovery(self):
         for measured, initial in ((23.4, 23), (22.7, None)):
             with self.subTest(measured=measured):

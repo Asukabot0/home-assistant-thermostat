@@ -247,6 +247,8 @@ def read_journal(folder, start, end, captured, schema):
               "manual_holds": {schema.convert(k): schema.convert(v, "status") for k,v in current.get("manual_holds", {}).items()},
               "failure_holds": {schema.convert(k): schema.convert(v, "status") for k,v in current.get("holds", {}).items()},
               "parked": schema.convert(current.get("parked", {})),
+              "external_overrides": schema.convert(current.get("external_overrides", {})),
+              "start_failures": schema.convert(current.get("start_failures", {})),
               "transitions": schema.convert(current.get("transitions", {})),
               "pending": [schema.record(a, COMMAND_FIELDS) for a in current.get("commands", ()) if a["status"] in {"prepared","accepted"}]}
     return sorted(commands.values(), key=lambda a: (a["sent_at"],a["id"])), status

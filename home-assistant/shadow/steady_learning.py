@@ -50,7 +50,8 @@ def learning_active(session, room, virtual):
         return None
     attrs = json.loads(virtual["shared_attrs"] or "{}")
     group = "living_study" if room in SHARED_ROOMS else room
-    if (room in session.get("isolated_rooms", ()) or room in session.get("manual_holds", {}) or room in session["holds"] or group in session["holds"]
+    if (room in session.get("isolated_rooms", ()) or room in session.get("manual_holds", {})
+            or room in session.get("external_overrides", {}) or room in session["holds"] or group in session["holds"]
             or attrs.get("preset_mode") != "标准" or attrs.get("control_hold_latched", False)):
         return None
     return session["start"]
