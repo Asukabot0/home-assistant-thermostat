@@ -289,6 +289,22 @@ class UnifiedCycleTests(unittest.TestCase):
         self.assertFalse(strengthened_last([start, reduce]))
         self.assertFalse(strengthened_last([initial]))
 
+    def test_first_sparse_report_after_strengthening_can_ease_a_projected_overshoot(self):
+        self.scene(bed=("cool", 23, 24.6, 538))
+        self.run_cycle()
+        self.assertEqual(self.h.calls, [])
+        self.h.update_state(commands=[{
+            "room": "bedroom", "kind": "temperature", "value": 23, "before": ["cool", 24, "auto"],
+            "sent_at": self.h.now+30, "proxy_at": self.h.now+30, "purpose": "zone_strengthen",
+            "status": "proxy_echo", "followup": {}, "control": {"zone": "sleep", "definition": "fixture"}}])
+
+        eased = self.run_cycle(630, bed=24.0)
+
+        sleep = self.trace()["zones"]["sleep"]
+        self.assertIsNone(sleep["trend"])
+        self.assertAlmostEqual(sleep["response_trend"]["delta"], -0.6)
+        self.assertEqual((eased["commands"][-1]["purpose"], eased["commands"][-1]["value"]), ("zone_reduce", 24))
+
     def test_comfort_overrun_at_weakest_setting_still_respects_minimum_runtime(self):
         self.scene(bed=("cool", 26, 23.0, 538))
         self.h.recent_adjustment("bedroom", 25, ago=5)
@@ -395,7 +411,7 @@ class UnifiedCycleTests(unittest.TestCase):
         self.assertEqual(memory["trackers"]["alpha"]["changed_at"],self.h.now)
 
     def test_opposed_real_cycle_yields_then_observes_and_serves_each_zone(self):
-        self.scene(bed=("heat",22,23.5,300),lounge=("cool",25,24.5,300),study=("off",25,24.5,8))
+        self.scene(bed=("heat",22,23.4,300),lounge=("cool",25,24.6,300),study=("off",25,24.6,8))
         reduced=self.qualify()
         self.assertEqual([(a["room"],a["value"],a["purpose"]) for a in reduced["commands"]],[("bedroom",21,"handoff_reduce")])
         self.run_cycle(20,cache=("bedroom","living","study"))

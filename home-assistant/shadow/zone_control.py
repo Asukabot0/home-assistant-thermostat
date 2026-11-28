@@ -203,13 +203,18 @@ def observations(topology, live, inputs, state, actions, paused, now, policy=POL
         influencing = sorted((a for a in actions if key in topology["actuators"][a["room"]]["influences"]),
                              key=lambda a: a["proxy_at"])
         changed = influencing[-1]["proxy_at"] if influencing else 0
-        forecast = (trend(points, max(changed, memory["changed_at"]), now, policy,
-                          anchored=changed > memory["changed_at"] and strengthened_last(influencing))
-                    if ref["quality"] == "fresh" else None)
+        after = max(changed, memory["changed_at"])
+        forecast = trend(points, after, now, policy) if ref["quality"] == "fresh" else None
+        # Arbitration, peer risk and recovery keep the unanchored trend; only the
+        # local overshoot checks of running equipment use the anchored response.
+        response = (trend(points, after, now, policy, anchored=True)
+                    if forecast is None and ref["quality"] == "fresh" and changed > memory["changed_at"]
+                    and strengthened_last(influencing) else forecast)
         result = track(memory, ref, target, forecast, is_paused, now, policy)
         result.update(source_version=identity, observation_definition=definition, source=ref["source"], primary=zone["primary"],
                       primary_reading=primary, inputs=sensors,
                       constraints={k: s for k, s in sensors.items() if topology["sensors"][k]["role"] == "constraint"})
+        result["response_trend"] = response
         out[key] = result
     for room, modes in list(state.get("maintenance", {}).items()):
         home = topology["actuators"].get(room, {}).get("zone")
@@ -668,7 +673,7 @@ def coordinate(live, readings, ready, state, now, configurations, connected, top
                 candidates.append((0, rank, room, "mode", "off", "energy_off"))
                 reasons[room] = "exit_eased_dormant_overrun"
                 continue
-        local_prediction = local_zone["trend"]
+        local_prediction = local_zone["response_trend"]
         expected = (current_excess+direction*local_prediction["delta"]-local_prediction["uncertainty"]
                     if local_prediction else current_excess)
         high_band = power.get("bands", {}).get("high", {})
