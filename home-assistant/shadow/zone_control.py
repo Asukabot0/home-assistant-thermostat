@@ -66,13 +66,17 @@ def track(row, observation, target, estimate, paused, now, policy):
     if target is None or observation["quality"] != "fresh":
         return result
     error = target-measured
-    band = policy["tracking_band"]
+
+    def band_for(gap):
+        return policy.get("tracking_bands", {}).get("heat" if gap > 0 else "cool", policy["tracking_band"])
+
+    band = band_for(error)
     result["error"] = error
     if abs(error) <= band+TEMP_EPSILON:
         if episode:
             inside = []
             for at, value in reversed(row["points"]):
-                if at <= episode["last_outside"] or abs(value-target) > band+TEMP_EPSILON:
+                if at <= episode["last_outside"] or abs(value-target) > band_for(target-value)+TEMP_EPSILON:
                     break
                 inside.append(at)
             span = inside[0]-inside[-1] if inside else 0
@@ -81,7 +85,7 @@ def track(row, observation, target, estimate, paused, now, policy):
                           reason="verify_stable_recovery" if not paused else "zone_paused")
             projected = measured+(estimate["delta"] if estimate else 0)
             moving_out = (estimate is not None and abs(estimate["delta"])-estimate["uncertainty"] >= policy["minimum_progress_c"]
-                          and abs(projected-target) > band+TEMP_EPSILON)
+                          and abs(projected-target) > band_for(target-projected)+TEMP_EPSILON)
             if len(inside) < 2 or span < policy["recovery_settle_seconds"] or moving_out:
                 return result
             row.pop("recovery", None)
@@ -160,9 +164,43 @@ def setting_effect(actions, now, observations, topology, state, policy, readings
                          "learning_version": topology["learning_versions"][action["room"]]}
 
 
+SEASON_DEFAULTS = {"cooling_weather_enter_delta_c": 0, "cooling_weather_exit_delta_c": -2,
+                   "heating_weather_enter_delta_c": -10, "heating_weather_exit_delta_c": -6,
+                   "off_season_band_c": 1.5, "season_memory_seconds": 21600}
+
+
+def season(environment, targets, state, now, policy=POLICY):
+    """Compare fresh environment points with the zone targets to classify cooling or heating weather."""
+    limits = {key: policy.get(key, value) for key, value in SEASON_DEFAULTS.items()}
+    memory = state.get("season") or {"mode": None}
+    fresh = [row for row in environment.values() if row["quality"] == "fresh"]
+    known = [target for target in targets if target is not None]
+    if fresh and known:
+        outdoor, reference = median(row["value"] for row in fresh), median(known)
+        gap = outdoor-reference
+        mode = memory["mode"]
+        if (mode == "cool" and gap < limits["cooling_weather_exit_delta_c"]
+                or mode == "heat" and gap > limits["heating_weather_exit_delta_c"]):
+            mode = None
+        if mode is None:
+            mode = ("cool" if gap >= limits["cooling_weather_enter_delta_c"] else
+                    "heat" if gap <= limits["heating_weather_enter_delta_c"] else None)
+        memory = {"mode": mode, "temperature_c": outdoor, "target": reference, "at": max(row["at"] for row in fresh)}
+    elif memory["mode"] is None or now-memory["at"] > limits["season_memory_seconds"]:
+        memory = {"mode": None}
+    state["season"] = memory
+    opposite = {"cool": "heat", "heat": "cool"}.get(memory["mode"])
+    band = max(policy["tracking_band"], limits["off_season_band_c"])
+    return memory, {opposite: band} if opposite else {}
+
+
 def observations(topology, live, inputs, state, actions, paused, now, policy=POLICY, *, readings=None):
     by_sensor = {key: sensor_reading(s, live, inputs, now) for key, s in topology["sensors"].items()
                  if s.get("enabled", True)}
+    environment = {k: v for k, v in by_sensor.items() if topology["sensors"][k]["role"] == "environment"}
+    targets = [zone_target(zone, live, inputs) for zone in topology["zones"].values()]
+    _, bands = season(environment, targets, state, now, policy)
+    policy = dict(policy, tracking_bands=bands)
     previous = state.get("definition")
     state["definition"] = topology["fingerprint"]
     trackers = state.setdefault("trackers", {})
@@ -226,7 +264,6 @@ def observations(topology, live, inputs, state, actions, paused, now, policy=POL
             and entry["source_version"] == out[entry["zone"]]["source_version"]
             and entry.get("learning_version") == topology["learning_versions"].get(entry["unit"])}
     setting_effect(actions, now, out, topology, state, policy, readings or {})
-    environment = {k: v for k, v in by_sensor.items() if topology["sensors"][k]["role"] == "environment"}
     return out, environment
 
 
@@ -569,7 +606,7 @@ def coordinate(live, readings, ready, state, now, configurations, connected, top
     if owner != contender:
         local.update(owner=owner, selected_at=now)
     trace.update(topology=topology["observation_version"], definition=topology["fingerprint"], zones=zones,
-                 environment=environment, owner=owner, demand_order=demands, feasible=feasible, output_evidence=output,
+                 environment=environment, season=local.get("season"), owner=owner, demand_order=demands, feasible=feasible, output_evidence=output,
                  risks={}, equipment={}, observations_after={}, action_scopes=scopes, energy_scores=energy_scores,
                  recent_effects=list(local.get("effects", {}).values())[-8:], uncertain_zones=sorted(uncertain),
                  handoff=handoff, conflict=contest, yielding_blocks=blocked, elected=elected)

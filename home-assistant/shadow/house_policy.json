@@ -1,6 +1,12 @@
 {
   "ideal_band": 0.5,
   "comfort_band": 0.7,
+  "cooling_weather_enter_delta_c": 0,
+  "cooling_weather_exit_delta_c": -2,
+  "heating_weather_enter_delta_c": -10,
+  "heating_weather_exit_delta_c": -6,
+  "off_season_band_c": 1.5,
+  "season_memory_seconds": 21600,
   "ordinary_step": 1,
   "gentle_dwell_seconds": 1200,
   "gentle_report_span_seconds": 600,

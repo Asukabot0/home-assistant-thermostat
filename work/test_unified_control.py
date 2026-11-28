@@ -1,5 +1,6 @@
 """Exercise the configured controller and real journal with sparse HA feedback."""
 from copy import deepcopy
+from datetime import datetime, timezone
 import json
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -504,6 +505,75 @@ class UnifiedCycleTests(unittest.TestCase):
         self.assertEqual(self.trace()["unmet"],{"lounge":"no_comfort_safe_assignment","sleep":"no_comfort_safe_assignment"})
         last=next(x.kwargs for x in reversed(self.audit.call_args_list) if x.args==("cycle",) and "rooms" in x.kwargs)
         self.assertEqual(last["rooms"]["bedroom"]["status"],"no_comfort_safe_assignment")
+
+    def test_cooling_weather_does_not_turn_a_slightly_cool_zone_into_heating_demand(self):
+        example = json.loads(EXAMPLE.read_bytes())
+        example["sensors"]["outdoor_reference"]["enabled"] = False
+        example["sensors"]["balcony"].update(enabled=True, max_age_seconds=7200)
+        self.enterContext(patch.object(pilot, "TOPOLOGY", configure(example, pilot.ROOMS)))
+        for outdoor, contested in ((None, True), (17, True), (30, False)):
+            with self.subTest(outdoor=outdoor):
+                self.h.journal.unlink(missing_ok=True)
+                self.h.calls.clear()
+                reported = lambda: datetime.fromtimestamp(self.h.now, timezone.utc).isoformat()
+                inputs = lambda *_: {} if outdoor is None else {
+                    "sensor.example_balcony_temperature": {"state": str(outdoor), "last_reported": reported()}}
+                self.enterContext(patch.object(pilot, "extra_inputs", side_effect=inputs))
+                self.scene(bed=("off", 25, 23.4, 8), lounge=("off", 25, 24.8, 8), study=("off", 25, 24.8, 8))
+
+                started = self.qualify()
+
+                trace = self.trace()
+                self.assertEqual(trace["conflict"], contested)
+                self.assertEqual(trace["zones"]["sleep"]["qualified"], contested)
+                self.assertEqual((started["commands"][0]["purpose"], started["commands"][0]["value"],
+                                  started["commands"][0]["control"]["zone"]), ("energy_start", "cool", "lounge"))
+                if not contested:
+                    self.assertEqual(trace["season"]["mode"], "cool")
+                    self.assertEqual(trace["zones"]["sleep"]["intent"], "maintain")
+                for _ in range(10):
+                    for row in self.h.live.values():
+                        row["adapter"]["power"] = 8 if row["adapter"]["mode"] == "off" else 300
+                    self.run_cycle(600)
+                    self.assertEqual(self.trace()["conflict"], contested)
+                trace = self.trace()
+                self.assertEqual(trace["owner"], None if contested else "lounge")
+                self.assertEqual("sleep" in trace["unmet"], contested)
+
+    def test_season_needs_fresh_weather_and_keeps_hysteresis(self):
+        from zone_control import season
+        fresh = lambda value, at: {"outdoor": {"value": value, "quality": "fresh", "at": at}}
+        targets, memory = [24, None, 24], {}
+        self.assertEqual(season(fresh(23.9, -30), targets, memory, 0),
+                         ({"mode": None, "temperature_c": 23.9, "target": 24, "at": -30}, {}))
+        self.assertEqual(season(fresh(24, 50), targets, memory, 60)[1], {"heat": 1.5})
+        self.assertEqual(season(fresh(22, 100), targets, memory, 120)[0]["mode"], "cool")
+        self.assertEqual(season({"outdoor": {"value": 30, "quality": "stale", "at": 100}}, targets, memory, 3000)[0]["mode"], "cool")
+        self.assertEqual(season(fresh(30, 200), [None], memory, 3000)[0]["mode"], "cool")
+        self.assertEqual(season({}, targets, memory, 100+21600)[0]["mode"], "cool")
+        self.assertEqual(season({}, targets, memory, 100+21601)[0], {"mode": None})
+        season(fresh(26, 30000), targets, memory, 30000)
+        self.assertEqual(season(fresh(21.9, 30060), targets, memory, 30060)[0]["mode"], None)
+        self.assertEqual(season(fresh(14, 30120), targets, memory, 30120)[1], {"cool": 1.5})
+        self.assertEqual(season(fresh(18, 30180), targets, memory, 30180)[0]["mode"], "heat")
+        self.assertEqual(season(fresh(18.1, 30240), targets, memory, 30240)[0]["mode"], None)
+        self.assertEqual(season(fresh(17, 30300), [26], memory, 30300)[0]["mode"], None)
+        season({}, targets, memory, 30360)
+        self.assertEqual(memory["season"], {"mode": None})
+
+    def test_off_season_band_still_allows_real_demand_and_settles_running_recovery(self):
+        from zone_control import track
+        policy = dict(pilot.POLICY, tracking_bands={"heat": 1.5})
+        for measured, qualified in ((22.4, True), (22.6, False)):
+            with self.subTest(measured=measured):
+                row = {"changed_at": 0, "points": [[0, measured], [600, measured], [1200, measured]]}
+                result = track(row, {"value": measured, "at": 1200, "quality": "fresh"}, 24, None, False, 1210, policy)
+                self.assertEqual((result["qualified"], result["direction"]), (qualified, "heat" if qualified else None))
+        row = {"changed_at": 0, "points": [[0, 23.2], [600, 23.2], [1200, 23.3], [1800, 23.3]],
+               "recovery": {"direction": "heat", "since": 0, "report_span": 600, "reports": 2, "last_outside": 600}}
+        settled = track(row, {"value": 23.3, "at": 1800, "quality": "fresh"}, 24, None, False, 1810, policy)
+        self.assertEqual((settled["intent"], settled["recovery_completed_at"]), ("maintain", 1800))
+        self.assertNotIn("recovery", row)
 
     def test_heat_and_cool_recovery_survive_single_boundary_report_and_restart(self):
         for mode, outside, boundary, relapse, settled, setting in (

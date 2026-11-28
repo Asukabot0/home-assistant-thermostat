@@ -56,6 +56,8 @@ stateDiagram-v2
 
 `zones.target` 可映射某台虚拟恒温器、指定 HA 数值实体及可选属性，或设静态目标。`pause_entity` 可接绑定的 `input_boolean`。许可的 `paused_zones` 暂停一个区域，`isolated_rooms` 和伴侣手动状态限制对应设备。暂停区域仍保留温度约束。`actuators.influences` 显式描述设备可作用的多个区域。`connections` 记录区域耦合，`opposite_operation.enabled` 默认关闭。开启后还要求明确分区、低跨区影响、真实输出证据以及对侧匹配需求。新增室内主点后建立新区域，修改设备影响关系并提升 `observation_version`。变更定义、实际来源或目标会废弃受影响的暂态证据；设备基线及发令历史照常继承。
 
+室外与目标的温差决定季节：取环境点新鲜读数的中位数，减去各区域目标的中位数。温差达到 `cooling_weather_enter_delta_c`（默认 0℃，即室外不低于目标）进入制冷季，低于 `cooling_weather_exit_delta_c`（−2℃）才退出；不高于 `heating_weather_enter_delta_c`（−10℃）进入采暖季，高于 `heating_weather_exit_delta_c`（−6℃）才退出。室外比目标暖时，略低于目标的房间会自行回升，所以制冷季里偏冷方向的跟踪带放宽到 `off_season_band_c`（默认 1.5℃）；采暖季里偏热方向同样放宽。超过这个范围仍按原规则处理。室外比目标凉时不判定季节，偏冷的房间照常形成制热需求。环境点全部失效时，从最后一次新鲜读数的上报时间起沿用上次季节最多 `season_memory_seconds`（6 小时）。季节状态（`mode`、`temperature_c`、`target`、`at`）写入 `closed_loop.season`，并随状态输出、逐轮审计和脱敏遥测记录。季节只用 `entity` 型环境点：`from_actuator` 型环境点目前没有接入实时读数，始终是 `unavailable`。只有两个环境点时中位数等于两者平均，一个受日晒偏高的点会把季节推向制冷侧；这样的点应改装位置，或在 `topology.json` 中设 `"enabled": false`。
+
 ## 策略与保护
 
 初始跟踪带为 ±0.3℃。区域偏差、持续时间和独立上报共同资格化，轻重偏差保持同一段记录。偏差持续至少 20 分钟并有跨 10 分钟的独立报告时可以恢复，可信趋势已在回归时暂缓。加强后使用本区新温度和阶段等待，邻区以新鲜值和风险边界约束，单台暂停不会消除该区域。设备短运行、停机、反向保护和数据新鲜度独立记录。停机重启继续要求连续低耗的实测报告，报告断流仍以 120 秒为限。
