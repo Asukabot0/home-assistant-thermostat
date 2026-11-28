@@ -133,6 +133,8 @@ def sensor_reading(sensor, live, inputs, now):
         value = state.get("attributes", {}).get(sensor["attribute"]) if sensor.get("attribute") else state.get("state")
         at, source = report_time(state), [sensor["entity"], "ha_report"]
     value = numeric(value)
+    if value is not None and sensor.get("offset_c"):
+        value += sensor["offset_c"]
     valid_value = value is not None and (-50 <= value <= 65 if environment else 0 < value <= 50)
     valid = valid_value and source is not None and at is not None and 0 <= now-at <= sensor.get("max_age_seconds", 1200)
     return {"value": value, "at": at, "source": source, "quality": "fresh" if valid else

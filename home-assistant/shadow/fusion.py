@@ -1,4 +1,7 @@
-"""Fuse a zone's primary and auxiliary temperature sensors with learned offsets."""
+"""Fuse a zone's primary and auxiliary temperature sensors with learned offsets.
+
+Readings arrive already calibrated by each sensor's `offset_c`.
+"""
 from math import inf
 
 
@@ -13,14 +16,6 @@ def setting(policy, key):
     return policy.get(key, FUSION_DEFAULTS[key])
 
 
-def calibrated(reading, sensor):
-    """Apply a sensor's commissioned calibration offset."""
-    offset = sensor.get("offset_c", 0)
-    if not offset or reading["value"] is None:
-        return reading
-    return dict(reading, value=reading["value"] + offset)
-
-
 def auxiliaries(zone, topology, by_sensor):
     return sorted(key for key in zone.get("sensors", ())
                   if key in by_sensor and topology["sensors"][key]["role"] == "auxiliary")
@@ -29,14 +24,14 @@ def auxiliaries(zone, topology, by_sensor):
 def learn_offsets(zone, topology, by_sensor, memory):
     """Track each auxiliary sensor's offset from the primary using reports taken close together.
 
-    A pair is formed once per new report of either sensor, so cached values
-    cannot be counted twice. Offsets are learned in every fusion mode so they
-    are already established when an operator switches a zone to fusion.
+    A pair needs a newer report on both sides than the previous pair, so each
+    report is paired at most once. Offsets are learned in every fusion mode so
+    they are already established when an operator switches a zone to fusion.
     """
     sensors = topology["sensors"]
-    primary = calibrated(by_sensor[zone["primary"]], sensors[zone["primary"]])
+    primary = by_sensor[zone["primary"]]
     for key in auxiliaries(zone, topology, by_sensor):
-        reading = calibrated(by_sensor[key], sensors[key])
+        reading = by_sensor[key]
         definition = [topology["sources"][key], sensors[key].get("offset_c", 0),
                       topology["sources"][zone["primary"]], sensors[zone["primary"]].get("offset_c", 0)]
         row = memory.get(key)
@@ -45,7 +40,8 @@ def learn_offsets(zone, topology, by_sensor, memory):
         if primary["quality"] != "fresh" or reading["quality"] != "fresh":
             continue
         stamps = [reading["at"], primary["at"]]
-        if abs(stamps[0]-stamps[1]) > PAIR_SECONDS or stamps == row.get("paired"):
+        previous = row.get("paired") or [-inf, -inf]
+        if abs(stamps[0]-stamps[1]) > PAIR_SECONDS or stamps[0] <= previous[0] or stamps[1] <= previous[1]:
             continue
         difference = reading["value"]-primary["value"]
         if row["pairs"]:
@@ -64,12 +60,13 @@ def fuse(zone, topology, by_sensor, memory, now, policy):
     `estimated` average the primary with auxiliary sensors. A stale auxiliary
     with an established offset is held at primary + offset, so a dropout neither
     moves the value nor changes the zone identity. `estimated` additionally
-    dates the zone by the latest contributing report and, for a bounded time,
-    replaces a stale primary with calibrated auxiliaries.
+    dates the zone by the latest contributing report and, for a bounded time
+    after the primary's last valid temperature, replaces it with calibrated
+    auxiliaries.
     """
     fusion = zone.get("fusion", "primary")
     sensors = topology["sensors"]
-    primary = calibrated(by_sensor[zone["primary"]], sensors[zone["primary"]])
+    primary = by_sensor[zone["primary"]]
     if primary["value"] is not None and primary["quality"] != "unavailable" and primary["at"] is not None:
         # An unavailable report still carries a time; failover counts from the last real temperature.
         memory["primary_valid_at"] = primary["at"]
@@ -91,7 +88,7 @@ def fuse(zone, topology, by_sensor, memory, now, policy):
         row = memory[key]
         return row["pairs"] >= minimum and now-row.get("at", -inf) <= hold
 
-    fresh = {key: calibrated(by_sensor[key], sensors[key]) for key in keys if by_sensor[key]["quality"] == "fresh"}
+    fresh = {key: by_sensor[key] for key in keys if by_sensor[key]["quality"] == "fresh"}
     if primary["quality"] == "fresh":
         anchor = primary["value"]
     else:

@@ -7,7 +7,7 @@ import unittest
 import test_p0_p1_dispatch as fixture
 from fusion import fuse
 import house_policy
-from topology import configure, fingerprint
+from topology import configure, fingerprint, sensor_reading
 from zone_control import observations
 
 
@@ -111,14 +111,23 @@ class FusionTests(unittest.TestCase):
              now+30, self.policy)
         self.assertLessEqual(memory["x"]["offset"]-offset, 0.2+1e-9)
 
-    def test_calibration_offset_shifts_readings_and_resets_learning(self):
+    def test_each_report_pairs_once_when_one_side_reports_more_often(self):
+        memory, zone = {}, self.zone("estimated")
+        for minute in range(1, 7):
+            fuse(zone, self.topology, {"p": reading(24.0, 60.0*minute, "sensor.p"), "x": reading(23.4, 0.0)}, memory,
+                 60.0*minute, self.policy)
+        self.assertEqual(memory["x"]["pairs"], 1)
+        fuse(zone, self.topology, {"p": reading(24.0, 420.0, "sensor.p"), "x": reading(23.4, 400.0)}, memory, 430.0,
+             self.policy)
+        self.assertEqual(memory["x"]["pairs"], 2)
+
+    def test_calibration_change_restarts_offset_learning(self):
         memory, zone = {}, self.zone("weighted")
         self.learn(zone, memory)
         self.topology["sensors"]["x"]["offset_c"] = 0.6
-        ref, detail = fuse(zone, self.topology, {"p": reading(24.0, 900, "sensor.p"), "x": reading(23.4, 900)}, memory,
-                           910, self.policy)
-        self.assertAlmostEqual(ref["value"], 24.0)
-        self.assertEqual(detail["sensors"]["x"]["pairs"], 1)
+        _, detail = fuse(zone, self.topology, {"p": reading(24.0, 900, "sensor.p"), "x": reading(24.0, 900)}, memory,
+                         910, self.policy)
+        self.assertEqual((detail["sensors"]["x"]["pairs"], detail["sensors"]["x"]["offset"]), (1, 0.0))
 
 
 class TopologyFusionTests(unittest.TestCase):
@@ -136,6 +145,16 @@ class TopologyFusionTests(unittest.TestCase):
         self.assertEqual(primary["sleep"], estimated["zone_versions"]["sleep"])
         example["sensors"]["lounge_auxiliary"]["offset_c"] = -0.4
         self.assertNotEqual(estimated["zone_versions"]["lounge"], configure(example, pilot.ROOMS)["zone_versions"]["lounge"])
+
+    def test_calibration_offset_applies_to_every_sensor_role(self):
+        stamp = "1970-01-01T00:16:40+00:00"
+        inputs = {"sensor.out": {"state": "30.0", "last_reported": stamp}}
+        outdoor = sensor_reading({"role": "environment", "entity": "sensor.out", "offset_c": -1.5, "max_age_seconds": 7200},
+                                 {}, inputs, 1010)
+        live = {"bedroom": {"temperature": "24.0", "temperature_report_at": 1000, "temperature_source": ["sensor.t", "x"]}}
+        primary = sensor_reading({"role": "primary", "from_actuator": "bedroom", "offset_c": 0.4}, live, {}, 1010)
+        self.assertEqual((outdoor["value"], outdoor["quality"]), (28.5, "fresh"))
+        self.assertAlmostEqual(primary["value"], 24.4)
 
     def test_invalid_fusion_or_calibration_is_rejected(self):
         for change in ({"fusion": "kalman"},):
