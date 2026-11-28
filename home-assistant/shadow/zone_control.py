@@ -151,25 +151,28 @@ def setting_effect(actions, now, observations, topology, state, policy, readings
                          "learning_version": topology["learning_versions"][action["room"]]}
 
 
-SEASON_DEFAULTS = {"cooling_season_enter_c": 26, "cooling_season_exit_c": 22, "heating_season_enter_c": 14,
-                   "heating_season_exit_c": 18, "off_season_band_c": 1.5, "season_memory_seconds": 21600}
+SEASON_DEFAULTS = {"cooling_weather_enter_delta_c": 0, "cooling_weather_exit_delta_c": -2,
+                   "heating_weather_enter_delta_c": -10, "heating_weather_exit_delta_c": -6,
+                   "off_season_band_c": 1.5, "season_memory_seconds": 21600}
 
 
-def season(environment, state, now, policy=POLICY):
-    """Classify cooling or heating weather from fresh environment points, with hysteresis."""
+def season(environment, targets, state, now, policy=POLICY):
+    """Compare fresh environment points with the zone targets to classify cooling or heating weather."""
     limits = {key: policy.get(key, value) for key, value in SEASON_DEFAULTS.items()}
     memory = state.get("season") or {"mode": None}
     fresh = [row for row in environment.values() if row["quality"] == "fresh"]
-    if fresh:
-        outdoor = median(row["value"] for row in fresh)
+    known = [target for target in targets if target is not None]
+    if fresh and known:
+        outdoor, reference = median(row["value"] for row in fresh), median(known)
+        gap = outdoor-reference
         mode = memory["mode"]
-        if (mode == "cool" and outdoor < limits["cooling_season_exit_c"]
-                or mode == "heat" and outdoor > limits["heating_season_exit_c"]):
+        if (mode == "cool" and gap < limits["cooling_weather_exit_delta_c"]
+                or mode == "heat" and gap > limits["heating_weather_exit_delta_c"]):
             mode = None
         if mode is None:
-            mode = ("cool" if outdoor >= limits["cooling_season_enter_c"] else
-                    "heat" if outdoor <= limits["heating_season_enter_c"] else None)
-        memory = {"mode": mode, "temperature_c": outdoor, "at": max(row["at"] for row in fresh)}
+            mode = ("cool" if gap >= limits["cooling_weather_enter_delta_c"] else
+                    "heat" if gap <= limits["heating_weather_enter_delta_c"] else None)
+        memory = {"mode": mode, "temperature_c": outdoor, "target": reference, "at": max(row["at"] for row in fresh)}
     elif memory["mode"] is None or now-memory["at"] > limits["season_memory_seconds"]:
         memory = {"mode": None}
     state["season"] = memory
@@ -182,7 +185,8 @@ def observations(topology, live, inputs, state, actions, paused, now, policy=POL
     by_sensor = {key: sensor_reading(s, live, inputs, now) for key, s in topology["sensors"].items()
                  if s.get("enabled", True)}
     environment = {k: v for k, v in by_sensor.items() if topology["sensors"][k]["role"] == "environment"}
-    _, bands = season(environment, state, now, policy)
+    targets = [zone_target(zone, live, inputs) for zone in topology["zones"].values()]
+    _, bands = season(environment, targets, state, now, policy)
     policy = dict(policy, tracking_bands=bands)
     previous = state.get("definition")
     state["definition"] = topology["fingerprint"]

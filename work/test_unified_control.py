@@ -1,5 +1,6 @@
 """Exercise the configured controller and real journal with sparse HA feedback."""
 from copy import deepcopy
+from datetime import datetime, timezone
 import json
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -348,15 +349,19 @@ class UnifiedCycleTests(unittest.TestCase):
         self.assertEqual(last["rooms"]["bedroom"]["status"],"no_comfort_safe_assignment")
 
     def test_cooling_weather_does_not_turn_a_slightly_cool_zone_into_heating_demand(self):
-        for outdoor, contested in ((None, True), (30, False)):
+        example = json.loads(EXAMPLE.read_bytes())
+        example["sensors"]["outdoor_reference"]["enabled"] = False
+        example["sensors"]["balcony"].update(enabled=True, max_age_seconds=7200)
+        self.enterContext(patch.object(pilot, "TOPOLOGY", configure(example, pilot.ROOMS)))
+        for outdoor, contested in ((None, True), (17, True), (30, False)):
             with self.subTest(outdoor=outdoor):
                 self.h.journal.unlink(missing_ok=True)
                 self.h.calls.clear()
+                reported = lambda: datetime.fromtimestamp(self.h.now, timezone.utc).isoformat()
+                inputs = lambda *_: {} if outdoor is None else {
+                    "sensor.example_balcony_temperature": {"state": str(outdoor), "last_reported": reported()}}
+                self.enterContext(patch.object(pilot, "extra_inputs", side_effect=inputs))
                 self.scene(bed=("off", 25, 23.4, 8), lounge=("off", 25, 24.8, 8), study=("off", 25, 24.8, 8))
-                bedroom = self.h.live["bedroom"]
-                bedroom.pop("outdoor", None)
-                if outdoor is not None:
-                    bedroom.update(outdoor=outdoor, outdoor_report_at=self.h.now, outdoor_source=["sensor.outdoor", "fixture"])
 
                 started = self.qualify()
 
@@ -371,8 +376,6 @@ class UnifiedCycleTests(unittest.TestCase):
                 for _ in range(10):
                     for row in self.h.live.values():
                         row["adapter"]["power"] = 8 if row["adapter"]["mode"] == "off" else 300
-                    if outdoor is not None:
-                        bedroom["outdoor_report_at"] = self.h.now
                     self.run_cycle(600)
                     self.assertEqual(self.trace()["conflict"], contested)
                 trace = self.trace()
@@ -382,19 +385,22 @@ class UnifiedCycleTests(unittest.TestCase):
     def test_season_needs_fresh_weather_and_keeps_hysteresis(self):
         from zone_control import season
         fresh = lambda value, at: {"outdoor": {"value": value, "quality": "fresh", "at": at}}
-        memory = {}
-        self.assertEqual(season(fresh(25, -30), memory, 0), ({"mode": None, "temperature_c": 25, "at": -30}, {}))
-        self.assertEqual(season(fresh(27, 50), memory, 60)[1], {"heat": 1.5})
-        self.assertEqual(season(fresh(23, 100), memory, 120)[0]["mode"], "cool")
-        self.assertEqual(season({"outdoor": {"value": 30, "quality": "stale", "at": 100}}, memory, 3000)[0]["mode"], "cool")
-        self.assertEqual(season({}, memory, 100+21600)[0]["mode"], "cool")
-        self.assertEqual(season({}, memory, 100+21601)[0], {"mode": None})
-        season(fresh(27, 30000), memory, 30000)
-        self.assertEqual(season(fresh(21.5, 30060), memory, 30060)[0]["mode"], None)
-        self.assertEqual(season(fresh(14, 30120), memory, 30120)[1], {"cool": 1.5})
-        self.assertEqual(season(fresh(18, 30180), memory, 30180)[0]["mode"], "heat")
-        self.assertEqual(season(fresh(18.5, 30240), memory, 30240)[0]["mode"], None)
-        season({}, memory, 30300)
+        targets, memory = [24, None, 24], {}
+        self.assertEqual(season(fresh(23.9, -30), targets, memory, 0),
+                         ({"mode": None, "temperature_c": 23.9, "target": 24, "at": -30}, {}))
+        self.assertEqual(season(fresh(24, 50), targets, memory, 60)[1], {"heat": 1.5})
+        self.assertEqual(season(fresh(22, 100), targets, memory, 120)[0]["mode"], "cool")
+        self.assertEqual(season({"outdoor": {"value": 30, "quality": "stale", "at": 100}}, targets, memory, 3000)[0]["mode"], "cool")
+        self.assertEqual(season(fresh(30, 200), [None], memory, 3000)[0]["mode"], "cool")
+        self.assertEqual(season({}, targets, memory, 100+21600)[0]["mode"], "cool")
+        self.assertEqual(season({}, targets, memory, 100+21601)[0], {"mode": None})
+        season(fresh(26, 30000), targets, memory, 30000)
+        self.assertEqual(season(fresh(21.9, 30060), targets, memory, 30060)[0]["mode"], None)
+        self.assertEqual(season(fresh(14, 30120), targets, memory, 30120)[1], {"cool": 1.5})
+        self.assertEqual(season(fresh(18, 30180), targets, memory, 30180)[0]["mode"], "heat")
+        self.assertEqual(season(fresh(18.1, 30240), targets, memory, 30240)[0]["mode"], None)
+        self.assertEqual(season(fresh(17, 30300), [26], memory, 30300)[0]["mode"], None)
+        season({}, targets, memory, 30360)
         self.assertEqual(memory["season"], {"mode": None})
 
     def test_off_season_band_still_allows_real_demand_and_settles_running_recovery(self):
