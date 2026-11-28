@@ -56,5 +56,16 @@
   "start_retry_limit": 2,
   "start_retry_backoff_seconds": 900,
   "start_failure_hold_seconds": 7200,
-  "start_failure_reset_seconds": 86400
+  "start_failure_reset_seconds": 86400,
+  "model_active": 0,
+  "model_min_samples": 48,
+  "model_ready_margin": 0.9,
+  "model_prior_gain": 8,
+  "model_max_interval_seconds": 1800,
+  "influence_negligible": 0.15,
+  "influence_significant": 0.3,
+  "influence_min_excitation": 6,
+  "fusion_offset_min_pairs": 6,
+  "fusion_hold_seconds": 7200,
+  "fusion_failover_seconds": 3600
 }

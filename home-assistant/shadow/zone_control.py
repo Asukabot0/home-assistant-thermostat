@@ -6,7 +6,8 @@ from house_policy import ACTIVE, POLICY, TEMP_EPSILON
 from model import automatic_setpoint, increases_output, numeric, setpoint_bounds
 from pilot_gate import credible_output, current_power_evidence
 from topology import fingerprint, sensor_reading, zone_target
-from service import metered_interval
+from service import POWER_REPORT_GAP_SECONDS, metered_interval
+import zone_model
 
 
 DIRECTION = {"heat": 1, "cool": -1}
@@ -195,6 +196,27 @@ def season(environment, targets, state, now, policy=POLICY):
     return memory, {opposite: band} if opposite else {}
 
 
+def unit_conditions(topology, live):
+    """Current mode, last mode change and fresh electric power (kW) of each configured unit."""
+    units = {}
+    for unit in topology["actuators"]:
+        adapter = (live.get(unit) or {}).get("adapter") or {}
+        watts, age = numeric(adapter.get("power")), numeric(adapter.get("from_power_s"))
+        fresh = watts is not None and 0 <= watts <= 10000 and age is not None and 0 <= age <= POWER_REPORT_GAP_SECONDS
+        units[unit] = {"mode": adapter.get("mode"), "changed_at": adapter.get("last_mode_change"),
+                       "kw": watts/1000 if fresh else None}
+    return units
+
+
+def interval_power(shadow, start, end):
+    """Mean kW from verified power reports that cover most of the interval."""
+    reports = (shadow or {}).get("live_power_reports")
+    if not reports or end <= start:
+        return None
+    kwh, covered = metered_interval(reports, start, end)
+    return kwh*3600/covered if covered >= 0.8*(end-start) else None
+
+
 def observations(topology, live, inputs, state, actions, paused, now, policy=POLICY, *, readings=None):
     by_sensor = {key: sensor_reading(s, live, inputs, now) for key, s in topology["sensors"].items()
                  if s.get("enabled", True)}
@@ -210,6 +232,14 @@ def observations(topology, live, inputs, state, actions, paused, now, policy=POL
     fusion_memory = state.setdefault("fusion", {})
     for removed in fusion_memory.keys()-topology["zones"].keys():
         del fusion_memory[removed]
+    learning = zone_model.begin(state, topology, policy)
+    units_now = unit_conditions(topology, live)
+    intervened = max((a["proxy_at"] for a in actions), default=0)
+    readings = readings or {}
+
+    def power(unit, start, end):
+        return interval_power(readings.get(unit), start, end)
+
     out = {}
     for key, zone in topology["zones"].items():
         primary = by_sensor[zone["primary"]]
@@ -245,11 +275,16 @@ def observations(topology, live, inputs, state, actions, paused, now, policy=POL
         response = (trend(points, after, now, policy, anchored=True)
                     if forecast is None and ref["quality"] == "fresh" and changed > memory["changed_at"]
                     and strengthened_last(influencing) else forecast)
+        modeled = zone_model.observe_zone(learning, key, ref, forecast, environment, units_now, power, now, intervened)
+        if modeled["use"]:
+            # A ready model already accounts for the measured output of each unit,
+            # so it replaces both the rule trend and the anchored response.
+            forecast = response = modeled["forecast"]
         result = track(memory, ref, target, forecast, is_paused, now, policy)
         result.update(source_version=identity, observation_definition=definition, source=ref["source"], primary=zone["primary"],
                       primary_reading=primary, inputs=sensors,
                       constraints={k: s for k, s in sensors.items() if topology["sensors"][k]["role"] == "constraint"},
-                      fusion=fusion)
+                      fusion=fusion, model_trend=modeled["forecast"])
         result["response_trend"] = response
         out[key] = result
     for room, modes in list(state.get("maintenance", {}).items()):
@@ -290,11 +325,10 @@ def allows_assistance(home_zone, mode):
             and home_zone["qualified"] and home_zone["direction"] == mode)
 
 
-def peer_risk(room, zone_key, mode, zones, topology, policy):
+def peer_risk(room, zone_key, mode, zones, topology, policy, learned=None):
     direction = DIRECTION[mode]
-    unit = topology["actuators"][room]
     limits = []
-    for peer, influence in unit["influences"].items():
+    for peer, influence in zone_model.risk_influences(room, mode, topology, learned or {}).items():
         zone = zones[peer]
         checks = []
         if peer != zone_key:
@@ -564,6 +598,9 @@ def coordinate(live, readings, ready, state, now, configurations, connected, top
     zones, environment = observations(topology, live, inputs, local, actions, paused, now, policy, readings=readings)
     for key, zone in zones.items():
         zone["key"] = key
+    learned = zone_model.influence(local.get("model"), topology, policy)
+    # Learned influence is recorded in every run but changes allocation only when enabled.
+    gated = learned if zone_model.active(policy) else {}
     modes = {room: live[room]["adapter"]["mode"] for room in connected}
     output = {room: mode in ACTIVE and room in readings and credible_output(now, live[room], readings[room])
               for room, mode in modes.items()}
@@ -580,9 +617,11 @@ def coordinate(live, readings, ready, state, now, configurations, connected, top
     feasible = {key: [r for r in sorted(connected) if control_ready.get(r) and key in units[r]["influences"] and key not in uncertain
                        and zones[units[r]["zone"]]["quality"] == "fresh" and not zones[units[r]["zone"]]["paused"]
                        and (units[r]["zone"] == key or allows_assistance(
-                           zones[units[r]["zone"]], zones[key]["direction"]))
+                           zones[units[r]["zone"]], zones[key]["direction"])
+                           and not zone_model.negligible(gated, r, zones[key]["direction"], key))
                        and zones[key]["direction"] in live[r]["adapter"]["modes"]
-                       and not any(x["reason"] != "peer_near_boundary" for x in peer_risk(r, key, zones[key]["direction"], zones, topology, policy))]
+                       and not any(x["reason"] != "peer_near_boundary"
+                                   for x in peer_risk(r, key, zones[key]["direction"], zones, topology, policy, gated))]
                 for key in demands}
     contest = len({zones[key]["direction"] for key in demands}) > 1
     blocked = {}
@@ -607,7 +646,8 @@ def coordinate(live, readings, ready, state, now, configurations, connected, top
                  environment=environment, season=local.get("season"), owner=owner, demand_order=demands, feasible=feasible, output_evidence=output,
                  risks={}, equipment={}, observations_after={}, action_scopes=scopes, energy_scores=energy_scores,
                  recent_effects=list(local.get("effects", {}).values())[-8:], uncertain_zones=sorted(uncertain),
-                 handoff=handoff, conflict=contest, yielding_blocks=blocked, elected=elected)
+                 handoff=handoff, conflict=contest, yielding_blocks=blocked, elected=elected,
+                 zone_model=zone_model.summary(local.get("model"), zones, learned, policy))
     for key in demands:
         if key != owner:
             zones[key].update(intent="limited", reason="unconfirmed_influencing_equipment" if key in uncertain else
@@ -615,7 +655,8 @@ def coordinate(live, readings, ready, state, now, configurations, connected, top
     for room in sorted(connected):
         unit = units[room]
         home = unit["zone"]
-        serve = owner if owner in unit["influences"] else home
+        serve = (owner if owner in unit["influences"] and not zone_model.negligible(gated, room, need, owner)
+                 else home)
         local_zone, zone = zones[home], zones[serve]
         mode, setting = modes[room], numeric(live[room]["adapter"]["setpoint"])
         if not ready.get(room) or local_zone["paused"] or local_zone["quality"] != "fresh" or local_zone["target"] is None:
@@ -634,9 +675,10 @@ def coordinate(live, readings, ready, state, now, configurations, connected, top
                         and is_strengthening(a)), None)
         trace["observations_after"][room] = {"zone_report": zone["at"], "last_increase": last_up["proxy_at"] if last_up else None,
                                               "own_command": own["proxy_at"] if own else None}
-        risks = peer_risk(room, serve, need if need in ACTIVE else mode, zones, topology, policy) if mode in ACTIVE or need in ACTIVE else []
+        risks = (peer_risk(room, serve, need if need in ACTIVE else mode, zones, topology, policy, gated)
+                 if mode in ACTIVE or need in ACTIVE else [])
         trace["risks"][room] = risks
-        active_risk = peer_risk(room, home, mode, zones, topology, policy) if mode in ACTIVE else []
+        active_risk = peer_risk(room, home, mode, zones, topology, policy, gated) if mode in ACTIVE else []
         own_critical_need = (mode in ACTIVE and local_zone.get("error") is not None and
                              DIRECTION[mode]*local_zone["error"] >= policy["comfort_band"]-TEMP_EPSILON)
         red_risk = any(r["reason"] == "peer_comfort_risk" for r in active_risk) and not own_critical_need

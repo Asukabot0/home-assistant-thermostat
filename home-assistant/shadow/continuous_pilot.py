@@ -605,7 +605,8 @@ def display_progress(message, details, trace, selection=None):
         publish(message, details)
         return
     control = {key: trace.get(key) for key in ("topology", "definition", "zones", "environment", "season", "need", "owner",
-                                               "lead", "risks", "candidates", "rejections", "pending_rooms", "unmet", "handoff", "conflict", "yielding_blocks", "elected")}
+                                               "lead", "risks", "candidates", "rejections", "pending_rooms", "unmet", "handoff", "conflict", "yielding_blocks", "elected",
+                                               "zone_model")}
     control.update(at=time(), selected=selection)
     publish(message, details, control=control)
 
