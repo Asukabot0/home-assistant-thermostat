@@ -12,7 +12,7 @@ from live_evidence import attach
 from service import power_evidence
 from steady_learning import record_episode
 from topology import configure, extra_inputs
-from zone_control import observations, trend
+from zone_control import observations, strengthened_last, trend
 
 
 pilot=fixture.pilot
@@ -245,6 +245,27 @@ class UnifiedCycleTests(unittest.TestCase):
 
         self.assertIsNone(self.trace()["owner"])
         self.assertEqual((eased["commands"][-1]["purpose"], eased["commands"][-1]["value"]), ("zone_reduce", 24))
+        for _ in range(3):
+            held = self.run_cycle(600)
+        self.assertEqual(len(held["commands"]), 2)
+        self.assertEqual(self.h.live["bedroom"]["adapter"]["mode"], "cool")
+
+    def test_assistance_run_without_owner_stops_after_easing(self):
+        self.scene(bed=("cool", 25, 24.0, 402), lounge=("off", 24, 24.9, 8), study=("off", 24, 24.9, 8))
+        self.h.live["bedroom"]["adapter"]["last_mode_change"] = self.h.now-2500
+        started = {"room": "bedroom", "kind": "mode", "value": "cool", "before": ["off", None, "auto"],
+                   "sent_at": self.h.now-2500, "proxy_at": self.h.now-2500, "purpose": "energy_start",
+                   "status": "proxy_echo", "followup": {}, "control": {"zone": "lounge"}}
+        initial = dict(started, kind="temperature", value=25, before=["cool", 24, "auto"], purpose="reversal_initial",
+                       sent_at=self.h.now-2480, proxy_at=self.h.now-2480)
+        self.h.update_state(manual_holds={"living": "fixture", "study": "fixture"}, commands=[started, initial])
+
+        stopped = self.run_cycle()
+
+        self.assertIsNone(self.trace()["owner"])
+        self.assertEqual((stopped["commands"][-1]["purpose"], stopped["commands"][-1]["value"]), ("energy_off", "off"))
+        last = next(x.kwargs for x in reversed(self.audit.call_args_list) if x.args == ("cycle",) and "rooms" in x.kwargs)
+        self.assertEqual(last["rooms"]["bedroom"]["status"], "exit_after_assistance_ended")
 
     def test_trend_after_strengthening_is_anchored_on_last_prior_report(self):
         points = [[0, 24.4], [600, 24.4], [1300, 23.9]]
@@ -252,6 +273,21 @@ class UnifiedCycleTests(unittest.TestCase):
         anchored = trend(points, 700, 1310, pilot.POLICY, anchored=True)
         self.assertEqual((anchored["from"], anchored["reports"]), (600, 2))
         self.assertLess(anchored["delta"], -0.4)
+
+    def test_trend_anchor_yields_to_post_command_reports_and_needs_their_span(self):
+        reports = [[0, 24.4], [600, 24.6], [900, 24.3], [1200, 23.7]]
+        alone = trend(reports, 500, 1210, pilot.POLICY)
+        self.assertEqual(trend(reports, 500, 1210, pilot.POLICY, anchored=True), alone)
+        self.assertAlmostEqual(alone["delta"], -0.9)
+        self.assertIsNone(trend([[0, 24.4], [600, 24.4], [760, 24.3]], 700, 770, pilot.POLICY, anchored=True))
+
+    def test_start_followed_by_its_initial_setting_counts_as_strengthening(self):
+        start = {"kind": "mode", "value": "cool", "purpose": "energy_start"}
+        initial = {"kind": "temperature", "value": 25, "before": ["cool", 24, "auto"], "purpose": "reversal_initial"}
+        reduce = {"kind": "temperature", "value": 25, "before": ["cool", 24, "auto"], "purpose": "zone_reduce"}
+        self.assertTrue(strengthened_last([start, initial]))
+        self.assertFalse(strengthened_last([start, reduce]))
+        self.assertFalse(strengthened_last([initial]))
 
     def test_comfort_overrun_at_weakest_setting_still_respects_minimum_runtime(self):
         self.scene(bed=("cool", 26, 23.0, 538))

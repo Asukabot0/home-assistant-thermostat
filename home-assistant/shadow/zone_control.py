@@ -14,11 +14,18 @@ DIRECTION = {"heat": 1, "cool": -1}
 def trend(points, after, now, policy, *, anchored=False):
     window = now-policy["sparse_trend_window_seconds"]
     recent = [p for p in points if p[0] > after and p[0] >= window]
-    # The last report before a strengthening command anchors the first
-    # response, so sparse sensors can show an overshoot one report earlier.
-    anchor = next((p for p in reversed(points) if p[0] <= after), None) if anchored else None
-    if recent and anchor is not None and anchor[0] >= window:
-        recent.insert(0, anchor)
+    estimate = fit_trend(recent, now, policy) if recent else None
+    if estimate is not None or not anchored or not recent:
+        return estimate
+    # Until reports after a strengthening command form a trend alone, the last
+    # report before it anchors the response if most of the span follows it.
+    anchor = next((p for p in reversed(points) if p[0] <= after), None)
+    if anchor is None or anchor[0] < window or 2*(recent[-1][0]-after) < recent[-1][0]-anchor[0]:
+        return None
+    return fit_trend([anchor, *recent], now, policy)
+
+
+def fit_trend(recent, now, policy):
     slopes = [(v2-v1)/(t2-t1) for i, (t1, v1) in enumerate(recent) for t2, v2 in recent[i+1:]
               if t2-t1 >= policy["minimum_trend_span_seconds"]]
     if not slopes or now-recent[-1][0] > policy["sparse_report_age_seconds"]:
@@ -193,11 +200,11 @@ def observations(topology, live, inputs, state, actions, paused, now, policy=POL
                         entry.update(source_version=identity, learning_version=topology["learning_versions"][entry["unit"]])
         points = add_points(memory, ref, identity, now, policy)
         memory["zone_version"] = definition
-        latest = max((a for a in actions if key in topology["actuators"][a["room"]]["influences"]),
-                     key=lambda a: a["proxy_at"], default=None)
-        changed = latest["proxy_at"] if latest else 0
+        influencing = sorted((a for a in actions if key in topology["actuators"][a["room"]]["influences"]),
+                             key=lambda a: a["proxy_at"])
+        changed = influencing[-1]["proxy_at"] if influencing else 0
         forecast = (trend(points, max(changed, memory["changed_at"]), now, policy,
-                          anchored=changed > memory["changed_at"] and is_strengthening(latest))
+                          anchored=changed > memory["changed_at"] and strengthened_last(influencing))
                     if ref["quality"] == "fresh" else None)
         result = track(memory, ref, target, forecast, is_paused, now, policy)
         result.update(source_version=identity, observation_definition=definition, source=ref["source"], primary=zone["primary"],
@@ -234,7 +241,7 @@ def assistance_initial(mode, home_zone, limits, policy=POLICY):
     bounds = setpoint_bounds(limits)
     if bounds is None or home_zone["target"] is None:
         return None
-    chosen = round(home_zone["target"]) - DIRECTION[mode]*policy.get("assistance_initial_offset", 1)
+    chosen = round(round(home_zone["target"]) - DIRECTION[mode]*policy.get("assistance_initial_offset", 1))
     return max(bounds[0], min(bounds[1], chosen))
 
 
@@ -287,6 +294,38 @@ def response_ready(now, zone, action, wait):
 def is_strengthening(action):
     return (action["value"] in ACTIVE if action["kind"] == "mode" else
             increases_output(action["before"][0], action["before"][1], action["value"]))
+
+
+def strengthened_last(actions):
+    """Whether the latest action, or the start that an initial setting follows, strengthened output."""
+    for action in reversed(actions):
+        if action["purpose"] not in {"reversal_initial", "initial_safety_easing"}:
+            return is_strengthening(action)
+    return False
+
+
+def assistance_run(room, home, mode, setting, actions):
+    """Return the zone the unit's current run still helps and whether that run began as help."""
+    run = []
+    for action in reversed(actions):
+        if action["room"] == room:
+            run.append(action)
+            if action["kind"] == "mode":
+                break
+    helped = baseline = None
+    for action in reversed(run):
+        if not is_strengthening(action):
+            continue
+        zone = (action.get("control") or {}).get("zone", home)
+        if zone == home:
+            helped = baseline = None
+            continue
+        if helped is None:
+            baseline = None if action["kind"] == "mode" else action["before"][1]
+        helped = zone
+    if helped is not None and baseline is not None and not increases_output(mode, baseline, setting):
+        return None, False
+    return helped, helped is not None and baseline is None
 
 
 def allocation_scope(room, zone, zones, environment, topology):
@@ -625,7 +664,7 @@ def coordinate(live, readings, ready, state, now, configurations, connected, top
             if output[room]:
                 stop_or_ease("exit_local_comfort_overrun")
                 continue
-            if quiet and eased:
+            if quiet and (eased or setting == weakest):
                 candidates.append((0, rank, room, "mode", "off", "energy_off"))
                 reasons[room] = "exit_eased_dormant_overrun"
                 continue
@@ -641,10 +680,10 @@ def coordinate(live, readings, ready, state, now, configurations, connected, top
         redundant = (owner is None and priority > 0 and local_zone["intent"] == "maintain" and local_prediction
                      and abs(local_prediction["delta"])+local_prediction["uncertainty"] <= policy["minimum_progress_c"]
                      and any(output[p] and p != room and modes[p] == mode and units[p]["zone"] == home for p in output))
-        previous_zone = (own.get("control") or {}).get("zone", home) if own else home
-        assistance_limited = previous_zone != home and current_excess >= policy["tracking_band"] - TEMP_EPSILON
+        helped, help_started = assistance_run(room, home, mode, setting, actions)
+        assistance_limited = helped is not None and current_excess >= policy["tracking_band"] - TEMP_EPSILON
         # Help for another zone ends with that zone's ownership unless the home zone needs this mode itself.
-        assistance_orphaned = (previous_zone != home and owner != previous_zone
+        assistance_orphaned = (helped is not None and owner != helped
                                and not (local_zone["qualified"] and local_zone["direction"] == mode))
         reducing = (direct or red_risk or assistance_limited or assistance_orphaned
                     or expected > policy["tracking_band"]+TEMP_EPSILON or blocks_needed or redundant)
@@ -665,11 +704,13 @@ def coordinate(live, readings, ready, state, now, configurations, connected, top
                 candidates.append((0, rank, room, "mode", "off", "energy_off"))
                 reasons[room] = "exit_dormant_opposition"
             elif output[room] and (eased or proposed is None) and (
-                    blocks_needed or red_risk or redundant or current_excess > policy["ideal_band"]):
-                stop_or_ease("exit_contrary_or_risky_output")
+                    blocks_needed or red_risk or redundant or current_excess > policy["ideal_band"]
+                    or assistance_orphaned and help_started):
+                stop_or_ease("exit_after_assistance_ended" if assistance_orphaned else "exit_contrary_or_risky_output")
             elif output[room] and proposed is not None:
                 candidates.append((1, rank, room, "temperature", proposed, "zone_reduce"))
                 reasons[room] = ("high_power_overrun" if direct else "reduce_at_assistance_limit" if assistance_limited
+                                 else "reduce_after_assistance_ended" if assistance_orphaned
                                  else "reduce_projected_or_neighbor_overrun")
             else:
                 reasons[room] = "wait_verified_output_or_off_proof"
