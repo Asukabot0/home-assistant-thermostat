@@ -240,7 +240,7 @@ def build_site_config(
         off_entity = off_ref.get("entity") if isinstance(off_ref, dict) else None
         ceiling = (
             shadow_model.numeric(off_ref.get("ceiling_w"))
-            if isinstance(off_ref, dict) and off_entity in {None, rcfg["power"]}
+            if isinstance(off_ref, dict) and off_entity == rcfg["power"]
             else None
         )
         actuators.append(

@@ -1998,14 +1998,16 @@ class NeuralShadowRegressionTests(unittest.TestCase):
     def test_issue2_xhist_features_verified_off_ceiling_and_production_export_archive_parity(self):
         from zipfile import ZipFile
 
-        # Verify config.py ignores verified_off_power if bound to fallback entity instead of primary
+        # Verify config.py ignores verified_off_power when entity is fallback or omitted (matching live service.py)
         rooms_wrong_off = deepcopy(self.site.raw_rooms)
         rooms_wrong_off["living"]["verified_off_power"] = {
             "entity": rooms_wrong_off["living"]["power_fallback"],
             "ceiling_w": 8.0,
         }
+        rooms_wrong_off["bedroom"]["verified_off_power"] = {"ceiling_w": 8.0}
         site_wrong_off = build_site_config(rooms_wrong_off, self.site.raw_topology, self.site.policy)
         self.assertIsNone(site_wrong_off.actuator_by_name("living").verified_off_ceiling_w)
+        self.assertIsNone(site_wrong_off.actuator_by_name("bedroom").verified_off_ceiling_w)
 
         # Build site with primary-only verified_off_power ceiling_w = 8.0 on every unit
         rooms_voff = deepcopy(self.site.raw_rooms)
@@ -2047,31 +2049,48 @@ class NeuralShadowRegressionTests(unittest.TestCase):
         self.assertEqual(float(xh_mixed[-1, _feat_idx("unit:living:last_power_w")]), 4.0)
         self.assertEqual(float(xh_mixed[-1, _feat_idx("unit:living:power_above_off")]), 0.0)
 
-        # Part B: Fallback-only window (true primary hole): fallback watts (120W) MUST NOT be compared
-        # against primary-only verified_off_ceiling_w=8.0 -> power_above_off MUST be NaN!
+        # Part B: Fallback-only window (true primary hole): fallback watts MUST NOT be compared against
+        # primary-only verified_off_ceiling_w=8.0 -> power_above_off MUST be NaN, while keeping the
+        # meter-agnostic >80W "running while off" uncertainty anomaly signal.
         hist_fb_only = deepcopy(hist_primary_only)
         stu_act = site_voff.actuator_by_name("study")
         hist_fb_only.power_reports["study"] = [
             PowerReport("study", stu_act.power_entity, "ep1", base + m * 60.0 + 10.0, 2.0)
             for m in range(201)
         ]
+        # Moderate fallback (50W > primary ceiling 8W, <= 80W meter-agnostic floor): above_off is NaN, not uncertain
         hist_fb_only.power_reports["living"] = [
-            PowerReport("living", liv_act.power_fallback, "recorder", base + m * 60.0 + 10.0, 120.0, source_role="fallback")
+            PowerReport("living", liv_act.power_fallback, "recorder", base + m * 60.0 + 10.0, 50.0, source_role="fallback")
             for m in range(201)
         ]
-        # Set living proxy mode to "off" so we also verify mode=="off" uncertainty doesn't apply primary off_ceil to fallback
         hist_fb_only.proxy_states["living"] = [
             ProxyStateEvent("living", ev.at, "off", ev.setpoint, ev.target_c, source_fresh=True)
             for ev in hist_fb_only.proxy_states["living"]
         ]
         xh_fb, meta_fb = extract_history_window(_HistoryIndex(hist_fb_only), spec_voff, cutoff)
-        self.assertEqual(meta_fb["unit_watts"]["living"], 120.0)
+        self.assertEqual(meta_fb["unit_watts"]["living"], 50.0)
         self.assertEqual(meta_fb["unit_power_source"]["living"], "fallback:recorder")
-        self.assertEqual(float(xh_fb[-1, _feat_idx("unit:living:last_power_w")]), 120.0)
+        self.assertEqual(float(xh_fb[-1, _feat_idx("unit:living:last_power_w")]), 50.0)
         self.assertEqual(float(xh_fb[-1, _feat_idx("unit:living:power_missing")]), 0.0)
         self.assertGreater(float(xh_fb[-1, _feat_idx("unit:living:bin_power_cov")]), 0.7)
         self.assertTrue(np.isnan(xh_fb[-1, _feat_idx("unit:living:power_above_off")]))
         self.assertEqual(float(xh_fb[-1, _feat_idx("quality:any_uncertain")]), 0.0)
+
+        # High fallback (120W > 80W while mode=="off", even if primary ceiling were 30W -> 5x=150W):
+        # power_above_off stays NaN (never uses primary ceiling) AND meter-agnostic >80W uncertainty still fires!
+        rooms_hi_ceil = deepcopy(rooms_voff)
+        rooms_hi_ceil["living"]["verified_off_power"] = {"entity": rooms_hi_ceil["living"]["power"], "ceiling_w": 30.0}
+        site_hi_ceil = build_site_config(rooms_hi_ceil, self.site.raw_topology, self.site.policy)
+        spec_hi_ceil = build_feature_spec(site_hi_ceil)
+        hist_fb_high = deepcopy(hist_fb_only)
+        hist_fb_high.site = site_hi_ceil
+        hist_fb_high.power_reports["living"] = [
+            PowerReport("living", liv_act.power_fallback, "recorder", base + m * 60.0 + 10.0, 120.0, source_role="fallback")
+            for m in range(201)
+        ]
+        xh_fb_hi, _ = extract_history_window(_HistoryIndex(hist_fb_high), spec_hi_ceil, cutoff)
+        self.assertTrue(np.isnan(xh_fb_hi[-1, spec_hi_ceil.hist_feature_names.index("unit:living:power_above_off")]))
+        self.assertEqual(float(xh_fb_hi[-1, spec_hi_ceil.hist_feature_names.index("quality:any_uncertain")]), 1.0)
 
         # Part C: Production SQLite (--production) + export-history -> data-build --snapshot parity
         with TemporaryDirectory() as tmp:

@@ -318,6 +318,7 @@ def classify_power_report(
 
 
 def _epoch_sort_key(epoch: str, max_report_at: float) -> tuple[int, float, str]:
+    """Order epochs within the same tier: ISO/numeric timestamps first (chronologically), then non-ISO labels by max_report_at."""
     ts = _ts(epoch)
     if ts is not None:
         return (1, ts, epoch)
@@ -2470,10 +2471,8 @@ def extract_history_window(
             hold_or_iso = bool(proxy and (proxy.manual_hold or proxy.failure_hold or proxy.isolated))
             if proxy and proxy.manual_hold:
                 bin_manual = True
-            if proxy and (
-                proxy.uncertain
-                or (mode == "off" and p_is_primary and not math.isnan(p_w) and p_w > max(80.0, off_ceil * 5))
-            ):
+            off_anomaly_w = max(80.0, off_ceil * 5) if p_is_primary else 80.0
+            if proxy and (proxy.uncertain or (mode == "off" and not math.isnan(p_w) and p_w > off_anomaly_w)):
                 bin_uncertain = True
 
             X[k, col : col + 4] = oh
