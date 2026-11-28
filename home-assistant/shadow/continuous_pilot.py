@@ -21,7 +21,7 @@ from house_policy import ACTIVE, INDEPENDENT, POLICY
 from heating_pilot import DATA_DIR, ha_client, publish
 from model import increases_output, numeric
 from pilot_gate import ROOMS, matching_feedback, room_advice, room_feedback
-from service import CONFIG, encode, local
+from service import CONFIG, POWER_REPORT_GAP_SECONDS, encode, local
 from live_evidence import attach as attach_power
 from topology import extra_inputs, read_topology
 from zone_control import allows_assistance, coordinate as coordinate_zones, learned_initial
@@ -42,8 +42,12 @@ RELEASE = {}
 LEGACY_EXTERNAL_HOLD = "检测到外部修改了空调设置，已暂停该机"
 RECONCILE_DEFAULTS = {"external_override_seconds": 3600, "start_verify_seconds": 900, "start_retry_limit": 2,
                       "start_retry_backoff_seconds": 900, "start_failure_hold_seconds": 7200}
-RECONCILE = {key: POLICY.get(key, value) for key, value in RECONCILE_DEFAULTS.items()}
 RUNNING_WATTS_FLOOR = 30
+
+
+def reconcile_setting(key):
+    return POLICY.get(key, RECONCILE_DEFAULTS[key])
+
 
 def configure_audit():
     directory = Path(__file__).parent
@@ -126,7 +130,8 @@ def put_state(path, state):
 
 def running_watts(room):
     reference = ROOMS[room].get("verified_off_power")
-    ceiling = numeric(reference.get("ceiling_w")) if isinstance(reference, dict) else None
+    matched = isinstance(reference, dict) and reference.get("entity") == ROOMS[room]["power"]
+    ceiling = numeric(reference.get("ceiling_w")) if matched else None
     return max(RUNNING_WATTS_FLOOR, 2*ceiling) if ceiling is not None and ceiling > 0 else RUNNING_WATTS_FLOOR
 
 
@@ -135,7 +140,18 @@ def is_start(action):
 
 
 def clock(stamp):
-    return local(stamp).strftime("%H:%M")
+    return local(stamp).strftime("%H：%M")
+
+
+def start_power(action, values, now):
+    """Return a power report taken after the command while the unit reports the started mode."""
+    adapter = values["adapter"]
+    watts = numeric(adapter["power"])
+    age = numeric(adapter["from_power_s"])
+    if (watts is None or not 0 <= watts <= 10000 or age is None or not 0 <= age <= POWER_REPORT_GAP_SECONDS
+            or now-age < action["sent_at"] or adapter["mode"] != action["value"]):
+        return None
+    return watts
 
 
 def park_from_report(state, room, values, previous_mode, started_at=None):
@@ -149,40 +165,51 @@ def reconcile_report(state, room, values, now):
     signature = list(values["signature"][:3])
     previous = state["baselines"][room]
     state["baselines"][room] = signature
+    parked = state.setdefault("parked", {})
+    if previous[0] == "off" and signature[0] == "off":
+        # A stopped unit can refresh its setpoint or fan attributes without any operation.
+        if room not in parked:
+            park_from_report(state, room, values, "off")
+        audit("stopped_report_drift", room=room, previous=previous, reported=signature)
+        return
+    failures = state.setdefault("start_failures", {})
     last = next((a for a in reversed(state["commands"])
                  if a["room"] == room and a["status"] == "proxy_echo" and a["kind"] == "mode"), None)
-    failed_start = (last is not None and is_start(last) and signature[0] == "off"
-                    and now-last["proxy_at"] <= RECONCILE["start_verify_seconds"]
-                    and (last.get("peak_watts") or 0) < running_watts(room))
+    failed_start = (last is not None and is_start(last) and previous[0] == last["value"] and signature[0] == "off"
+                    and last["sent_at"] != failures.get(room, {}).get("command_at")
+                    and now-last["proxy_at"] <= reconcile_setting("start_verify_seconds")
+                    and last.get("peak_watts") is not None and last["peak_watts"] < running_watts(room))
     overrides = state.setdefault("external_overrides", {})
     batch = state.get("transitions", {}).get(group(room))
     if batch and room in batch["members"]:
         batch["members"][room]["phase"] = "done"
     if failed_start:
         overrides.pop(room, None)
-        failures = state.setdefault("start_failures", {})
         count = failures.get(room, {}).get("count", 0) + 1
         entry = {"count": count, "at": now, "mode": last["value"], "command_at": last["sent_at"],
                  "peak_watts": last.get("peak_watts")}
-        if count > RECONCILE["start_retry_limit"]:
-            entry["hold_until"] = now + RECONCILE["start_failure_hold_seconds"]
+        if count > reconcile_setting("start_retry_limit"):
+            entry["hold_until"] = now + reconcile_setting("start_failure_hold_seconds")
         else:
-            entry["retry_at"] = now + RECONCILE["start_retry_backoff_seconds"] * 2**(count-1)
+            entry["retry_at"] = now + reconcile_setting("start_retry_backoff_seconds") * 2**(count-1)
         failures[room] = entry
         park_from_report(state, room, values, last["value"], last["proxy_at"])
         audit("start_unverified", room=room, previous=previous, reported=signature, **entry)
         return
-    overrides[room] = {"at": now, "until": now + RECONCILE["external_override_seconds"],
+    overrides[room] = {"at": now, "until": now + reconcile_setting("external_override_seconds"),
                        "previous": previous, "reported": signature}
     if signature[0] == "off":
         park_from_report(state, room, values, previous[0] if previous[0] in ACTIVE else "off")
     else:
-        state.setdefault("parked", {}).pop(room, None)
+        parked.pop(room, None)
+        if signature[0] in ACTIVE:
+            failures.pop(room, None)
     audit("external_override", room=room, previous=previous, reported=signature, until=overrides[room]["until"])
 
 
 def release_legacy_holds(state, live):
-    for room in [r for r, reason in state["manual_holds"].items() if reason == LEGACY_EXTERNAL_HOLD and r in live]:
+    for room in [r for r, reason in state["manual_holds"].items() if reason == LEGACY_EXTERNAL_HOLD and r in live
+                 and live[r]["signature"][0] not in {"unavailable", "unknown"}]:
         del state["manual_holds"][room]
         values = live[room]
         signature = list(values["signature"][:3])
@@ -265,9 +292,8 @@ def settle(state, live, now, *, trial=True):
         if previous_status != action["status"]:
             audit("receipt", room=room, command_at=action["sent_at"], status=action["status"], http=action.get("http"))
         if action["status"] == "proxy_echo":
-            watts = numeric(values["adapter"]["power"])
-            if (is_start(action) and watts is not None and values["adapter"]["mode"] == action["value"]
-                    and now-action["proxy_at"] <= RECONCILE["start_verify_seconds"]):
+            watts = start_power(action, values, now) if is_start(action) else None
+            if watts is not None and now-action["proxy_at"] <= reconcile_setting("start_verify_seconds"):
                 action["peak_watts"] = max(action.get("peak_watts") or 0, watts)
                 if action["peak_watts"] >= running_watts(room) and state.get("start_failures", {}).pop(room, None):
                     audit("start_verified_by_power", room=room, command_at=action["sent_at"], watts=action["peak_watts"])
@@ -334,7 +360,8 @@ def assess(live, state, now, advise_room=room_advice, *, trial=True, isolated=()
     for room, values in live.items():
         mode, setpoint, fan, requested, target, preset, native_on = values["signature"]
         power = numeric(values["adapter"]["power"])
-        hold = state["holds"].get(group(room)) or manual.get(room) or yielded(state, room, now)
+        yielding = yielded(state, room, now)
+        hold = state["holds"].get(group(room)) or manual.get(room) or yielding
         ready[room] = (room in connected and not hold and room not in pending
                        and requested == "auto" and preset == "标准" and native_on is False
                        and values["native_authorized"] is False and power is not None and 0 <= power <= 10000

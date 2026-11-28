@@ -726,8 +726,8 @@ class DispatchTests(unittest.TestCase):
         started = self.snapshot()
         self.assertEqual((started["commands"][-1]["purpose"], started["commands"][-1]["value"]),
                          ("energy_start", "heat"))
-        for _ in range(2):
-            self.now += 20
+        for seconds in (20, 20, 60):
+            self.now += seconds
             self.observe("living")
             echoed = self.snapshot()
         self.assertEqual((echoed["commands"][0]["purpose"], echoed["commands"][0]["status"]),
@@ -860,6 +860,89 @@ class DispatchTests(unittest.TestCase):
                                                      "started_at": self.now-3600})
         self.assertNotIn("living", state.get("external_overrides", {}))
         self.assertIn("study", state["external_overrides"])
+
+    def test_attribute_drift_after_failed_start_is_not_counted_again(self):
+        self.start_parked_living()
+        self.revert_living_to_off()
+        self.now += 120
+        live = self.live["living"]
+        live["signature"] = ("off", 24, *live["signature"][2:])
+        self.observe("living")
+        state = self.snapshot()
+        failure = state["start_failures"]["living"]
+        self.assertEqual(failure["count"], 1)
+        self.assertNotIn("hold_until", failure)
+        self.assertNotIn("living", state.get("external_overrides", {}))
+        self.assertEqual(state["parked"]["living"]["mode"], "heat")
+        self.assertEqual(state["baselines"]["living"], ["off", 24, "auto"])
+
+    def test_stopped_unit_drift_keeps_parked_evidence_without_override(self):
+        self.whole_scene(("heat", 25, 24, 20), ("heat", 24, 24, 15))
+        self.park("living", ago=600)
+        parked = {"off_at": self.now-600, "mode": "cool", "started_at": self.now-1200, "handoff": True}
+        self.update_state(parked={"living": parked},
+                          baselines={r: list(x["signature"][:3]) for r, x in self.live.items()})
+        live = self.live["living"]
+        live["signature"] = ("off", 24, "low", *live["signature"][3:])
+        self.observe("living")
+        state = self.snapshot()
+        self.assertEqual(state["parked"]["living"], parked)
+        self.assertNotIn("living", state.get("external_overrides", {}))
+        self.assertEqual(state["baselines"]["living"], ["off", 24, "low"])
+
+    def test_legacy_hold_is_released_only_after_an_available_report(self):
+        self.whole_scene(("heat", 25, 24, 20), ("heat", 24, 22.8, 15))
+        live = self.live["living"]
+        live["signature"] = ("unavailable", None, None, *live["signature"][3:])
+        live["adapter"].update(mode="unavailable", setpoint=None)
+        self.update_state(baselines={"bedroom": list(self.live["bedroom"]["signature"][:3]),
+                                     "living": ["heat", 24, "auto"], "study": ["heat", 24, "auto"]},
+                          manual_holds={"living": pilot.LEGACY_EXTERNAL_HOLD})
+        state = self.snapshot()
+        self.assertEqual(state["manual_holds"], {"living": pilot.LEGACY_EXTERNAL_HOLD})
+        self.assertEqual(state["baselines"]["living"], ["heat", 24, "auto"])
+        live["signature"] = ("off", None, "auto", *live["signature"][3:])
+        live["adapter"].update(mode="off", last_mode_change=self.now-3600)
+        self.now += 20
+        self.observe("living")
+        state = self.snapshot()
+        self.assertEqual(state["manual_holds"], {})
+        self.assertEqual(state["parked"]["living"]["mode"], "heat")
+        self.assertNotIn("living", state.get("external_overrides", {}))
+
+    def test_manual_start_clears_start_failures(self):
+        self.whole_scene(("heat", 25, 24, 20), ("heat", 24, 22.8, 15))
+        self.park("living", ago=900)
+        self.update_state(baselines={r: list(x["signature"][:3]) for r, x in self.live.items()},
+                          start_failures={"living": {"count": 3, "at": NOW-100, "mode": "heat", "hold_until": NOW+7000}})
+        live = self.live["living"]
+        live["signature"] = ("heat", 24, *live["signature"][2:])
+        live["adapter"].update(mode="heat", setpoint=24, power=600, last_mode_change=self.now)
+        self.now += 20
+        self.observe("living")
+        state = self.snapshot()
+        self.assertNotIn("living", state["start_failures"])
+        self.assertIn("living", state["external_overrides"])
+        self.assertNotIn("living", state["parked"])
+
+    def test_revert_without_power_after_the_start_is_an_external_change(self):
+        self.whole_scene(("heat", 25, 24, 20), ("heat", 24, 22.8, 15))
+        live = self.live["living"]
+        live["signature"] = ("off", None, *live["signature"][2:])
+        live["adapter"].update(mode="off", setpoint=None, last_mode_change=self.now-900)
+        self.update_state(baselines={r: list(x["signature"][:3]) for r, x in self.live.items()},
+                          parked={"living": {"off_at": self.now-900, "mode": "heat", "started_at": self.now-4000}})
+        self.observe("living")
+        started = self.snapshot()
+        self.assertEqual(started["commands"][-1]["purpose"], "energy_start")
+        for seconds in (20, 20):
+            self.now += seconds
+            self.observe("living")
+            echoed = self.snapshot()
+        self.assertIsNone(echoed["commands"][0].get("peak_watts"))
+        state = self.revert_living_to_off()
+        self.assertNotIn("living", state.get("start_failures", {}))
+        self.assertIn("living", state["external_overrides"])
 
 
 if __name__ == "__main__":

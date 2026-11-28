@@ -178,6 +178,23 @@ class TelemetryTests(unittest.TestCase):
         for secret in (b"area_private",b"sensor.private",b"leak",b"token"):
             self.assertNotIn(secret,blob)
 
+    def test_reconcile_status_failures_and_audit_payload_survive_projection(self):
+        public=evidence.PublicSchema("a"*64,{"living":{}},{})
+        unit=public.aliases["living"]
+        for text in ("检测到外部调整，暂时让出调度至 14：05","开机多次未生效，暂停重试至 09：30","开机未生效，23：15 后重试"):
+            self.assertEqual(public.convert(text,"status"),text)
+        failures=public.convert({"living":{"count":1,"at":5,"mode":"heat","command_at":3,"peak_watts":2.0,"retry_at":905}})
+        self.assertEqual(failures,{unit:{"count":1,"at":5,"mode":"heat","command_at":3,"peak_watts":2.0,"retry_at":905}})
+        overrides=public.convert({"living":{"at":5,"until":3605,"previous":["cool",24,"auto"],"reported":["off",None,"auto"]}})
+        self.assertEqual(overrides[unit]["previous"],["cool",24,"auto"])
+        event=public.audit({"event":"start_unverified","at":5,"room":"living","previous":["heat",24,"auto"],
+                            "reported":["off",None,"auto"],"count":3,"mode":"heat","command_at":3,"peak_watts":1.0,
+                            "hold_until":7205})
+        self.assertEqual((event["room"],event["count"],event["hold_until"],event["previous"]),
+                         (unit,3,7205,["heat",24,"auto"]))
+        command=public.record({"room":"living","kind":"mode","value":"heat","sent_at":3,"peak_watts":1.0},evidence.COMMAND_FIELDS)
+        self.assertEqual(command["peak_watts"],1.0)
+
 
 if __name__=="__main__":
     unittest.main()
