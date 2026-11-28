@@ -44,7 +44,7 @@ stateDiagram-v2
 
 长期暂停调度只认明确入口：虚拟恒温器离开 `auto`、区域 `pause_entity`、许可 `paused_zones` 或 `isolated_rooms`。伴侣回报的模式、设温或风速与最近确认的基线不同，且没有在途指令时，不再写入永久 `manual_holds`，按下面两种情况处理：
 
-- **开机未生效**：最近一条已回显的模式指令是这次开机，`start_verify_seconds` 内状态从该模式退回 `off`，且发令后的新鲜功率报告（120 秒内、0–10000 W）峰值 `peak_watts` 低于运行阈值（同一功率实体的 `verified_off_power.ceiling_w` 的 2 倍，至少 30 W）。记入 `start_failures`，按当时模式补回 `parked`，结束该机未完成的换向批次。同一条开机指令只计一次。重试间隔从 `start_retry_backoff_seconds` 起逐次翻倍；超过 `start_retry_limit` 次后暂停重试 `start_failure_hold_seconds`，到期再试。开机后实测功率达到运行阈值即清除失败计数。发令后没有新鲜功率报告时不判定为开机失败，按外部调整处理。
+- **开机未生效**：最近一条已回显的模式指令是这次开机，回显后 `start_power_grace_seconds`（240 秒）到 `start_verify_seconds`（900 秒）之间状态从该模式退回 `off`，且发令后的新鲜功率报告（120 秒内、0–10000 W）峰值 `peak_watts` 低于运行阈值（同一功率实体的 `verified_off_power.ceiling_w` 的 2 倍，至少 30 W）。记入 `start_failures`，按当时模式补回 `parked`，结束该机未完成的换向批次。同一条开机指令只计一次。重试间隔从 `start_retry_backoff_seconds` 起逐次翻倍；超过 `start_retry_limit` 次后暂停重试 `start_failure_hold_seconds`，到期再试；距上次失败超过 `start_failure_reset_seconds`（1 天）则重新计数。回显后 240 秒内就退回 `off` 视为有人关机，按外部调整处理。开机后实测功率达到运行阈值即清除失败计数。发令后没有新鲜功率报告时不判定为开机失败，按外部调整处理。
 - **其他外部调整**：采纳新状态为基线，写入 `external_overrides`，让出调度 `external_override_seconds`。期间再次变化会重新计时，到期自动恢复。外部关机按原运行模式补回 `parked`，此后仍受最短停机、低耗证据和反向保护约束。外部开到制冷或制热会清除该机的 `start_failures`。
 - **停机状态下的属性刷新**：基线和回报都是 `off`、只有设温或风速变化时，只采纳为新基线，不让出调度，也不改写已有的 `parked`。
 

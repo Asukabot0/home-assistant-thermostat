@@ -44,7 +44,9 @@
   "lower_output_observe_seconds": 180,
   "external_override_seconds": 3600,
   "start_verify_seconds": 900,
+  "start_power_grace_seconds": 240,
   "start_retry_limit": 2,
   "start_retry_backoff_seconds": 900,
-  "start_failure_hold_seconds": 7200
+  "start_failure_hold_seconds": 7200,
+  "start_failure_reset_seconds": 86400
 }

@@ -500,12 +500,12 @@ def load_room(db, rooms, recorder, code, config, tick, actual_beep, shared_simul
         activity = identify(tick, latest, [point for point in recent if point[0] >= tick - 900], model, history)
     else:
         activity = Activity("未知", "未知", "等待该分钟的 HA 观测")
-    active_since = learning_active(session, code, virtual) if source_fresh and fresh_power and not power_without_room_sample else None
+    active_since = learning_active(session, code, virtual, tick) if source_fresh and fresh_power and not power_without_room_sample else None
     learning_power_span = bands.get("learning", {}).get("seconds", 0)
     if active_since is not None and learning_power_span >= EPISODE_SECONDS:
         since = tick - EPISODE_SECONDS
         auto = continuous_entity(recorder, thermostat, since, tick+60,
-                                 lambda row: learning_active(session, code, row) is not None
+                                 lambda row: learning_active(session, code, row, tick) is not None
                                  and (fields := json.loads(row["shared_attrs"] or "{}")).get("temperature_entity_id") == attrs.get("temperature_entity_id")
                                  and numeric(fields.get("temperature")) == latest["desired"]
                                  and power_context(fields, config["power"]) == context)

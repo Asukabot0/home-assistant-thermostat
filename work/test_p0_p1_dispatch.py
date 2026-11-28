@@ -944,6 +944,57 @@ class DispatchTests(unittest.TestCase):
         self.assertNotIn("living", state.get("start_failures", {}))
         self.assertIn("living", state["external_overrides"])
 
+    def test_stop_soon_after_a_start_is_treated_as_a_person_not_a_failed_start(self):
+        started = self.start_parked_living()
+        self.assertIsNotNone(started["commands"][0]["peak_watts"])
+        state = self.revert_living_to_off(after=60)
+        self.assertNotIn("living", state.get("start_failures", {}))
+        self.assertIn("living", state["external_overrides"])
+
+    def test_start_failure_count_restarts_after_a_quiet_day(self):
+        self.start_parked_living(failures={"living": {"count": 2, "at": NOW-90000, "mode": "heat",
+                                                      "retry_at": NOW-89000}})
+        state = self.revert_living_to_off()
+        failure = state["start_failures"]["living"]
+        self.assertEqual((failure["count"], failure["retry_at"]), (1, self.now+900))
+        self.assertNotIn("hold_until", failure)
+
+    def test_learning_waits_only_while_an_override_is_current(self):
+        from steady_learning import learning_active
+        session = {"start": 5, "holds": {}, "external_overrides": {"bedroom": {"until": 100}}}
+        virtual = {"state": "auto", "shared_attrs": json.dumps({"preset_mode": "标准"})}
+        self.assertIsNone(learning_active(session, "bedroom", virtual, 99))
+        self.assertEqual(learning_active(session, "bedroom", virtual, 100), 5)
+
+    def test_start_then_home_assistant_restart_then_revert_counts_one_failed_start(self):
+        started = self.start_parked_living()
+        calls = len(self.calls)
+        live = self.live["living"]
+        running = live["signature"]
+        self.assertEqual(started["baselines"]["living"], list(running[:3]))
+        self.now += 60
+        live["signature"] = ("unavailable", None, None, *running[3:])
+        live["adapter"].update(mode="unavailable", setpoint=None, power=None)
+        self.observe("living")
+        live["adapter"]["from_power_s"] = 1e12
+        restarting = self.snapshot()
+        self.assertEqual(restarting["baselines"]["living"], list(running[:3]))
+        self.assertNotIn("living", restarting.get("external_overrides", {}))
+        self.now += 60
+        live["signature"] = running
+        live["adapter"].update(mode=running[0], setpoint=running[1], power=15, last_mode_change=self.now-5)
+        self.observe("living")
+        restored = self.snapshot()
+        self.assertNotIn("living", restored.get("external_overrides", {}))
+        self.assertNotIn("living", restored.get("start_failures", {}))
+        state = self.revert_living_to_off(after=120)
+        failure = state["start_failures"]["living"]
+        self.assertEqual((failure["count"], failure["retry_at"]), (1, self.now+900))
+        self.assertEqual(state["manual_holds"], {})
+        self.assertEqual(state["holds"], {})
+        self.assertNotIn("living", state.get("external_overrides", {}))
+        self.assertEqual(len(self.calls), calls)
+
 
 if __name__ == "__main__":
     unittest.main()

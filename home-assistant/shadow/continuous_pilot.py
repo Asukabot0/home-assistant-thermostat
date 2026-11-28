@@ -40,8 +40,9 @@ AUDIT = logging.getLogger("thermostat.live")
 RELEASE = {}
 # Written automatically by earlier releases; operator-written holds keep other text.
 LEGACY_EXTERNAL_HOLD = "检测到外部修改了空调设置，已暂停该机"
-RECONCILE_DEFAULTS = {"external_override_seconds": 3600, "start_verify_seconds": 900, "start_retry_limit": 2,
-                      "start_retry_backoff_seconds": 900, "start_failure_hold_seconds": 7200}
+RECONCILE_DEFAULTS = {"external_override_seconds": 3600, "start_verify_seconds": 900, "start_power_grace_seconds": 240,
+                      "start_retry_limit": 2, "start_retry_backoff_seconds": 900, "start_failure_hold_seconds": 7200,
+                      "start_failure_reset_seconds": 86400}
 RUNNING_WATTS_FLOOR = 30
 
 
@@ -175,9 +176,11 @@ def reconcile_report(state, room, values, now):
     failures = state.setdefault("start_failures", {})
     last = next((a for a in reversed(state["commands"])
                  if a["room"] == room and a["status"] == "proxy_echo" and a["kind"] == "mode"), None)
+    # A stop before a working compressor would draw power is treated as a person's choice.
     failed_start = (last is not None and is_start(last) and previous[0] == last["value"] and signature[0] == "off"
                     and last["sent_at"] != failures.get(room, {}).get("command_at")
-                    and now-last["proxy_at"] <= reconcile_setting("start_verify_seconds")
+                    and reconcile_setting("start_power_grace_seconds") <= now-last["proxy_at"]
+                    <= reconcile_setting("start_verify_seconds")
                     and last.get("peak_watts") is not None and last["peak_watts"] < running_watts(room))
     overrides = state.setdefault("external_overrides", {})
     batch = state.get("transitions", {}).get(group(room))
@@ -185,7 +188,9 @@ def reconcile_report(state, room, values, now):
         batch["members"][room]["phase"] = "done"
     if failed_start:
         overrides.pop(room, None)
-        count = failures.get(room, {}).get("count", 0) + 1
+        earlier = failures.get(room, {})
+        recent = now-earlier.get("at", now) <= reconcile_setting("start_failure_reset_seconds")
+        count = earlier.get("count", 0) + 1 if recent else 1
         entry = {"count": count, "at": now, "mode": last["value"], "command_at": last["sent_at"],
                  "peak_watts": last.get("peak_watts")}
         if count > reconcile_setting("start_retry_limit"):
