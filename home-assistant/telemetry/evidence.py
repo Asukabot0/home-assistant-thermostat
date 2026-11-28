@@ -28,7 +28,7 @@ SAMPLE_FIELDS = "room tick measured desired reported adapter_mode watts outdoor 
 DECISION_FIELDS += " season zone_model"
 ZONE_FIELDS += " fusion model_trend model_hold"
 MODEL_FIELDS = ("active ready ready_running used updates settled unscored running_settled sigma sigma_running mae running_mae coverage "
-                "ratio std trusted errors error failover estimated offset pairs")
+                "ratio std trusted errors error failover estimated offset pairs model summary")
 NESTED = set((ZONE_FIELDS + " " + ROOM_FIELDS + " " + DECISION_FIELDS + " " + COMMAND_FIELDS + " " + MODEL_FIELDS +
     " mode started_at off_at mode_started_at phase members ready_at id target zone source last_report bands threshold floor since seconds context low high above_low learning count delta uncertainty from to value report_span reports fresh interval_seconds watt_hours useful improvement thermal_delta start_c end_c ended_at covered_seconds weather_c served_zone last_increase own_command zone_report power_at deviation projected_adverse point influence temperature_report_at power_report_at room_age_s power_age_s reported watts room_c temperature_c definition before_c unit episode_count at code_sha256 config_sha256 step mode provenance local zone_reason time start finish enabled until reason virtual_mode context sensors limits centers_w edges_w counts samples span_minutes fit file function line status expires expected started last_power context_changed old new phases targets owner receiver blocker blocker_definition blocker_version selected_at handoff_at handoff_phase learning_version previous command_at retry_at hold_until 5 15").split())
 WORDS = re.compile(r"^[a-z][a-z0-9_]{0,55}$")

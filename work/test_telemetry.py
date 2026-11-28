@@ -200,7 +200,7 @@ class TelemetryTests(unittest.TestCase):
              "coverage":0.7,"secret":"leak"}
         influence=[{"unit":"room_private","mode":"cool","zone":"area_private","ratio":0.02,"std":0.02,"status":"negligible",
                     "trusted":False}]
-        errors={"area_private":{"at":5,"error":"TypeError"}}
+        errors={"area_private":{"at":5,"error":"TypeError"},"model":{"at":6,"error":"ValueError"},"summary":{"at":7,"error":"KeyError"}}
         out=public.audit({"event":"cycle","at":1,"assessment":{
             "zones":{"area_private":{"trend":trend,"model_trend":trend,"model_hold":"running_not_ready","fusion":fusion}},
             "zone_model":{"active":False,"zones":{"area_private":row},"influence":influence,"errors":errors}}})
@@ -214,7 +214,8 @@ class TelemetryTests(unittest.TestCase):
                          (True,False,[0.05,0.08,0.07],[0.1,0.3,0.3],"updated"))
         self.assertEqual(projected["zone_model"]["influence"][0]["unit"],public.aliases["room_private"])
         self.assertFalse(projected["zone_model"]["influence"][0]["trusted"])
-        self.assertEqual(projected["zone_model"]["errors"],{zone:{"at":5,"error":"TypeError"}})
+        self.assertEqual(projected["zone_model"]["errors"],
+                         {zone:{"at":5,"error":"TypeError"},"model":{"at":6,"error":"ValueError"},"summary":{"at":7,"error":"KeyError"}})
         blob=evidence.json_bytes(out)
         for secret in (b"area_private",b"aux_private",b"room_private",b"leak",b"secret"):
             self.assertNotIn(secret,blob)
