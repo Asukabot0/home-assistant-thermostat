@@ -43,7 +43,7 @@ def add_points(row, observation, identity, now, policy):
     return points
 
 
-def track(row, observation, target, estimate, paused, now, policy, bands=None):
+def track(row, observation, target, estimate, paused, now, policy):
     measured = observation["value"]
     episode = row.get("recovery") or {}
     result = {"measured": measured, "target": target, "at": observation["at"], "quality": observation["quality"],
@@ -55,7 +55,7 @@ def track(row, observation, target, estimate, paused, now, policy, bands=None):
     error = target-measured
 
     def band_for(gap):
-        return (bands or {}).get("heat" if gap > 0 else "cool", policy["tracking_band"])
+        return policy.get("tracking_bands", {}).get("heat" if gap > 0 else "cool", policy["tracking_band"])
 
     band = band_for(error)
     result["error"] = error
@@ -183,6 +183,7 @@ def observations(topology, live, inputs, state, actions, paused, now, policy=POL
                  if s.get("enabled", True)}
     environment = {k: v for k, v in by_sensor.items() if topology["sensors"][k]["role"] == "environment"}
     _, bands = season(environment, state, now, policy)
+    policy = dict(policy, tracking_bands=bands)
     previous = state.get("definition")
     state["definition"] = topology["fingerprint"]
     trackers = state.setdefault("trackers", {})
@@ -222,7 +223,7 @@ def observations(topology, live, inputs, state, actions, paused, now, policy=POL
         memory["zone_version"] = definition
         changed = max((a["proxy_at"] for a in actions if key in topology["actuators"][a["room"]]["influences"]), default=0)
         forecast = trend(points, max(changed, memory["changed_at"]), now, policy) if ref["quality"] == "fresh" else None
-        result = track(memory, ref, target, forecast, is_paused, now, policy, bands)
+        result = track(memory, ref, target, forecast, is_paused, now, policy)
         result.update(source_version=identity, observation_definition=definition, source=ref["source"], primary=zone["primary"],
                       primary_reading=primary, inputs=sensors,
                       constraints={k: s for k, s in sensors.items() if topology["sensors"][k]["role"] == "constraint"})

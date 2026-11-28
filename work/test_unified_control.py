@@ -12,7 +12,7 @@ from live_evidence import attach
 from service import power_evidence
 from steady_learning import record_episode
 from topology import configure, extra_inputs
-from zone_control import observations, season
+from zone_control import observations
 
 
 pilot=fixture.pilot
@@ -380,6 +380,7 @@ class UnifiedCycleTests(unittest.TestCase):
                 self.assertEqual("sleep" in trace["unmet"], contested)
 
     def test_season_needs_fresh_weather_and_keeps_hysteresis(self):
+        from zone_control import season
         fresh = lambda value: {"outdoor": {"value": value, "quality": "fresh"}}
         memory = {}
         self.assertEqual(season(fresh(25), memory, 0), ({"mode": None, "outdoor_c": 25, "at": 0}, {}))
