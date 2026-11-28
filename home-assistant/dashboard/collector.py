@@ -99,6 +99,10 @@ HANDOFF_REASON_LABELS = {
 ACTUATOR_STATUS_LABELS = {
     "bounded_zone_correction": "区域偏差确认，准备小步加码",
     "start_for_confirmed_zone_error": "持续偏差确认，准备按需启机",
+    "start_beside_unpowered_unit": "同区设备未证实输出，准备按需启用另一台",
+    "exit_eased_dormant_overrun": "减载后已确认低耗，准备退出",
+    "reduce_after_assistance_ended": "跨区辅助需求已结束，准备减载",
+    "ease_within_minimum_runtime": "最短运行期内先减载",
     "maintain_existing_zone_assignment": "同区已有运行设备承担需求",
     "wait_opposite_or_observation": "等待反向退出或动作后观察期",
     "no_admissible_start": "当前不满足启机条件或未停机驻留",
@@ -120,6 +124,7 @@ ACTUATOR_STATUS_LABELS = {
 PURPOSE_LABELS = {
     "zone_strengthen": "区域偏差恢复加码",
     "zone_reduce": "过冲 / 邻区风险减载",
+    "min_run_easing": "最短运行保护期间减载",
     "energy_start": "按需启机",
     "energy_off": "保护 / 退载停机",
     "handoff_reduce": "双向交接 · 对侧减载",
