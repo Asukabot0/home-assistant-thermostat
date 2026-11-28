@@ -168,6 +168,13 @@ class TelemetryTests(unittest.TestCase):
             with self.subTest(expected=expected), patch.object(worker,"container_runtime",side_effect=[dict(pilot),dict(shadow)]), patch.object(worker,"audit_rows",return_value=rows):
                 self.assertEqual(worker.runtime(config,Path("."),140)["status"],expected)
 
+    def test_public_projection_keeps_zone_response_trend(self):
+        topo={"zones":{"area_private":{"primary":"s"}},"sensors":{"s":{"entity":"sensor.private"}}}
+        public=evidence.PublicSchema("a"*64,{},topo)
+        response={"delta":-0.6,"uncertainty":0.1,"from":0,"to":600,"reports":2}
+        out=public.audit({"event":"cycle","at":1,"assessment":{"zones":{"area_private":{"trend":None,"response_trend":response}}}})
+        self.assertEqual(out["assessment"]["zones"][public.aliases["area_private"]]["response_trend"],response)
+
     def test_public_projection_preserves_zone_and_removes_unrelated_fields(self):
         topo={"zones":{"area_private":{"primary":"s"}},"sensors":{"s":{"entity":"sensor.private"}}}
         public=evidence.PublicSchema("a"*64,{},topo)
