@@ -533,6 +533,141 @@ class DashboardCollectorTests(unittest.TestCase):
             json.dumps(snap, allow_nan=False)
         self.assertGreaterEqual(len(stages), 5)
 
+    def test_three_zone_star_topology_labels_and_privacy_safe_summary(self):
+        three_zone_topo = json.loads((HA_DIR / "shadow" / "topology.three-zone.example.json").read_text(encoding="utf-8"))
+        rooms_cfg = json.loads((HA_DIR / "shadow" / "rooms.example.json").read_text(encoding="utf-8"))
+        rooms_cfg["study"]["temperature"] = "sensor.example_office_temperature"
+
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            cfg_dir = root / "shadow-cfg"
+            cfg_dir.mkdir()
+            (cfg_dir / "house_policy.json").write_text((HA_DIR / "shadow" / "house_policy.json").read_text(encoding="utf-8"), encoding="utf-8")
+            (cfg_dir / "rooms.json").write_text(json.dumps(rooms_cfg), encoding="utf-8")
+            (cfg_dir / "topology.json").write_text(json.dumps(three_zone_topo), encoding="utf-8")
+            pilot_dir = root / "pilot-data"
+            pilot_dir.mkdir()
+            now = 1_764_300_000.0
+            (pilot_dir / "live-permit.json").write_text(
+                json.dumps({
+                    "enabled": True, "start": int(now - 3600), "end": None,
+                    "rooms": {"bedroom": ["off", 24, "auto"], "living": ["cool", 25, "auto"], "study": ["cool", 24, "auto"]},
+                }),
+                encoding="utf-8",
+            )
+            (pilot_dir / "status.json").write_text(
+                json.dumps({
+                    "at": "2026-11-28T09:00:00+00:00",
+                    "status": "持续实机控制运行中",
+                    "rooms": {
+                        "bedroom": {"room_c": 24.0, "target_c": 24.0, "mode_reported": "off", "setpoint_reported": None, "power_w": 5, "ready": True, "power_age_s": 10, "temperature_age_s": 20, "zone": "sleep"},
+                        "living": {"room_c": 24.4, "target_c": 24.0, "mode_reported": "cool", "setpoint_reported": 25, "power_w": 150, "ready": True, "power_age_s": 10, "temperature_age_s": 20, "zone": "lounge"},
+                        "study": {"room_c": 25.4, "target_c": 24.0, "mode_reported": "cool", "setpoint_reported": 24, "power_w": 220, "ready": True, "power_age_s": 10, "temperature_age_s": 20, "zone": "office"},
+                    },
+                    "control": {
+                        "at": now - 5, "topology": "site-star-1", "need": "cool", "owner": "office", "lead": "study",
+                        "zones": {
+                            "sleep": {"key": "sleep", "measured": 24.0, "target": 24.0, "error": 0.0, "at": now - 20, "quality": "fresh", "paused": False, "intent": "maintain", "reason": "near_target", "qualified": False},
+                            "lounge": {"key": "lounge", "measured": 24.4, "target": 24.0, "error": -0.4, "at": now - 20, "quality": "fresh", "paused": False, "intent": "observe", "reason": "waiting_reports_or_dwell", "qualified": False},
+                            "office": {"key": "office", "measured": 25.4, "target": 24.0, "error": -1.4, "at": now - 20, "quality": "fresh", "paused": False, "intent": "recover", "reason": "confirmed_bias", "direction": "cool", "qualified": True},
+                        },
+                    },
+                }),
+                encoding="utf-8",
+            )
+            paths = DashboardPaths(
+                shadow_config_dir=cfg_dir,
+                pilot_data_dir=pilot_dir,
+                shadow_data_dir=root / "shadow-data",
+                shadow_output_dir=root / "climate-shadow",
+                neural_output_dir=root / "neural-shadow",
+            )
+            snap = collect_snapshot(paths, now=now)
+            zone_map = {z["zone"]: z for z in snap["state_machines"]["zone_states"]}
+            self.assertEqual(zone_map["sleep"]["label"], "卧室区 (sleep)")
+            self.assertEqual(zone_map["lounge"]["label"], "客厅区 (lounge)")
+            self.assertEqual(zone_map["office"]["label"], "书房区 (office)")
+            self.assertTrue(zone_map["office"]["is_owner"])
+
+            act_map = {a["room"]: a for a in snap["actuators"]}
+            self.assertEqual(act_map["bedroom"]["lock_group"], "bedroom")
+            self.assertEqual(act_map["living"]["lock_group"], "living")
+            self.assertEqual(act_map["study"]["lock_group"], "study")
+            self.assertEqual(set(act_map["bedroom"]["influences"]), {"sleep", "lounge"})
+            self.assertEqual(set(act_map["living"]["influences"]), {"lounge", "sleep", "office"})
+            self.assertEqual(set(act_map["study"]["influences"]), {"office", "lounge"})
+
+            topo = snap["topology"]
+            self.assertTrue(topo["present"])
+            self.assertFalse(topo["from_example"])
+            self.assertFalse(topo["opposite_operation"]["enabled"])
+            pairs = {tuple(sorted((c["from"], c["to"]))) for c in topo["connections"]}
+            self.assertEqual(pairs, {("lounge", "sleep"), ("lounge", "office")})
+            self.assertNotIn("sensor.example_", json.dumps(topo))
+
+            # Two-zone fallback must still label lounge as shared living/study when office is absent
+            demo_snap = build_demo_snapshot("recover_strengthen", now=now)
+            demo_zones = {z["zone"]: z for z in demo_snap["state_machines"]["zone_states"]}
+            self.assertEqual(demo_zones["lounge"]["label"], "客厅 / 书房区 (lounge)")
+
+            # Orphaned legacy hold (living_study) under 3-zone topology must surface on actuators and fault health
+            # and prevent queued transactions on other lock groups from forecasting automatic dispatch.
+            (pilot_dir / f"continuous-{int(now - 3600)}.json").write_text(
+                json.dumps({
+                    "start": int(now - 3600),
+                    "baselines": {"bedroom": ["off", None, "auto"], "living": ["cool", 25, "auto"], "study": ["cool", 24, "auto"]},
+                    "holds": {"living_study": "伴侣回报超时或与指令不一致，已暂停复发"},
+                    "manual_holds": {},
+                    "parked": {},
+                    "transitions": {
+                        "living": {
+                            "id": now - 30,
+                            "mode": "cool",
+                            "ready_at": now - 1,
+                            "members": {"living": {"phase": "initial", "target": 24.0, "control": {"zone": "lounge", "target": 24.0}}},
+                        }
+                    },
+                    "commands": [],
+                    "closed_loop": {},
+                }),
+                encoding="utf-8",
+            )
+            snap_orphan = collect_snapshot(paths, now=now)
+            self.assertEqual(snap_orphan["controller"]["health"], "fault_locked")
+            self.assertTrue(all(a["hold_reason"] and "living_study" in a["hold_reason"] for a in snap_orphan["actuators"]))
+            self.assertNotEqual(snap_orphan["next_command"]["stage"], "queued_transaction")
+
+            # Live 3-zone status without mounted topology.json must not falsely adopt 2-zone topology.example.json
+            (cfg_dir / "topology.json").unlink()
+            (cfg_dir / "topology.example.json").write_text(EXAMPLE_TOPOLOGY.read_text(encoding="utf-8"), encoding="utf-8")
+            snap_no_topo = collect_snapshot(paths, now=now)
+            self.assertFalse(snap_no_topo["topology"]["present"])
+            no_topo_zones = {z["zone"]: z for z in snap_no_topo["state_machines"]["zone_states"]}
+            self.assertEqual(no_topo_zones["lounge"]["label"], "客厅区 (lounge)")
+            self.assertEqual(no_topo_zones["office"]["label"], "书房区 (office)")
+
+            # A customized 2-zone deployment (observation_version != "site-1") must also NOT fall back to example weights
+            (pilot_dir / "status.json").write_text(
+                json.dumps({
+                    "at": "2026-11-28T09:00:00+00:00",
+                    "status": "持续实机控制运行中",
+                    "rooms": {
+                        "bedroom": {"room_c": 24.0, "target_c": 24.0, "mode_reported": "off", "setpoint_reported": None, "power_w": 5, "ready": True, "power_age_s": 10, "temperature_age_s": 20, "zone": "sleep"},
+                        "living": {"room_c": 24.4, "target_c": 24.0, "mode_reported": "cool", "setpoint_reported": 25, "power_w": 150, "ready": True, "power_age_s": 10, "temperature_age_s": 20, "zone": "lounge"},
+                    },
+                    "control": {
+                        "at": now - 5, "topology": "site-custom-2", "need": "hold", "owner": None,
+                        "zones": {
+                            "sleep": {"key": "sleep", "measured": 24.0, "target": 24.0, "error": 0.0, "at": now - 20, "quality": "fresh", "paused": False, "intent": "maintain", "reason": "near_target", "qualified": False},
+                            "lounge": {"key": "lounge", "measured": 24.4, "target": 24.0, "error": -0.4, "at": now - 20, "quality": "fresh", "paused": False, "intent": "observe", "reason": "waiting_reports_or_dwell", "qualified": False},
+                        },
+                    },
+                }),
+                encoding="utf-8",
+            )
+            snap_custom_2 = collect_snapshot(paths, now=now)
+            self.assertFalse(snap_custom_2["topology"]["present"])
+
 
 class DashboardHTTPServerTests(unittest.TestCase):
     def _start_server(self, config: ServerConfig):

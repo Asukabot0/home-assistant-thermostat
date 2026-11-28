@@ -140,3 +140,27 @@
 - 备选与取舍：给容器加 `CAP_DAC_READ_SEARCH` 来读取 0600 文件。未采纳，改为同 UID、不加能力。
 - 影响：能访问宿主 8780 端口的人都能看到运行状态。不要在不可信的局域网上把 `DASHBOARD_BIND` 设为 `0.0.0.0`；需要远程访问时，放在带认证的反向代理后面。
 - 关联：#9（合并提交 faff6c5）
+
+### D-0013 取消客厅/书房硬编码耦合并提供三区星形拓扑模板
+
+- 日期：2026-11-28（+08）
+- 状态：已采纳
+- 类别：架构与数据
+- 决定者：仓库所有者提出并要求合入，代理实现，经 Codex 与 cursor[bot] 评审修改，仓库所有者于 2026-11-28 19:36 要求检查并合入
+- 背景：现场物理布局为卧室（`sleep`）与书房（`office`）各自独立，分别经客厅（`lounge`）连通，两者之间无直接耦合。旧代码在 `service.py`、`cadence.py`、`pilot_gate.py`、`steady_learning.py`、`pilot_review.py` 及监控台中硬编码了客厅与书房共用参考温度和 `living_study` 锁组，且缺少三区模板。
+- 决定：新增 `home-assistant/shadow/topology.three-zone.example.json`（`observation_version: "site-star-1"`，三台设备使用独立 `lock_group`：`bedroom`、`living`、`study`；`sleep ↔ office` 无直连边和跨区影响；`opposite_operation.enabled: false`）。影子服务与门禁按 `rooms.json` 的实际 `temperature` 绑定推断共享测温组和独立测温房间；`room_lock_groups()` 在存在 `topology.json` 时读取各设备 `lock_group`，缺失 `topology.json` 时保持与 `continuous_pilot.group()` 一致的旧回退（客厅和书房归入 `living_study`）。监控台按实际分区动态命名 `lounge`（仅当 `study` 归属 `lounge` 且无 `office` 区时显示「客厅 / 书房区」），将动态调度 `owner` 统一标为「当前优先区 / 优先区」，并仅在 `control.topology` 匹配 `observation_version` 且区域为子集时才回退到 `topology.example.json`。
+- 备选与取舍：在无 `topology.json` 时按测温是否独立拆分 `room_lock_groups()`。未采纳，因为旧控制器仍用 `living_study` 锁组，拆分会导致影子服务忽略 `holds["living_study"]` 的暂停状态。
+- 影响：使用三区模板前须先把 `rooms.json` 中 `study.temperature` 改为书房独立温度实体（或把 `office_primary` 改为显式 `entity`），否则 `topology.configure()` 会因主测点重复拒绝启动。现有两区共享测温夹具和无拓扑部署保持兼容。
+- 关联：#11
+
+### D-0014 切换 `lock_group` 拓扑时对孤立暂停记录安全闭锁并续接在途事务
+
+- 日期：2026-11-28（+08）
+- 状态：已采纳
+- 类别：安全与保护
+- 决定者：代理根据评审意见实现，仓库所有者于 2026-11-28 19:36 要求检查并合入
+- 背景：评审复现显示，`continuous-<start>.json` 按许可周期保留且 `holds`、`transitions` 以 `lock_group` 为键。从两区模板（`living_study`）切换到三区模板（`living`、`study`）后，旧账本残留的 `holds["living_study"]` 不再匹配任何新锁组，会被静默解除，导致故障暂停失效；同组键下的在途 `transitions` 也会失配。
+- 决定：`continuous_pilot.py`、`house_dispatch.py`、`zone_control.py` 和 `steady_learning.py` 检测 `holds` 中不属于当前活动 `lock_group` 集合的任何孤立键（以及含未知房间未完成成员的事务），一旦发现即按安全闭锁暂停发令与稳态学习，不静默释放旧暂停；监控台同步在各设备 `hold_reason`、`fault_locked` 状态与下步指令预测中体现该闭锁。在途 `transitions` 通过 `transition_for()` 按成员房间查找，保留 `initial_safety_easing` 与正常结算清理。
+- 备选与取舍：仅在文档提醒运维切换前清理或更换许可 `start`，或自动将旧键名映射到新锁组。仅靠文档在漏操作时会静默解锁；硬编码键名映射无法覆盖任意自定义锁组改名，因此采用通用闭锁并配合文档说明。
+- 影响：变更 `lock_group` 前须确认已无未核实的旧锁组暂停记录，或启用新的许可 `start` 生成新账本；否则切换后自动发令与稳态学习将暂停直到人工处理。
+- 关联：#11

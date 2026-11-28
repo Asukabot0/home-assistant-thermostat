@@ -83,7 +83,7 @@ HANDOFF_PHASE_LABELS = {
     "verify_reduction": "核验减载效果 (VerifyReduction)",
     "exit": "对侧停机 (Exit)",
     "verify_exit": "核验停机低耗 (VerifyExit)",
-    "serve": "交接完成 · 服务主区 (Serve)",
+    "serve": "交接完成 · 服务当前优先区 (Serve)",
 }
 
 HANDOFF_REASON_LABELS = {
@@ -171,8 +171,8 @@ MODE_LABELS = {
 
 ZONE_FRIENDLY_NAMES = {
     "sleep": "卧室区",
-    "lounge": "客厅 / 书房区",
-    "office": "书房独立区",
+    "lounge": "客厅区",
+    "office": "书房区",
     "bedroom": "卧室",
     "living": "客厅",
 }
@@ -573,7 +573,20 @@ def _room_display_name(room: str, rooms_cfg: dict[str, Any]) -> str:
     return {"bedroom": "卧室 (bedroom)", "living": "客厅 (living)", "study": "书房 (study)"}.get(room, room)
 
 
-def _zone_display_name(zone_key: str) -> str:
+def _zone_display_name(
+    zone_key: str,
+    topology: dict[str, Any] | None = None,
+    zone_keys: Any = None,
+) -> str:
+    if zone_key == "lounge":
+        known_zones = set(zone_keys or ())
+        if isinstance(topology, dict) and isinstance(topology.get("zones"), dict):
+            known_zones.update(topology["zones"].keys())
+        actuators = topology.get("actuators") if isinstance(topology, dict) and isinstance(topology.get("actuators"), dict) else {}
+        study_in_lounge = isinstance(actuators.get("study"), dict) and actuators["study"].get("zone") == "lounge"
+        if study_in_lounge and "office" not in known_zones:
+            return "客厅 / 书房区 (lounge)"
+        return "客厅区 (lounge)"
     friendly = ZONE_FRIENDLY_NAMES.get(zone_key)
     return f"{friendly} ({zone_key})" if friendly else zone_key
 
@@ -796,7 +809,7 @@ def _build_zone_states(
             reason_label = ZONE_REASON_LABELS.get(reason, reason)
         result.append({
             "zone": key,
-            "label": _zone_display_name(key),
+            "label": _zone_display_name(key, topology=topology, zone_keys=zone_order),
             "state": intent,
             "state_label": INTENT_LABELS.get(intent, intent),
             "reason": reason,
@@ -931,13 +944,32 @@ def _build_actuators(
         if extra not in ordered_rooms:
             ordered_rooms.append(extra)
 
+    lock_groups_by_room: dict[str, str] = {}
+    for room in ordered_rooms:
+        unit = topo_actuators.get(room) if isinstance(topo_actuators.get(room), dict) else {}
+        lock_groups_by_room[room] = str(
+            unit.get("lock_group")
+            or (room if topology is not None else "living_study" if room in {"living", "study"} else room)
+        )
+    known_lock_groups = set(lock_groups_by_room.values())
+    orphan_holds = {k: v for k, v in holds.items() if k not in known_lock_groups}
+    orphan_hold_reason = (
+        f"存在未归属当前锁组的暂停记录（{'、'.join(sorted(orphan_holds))}），请核对后清理或启用新许可"
+        if orphan_holds
+        else None
+    )
+
     actuators: list[dict[str, Any]] = []
     for room in ordered_rooms:
         cfg = rooms_cfg.get(room) if isinstance(rooms_cfg.get(room), dict) else {}
         detail = status_rooms.get(room) if isinstance(status_rooms.get(room), dict) else {}
         unit = topo_actuators.get(room) if isinstance(topo_actuators.get(room), dict) else {}
-        lock_group = str(unit.get("lock_group") or ("living_study" if room in {"living", "study"} else room))
-        home_zone = detail.get("zone") or unit.get("zone") or ("living" if room == "study" else room)
+        lock_group = lock_groups_by_room[room]
+        home_zone = (
+            detail.get("zone")
+            or unit.get("zone")
+            or (room if topology is not None else "living" if room == "study" else room)
+        )
         equip_entry = equipment_map.get(room) if isinstance(equipment_map.get(room), dict) else {}
         served_zone = equip_entry.get("served_zone") or home_zone
         parked_raw = parked_map.get(room) if isinstance(parked_map.get(room), dict) else None
@@ -1016,7 +1048,7 @@ def _build_actuators(
             "parked": mode == "off" and parked_info is not None,
             "parked_info": parked_info,
             "output_credible": bool(output_evidence.get(room)),
-            "hold_reason": holds.get(lock_group),
+            "hold_reason": holds.get(lock_group) or orphan_hold_reason,
             "manual_hold_reason": manual_holds.get(room),
             "isolated": room in isolated,
             "status_code": status_code,
@@ -1445,6 +1477,7 @@ def _infer_next_command(
     if not permit_info.get("active"):
         has_queued_tx = any(
             m.get("phase") == "initial"
+            and not (actuators_by_room.get(m.get("room"), {}).get("hold_reason"))
             for tx in ledger["active_transactions"]
             if tx["group"] not in ledger["locks"]["holds"]
             for m in tx.get("members") or ()
@@ -1507,6 +1540,8 @@ def _infer_next_command(
             if member["phase"] == "initial":
                 room = member["room"]
                 act = actuators_by_room.get(room, {})
+                if act.get("hold_reason"):
+                    continue
                 mode = str(tx["mode"] or act.get("mode") or "")
                 limits = (rooms_cfg.get(room) or {}).get("soft_limits", {}).get(mode)
                 target = member["target"] if member["target"] is not None else act.get("target_c")
@@ -1636,7 +1671,7 @@ def _infer_next_command(
                 blockers.append({
                     "code": "both_zone_reports",
                     "label": "双区独立新测温反馈",
-                    "detail": "需主区与对侧区域在减载回显后均产生新测温上报",
+                    "detail": "需当前优先区与对侧区域在减载回显后均产生新测温上报",
                     "met": False,
                     "remaining_s": None,
                     "progress_pct": 0,
@@ -1687,7 +1722,7 @@ def _infer_next_command(
             "stage": "handoff_waiting",
             "stage_label": f"双向交接 · {handoff['phase_label']}",
             "headline": headline,
-            "summary": handoff.get("reason_label") or "双区反向需求交接中，按安全顺序先退载/停机再服务新主区。",
+            "summary": handoff.get("reason_label") or "双区反向需求交接中，按安全顺序先退载/停机再服务新优先区。",
             "confidence": "projected" if action else "none",
             "action": action,
             "eta_seconds": eta,
@@ -2067,7 +2102,7 @@ def _summarize_audit_record(entry: dict[str, Any], rooms_cfg: dict[str, Any]) ->
             if need:
                 parts.append(f"全屋需求={MODE_LABELS.get(str(need), str(need))}")
             if owner:
-                parts.append(f"主区={owner}")
+                parts.append(f"优先区={owner}")
             if rejs:
                 parts.append(f"门禁拦截 {len(rejs)} 项")
             elif cands:
@@ -2145,6 +2180,72 @@ def _build_neural_summary(neural_status: dict[str, Any] | None, neural_health: d
     }
 
 
+def _build_topology_summary(
+    topology: dict[str, Any] | None,
+    cfg_meta: dict[str, Any],
+    zone_states: list[dict[str, Any]],
+    actuators: list[dict[str, Any]],
+) -> dict[str, Any]:
+    zone_keys = [z["zone"] for z in zone_states]
+    zone_labels = {z["zone"]: z["label"] for z in zone_states}
+    if not isinstance(topology, dict):
+        return {
+            "present": False,
+            "from_example": False,
+            "observation_version": None,
+            "zones": [
+                {
+                    "zone": z["zone"],
+                    "label": z["label"],
+                    "actuators": [a["room"] for a in actuators if a["zone"] == z["zone"]],
+                }
+                for z in zone_states
+            ],
+            "connections": [],
+            "opposite_operation": {"enabled": False, "max_cross_influence": 0.1},
+        }
+    topo_zones = topology.get("zones") if isinstance(topology.get("zones"), dict) else {}
+    topo_actuators = topology.get("actuators") if isinstance(topology.get("actuators"), dict) else {}
+    all_keys = list(topo_zones.keys()) or zone_keys
+    zones_out = []
+    for key in all_keys:
+        label = zone_labels.get(key) or _zone_display_name(key, topology=topology, zone_keys=all_keys)
+        members = [
+            room
+            for room, unit in topo_actuators.items()
+            if isinstance(unit, dict) and unit.get("zone") == key
+        ]
+        zones_out.append({"zone": key, "label": label, "actuators": members})
+    conns_out = []
+    for link in topology.get("connections") or ():
+        if not isinstance(link, dict):
+            continue
+        src = str(link.get("from") or "")
+        dst = str(link.get("to") or "")
+        coupling = _num(link.get("coupling"))
+        if not src or not dst:
+            continue
+        conns_out.append({
+            "from": src,
+            "from_label": zone_labels.get(src) or _zone_display_name(src, topology=topology, zone_keys=all_keys),
+            "to": dst,
+            "to_label": zone_labels.get(dst) or _zone_display_name(dst, topology=topology, zone_keys=all_keys),
+            "coupling": coupling,
+        })
+    opposing = topology.get("opposite_operation") if isinstance(topology.get("opposite_operation"), dict) else {}
+    return {
+        "present": True,
+        "from_example": bool(cfg_meta.get("topology_from_example")),
+        "observation_version": topology.get("observation_version"),
+        "zones": zones_out,
+        "connections": conns_out,
+        "opposite_operation": {
+            "enabled": bool(opposing.get("enabled", False)),
+            "max_cross_influence": _num(opposing.get("max_cross_influence")) if opposing.get("max_cross_influence") is not None else 0.1,
+        },
+    }
+
+
 def collect_snapshot(paths: DashboardPaths, *, now: float | None = None) -> dict[str, Any]:
     """Assemble a complete, read-only dashboard snapshot from runtime files."""
     now_ts = time.time() if now is None else float(now)
@@ -2186,8 +2287,15 @@ def collect_snapshot(paths: DashboardPaths, *, now: float | None = None) -> dict
         and cfg_meta.get("topology_example_exists")
     ):
         topo_ex, _ = _read_json(paths.shadow_config_dir / "topology.example.json")
+        control_zones = control.get("zones") if isinstance(control.get("zones"), dict) else {}
         if isinstance(topo_ex, dict):
-            topology = topo_ex
+            ex_zones = topo_ex.get("zones") if isinstance(topo_ex.get("zones"), dict) else {}
+            if (
+                control.get("topology") == topo_ex.get("observation_version")
+                and (not control_zones or set(control_zones).issubset(ex_zones))
+            ):
+                topology = topo_ex
+                cfg_meta["topology_from_example"] = True
 
     permit_raw, permit_info = _load_permit(paths.pilot_data_dir, now_ts, rooms_cfg=rooms_cfg, topology=topology)
     journal, journal_file, journal_errors = _load_journal(paths.pilot_data_dir, permit_raw)
@@ -2283,6 +2391,7 @@ def collect_snapshot(paths: DashboardPaths, *, now: float | None = None) -> dict
     effects.sort(key=lambda e: _num(e.get("ended_at")) or 0.0, reverse=True)
 
     shadow_series = _load_shadow_series(paths.shadow_data_dir, rooms_cfg, now_ts)
+    topology_summary = _build_topology_summary(topology, cfg_meta, zone_states, actuators)
 
     return {
         "generated_at": round(now_ts, 3),
@@ -2360,5 +2469,6 @@ def collect_snapshot(paths: DashboardPaths, *, now: float | None = None) -> dict
         "shadow": _build_shadow_summary(shadow_status, shadow_health),
         "shadow_series": shadow_series,
         "neural_shadow": _build_neural_summary(neural_status, neural_health),
+        "topology": topology_summary,
         "policy": policy,
     }
