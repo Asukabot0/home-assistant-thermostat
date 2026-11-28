@@ -159,9 +159,9 @@ def season(environment, state, now, policy=POLICY):
     """Classify cooling or heating weather from fresh environment points, with hysteresis."""
     limits = {key: policy.get(key, value) for key, value in SEASON_DEFAULTS.items()}
     memory = state.get("season") or {"mode": None}
-    values = [row["value"] for row in environment.values() if row["quality"] == "fresh"]
-    if values:
-        outdoor = median(values)
+    fresh = [row for row in environment.values() if row["quality"] == "fresh"]
+    if fresh:
+        outdoor = median(row["value"] for row in fresh)
         mode = memory["mode"]
         if (mode == "cool" and outdoor < limits["cooling_season_exit_c"]
                 or mode == "heat" and outdoor > limits["heating_season_exit_c"]):
@@ -169,8 +169,8 @@ def season(environment, state, now, policy=POLICY):
         if mode is None:
             mode = ("cool" if outdoor >= limits["cooling_season_enter_c"] else
                     "heat" if outdoor <= limits["heating_season_enter_c"] else None)
-        memory = {"mode": mode, "outdoor_c": outdoor, "at": now}
-    elif memory["mode"] is not None and now-memory["at"] > limits["season_memory_seconds"]:
+        memory = {"mode": mode, "temperature_c": outdoor, "at": max(row["at"] for row in fresh)}
+    elif memory["mode"] is None or now-memory["at"] > limits["season_memory_seconds"]:
         memory = {"mode": None}
     state["season"] = memory
     opposite = {"cool": "heat", "heat": "cool"}.get(memory["mode"])

@@ -95,6 +95,11 @@ class TelemetryTests(unittest.TestCase):
         self.assertEqual(worker.last_full_end(3600+300),3600)
         self.assertEqual(worker.next_time(3600+300),7200+300)
 
+    def test_public_projection_keeps_season(self):
+        public=evidence.PublicSchema("a"*64,{},{})
+        out=public.audit({"event":"cycle","at":1,"assessment":{"season":{"mode":"cool","temperature_c":29.5,"at":100}}})
+        self.assertEqual(out["assessment"]["season"],{"mode":"cool","temperature_c":29.5,"at":100})
+
     def test_collector_reconciles_errors_in_each_version_and_rolling_window(self):
         with TemporaryDirectory() as tmp:
             root=Path(tmp)

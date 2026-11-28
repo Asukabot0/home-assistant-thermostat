@@ -46,7 +46,7 @@ stateDiagram-v2
 
 `zones.target` 可映射某台虚拟恒温器、指定 HA 数值实体及可选属性，或设静态目标。`pause_entity` 可接绑定的 `input_boolean`。许可的 `paused_zones` 暂停一个区域，`isolated_rooms` 和伴侣手动状态限制对应设备。暂停区域仍保留温度约束。`actuators.influences` 显式描述设备可作用的多个区域。`connections` 记录区域耦合，`opposite_operation.enabled` 默认关闭。开启后还要求明确分区、低跨区影响、真实输出证据以及对侧匹配需求。新增室内主点后建立新区域，修改设备影响关系并提升 `observation_version`。变更定义、实际来源或目标会废弃受影响的暂态证据；设备基线及发令历史照常继承。
 
-环境点的新鲜读数（多点取中位数）决定季节：达到 `cooling_season_enter_c`（默认 26℃）进入制冷季，低于 `cooling_season_exit_c`（22℃）才退出；不高于 `heating_season_enter_c`（14℃）进入采暖季，高于 `heating_season_exit_c`（18℃）才退出。制冷季里偏冷方向的跟踪带放宽到 `off_season_band_c`（默认 1.5℃），采暖季里偏热方向同样放宽，因此一处略低于目标的房间不会在热天形成制热需求，与需要制冷的房间互相阻塞。超过这个范围仍按原规则处理。环境点全部失效时沿用上次季节最多 `season_memory_seconds`（6 小时）。季节状态写入 `closed_loop.season`，并随状态输出和逐轮审计记录。
+环境点的新鲜读数（多点取中位数）决定季节：达到 `cooling_season_enter_c`（默认 26℃）进入制冷季，低于 `cooling_season_exit_c`（22℃）才退出；不高于 `heating_season_enter_c`（14℃）进入采暖季，高于 `heating_season_exit_c`（18℃）才退出。制冷季里偏冷方向的跟踪带放宽到 `off_season_band_c`（默认 1.5℃），采暖季里偏热方向同样放宽，因此一处略低于目标的房间不会在热天形成制热需求，与需要制冷的房间互相阻塞。超过这个范围仍按原规则处理。环境点全部失效时，从最后一次新鲜读数的上报时间起沿用上次季节最多 `season_memory_seconds`（6 小时）。季节状态（`mode`、`temperature_c`、`at`）写入 `closed_loop.season`，并随状态输出、逐轮审计和脱敏遥测记录。只有两个环境点时中位数等于两者平均，一个受日晒偏高的点会把季节推向制冷侧；这样的点应改装位置，或在 `topology.json` 中设 `"enabled": false`。
 
 ## 策略与保护
 

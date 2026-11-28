@@ -381,16 +381,35 @@ class UnifiedCycleTests(unittest.TestCase):
 
     def test_season_needs_fresh_weather_and_keeps_hysteresis(self):
         from zone_control import season
-        fresh = lambda value: {"outdoor": {"value": value, "quality": "fresh"}}
+        fresh = lambda value, at: {"outdoor": {"value": value, "quality": "fresh", "at": at}}
         memory = {}
-        self.assertEqual(season(fresh(25), memory, 0), ({"mode": None, "outdoor_c": 25, "at": 0}, {}))
-        self.assertEqual(season(fresh(27), memory, 60)[1], {"heat": 1.5})
-        self.assertEqual(season(fresh(23), memory, 120)[0]["mode"], "cool")
-        self.assertEqual(season({"outdoor": {"value": 30, "quality": "stale"}}, memory, 3000)[0]["mode"], "cool")
-        self.assertEqual(season({}, memory, 120+21601)[0]["mode"], None)
-        season(fresh(27), memory, 30000)
-        self.assertEqual(season(fresh(21.5), memory, 30060)[0]["mode"], None)
-        self.assertEqual(season(fresh(10), memory, 30120)[1], {"cool": 1.5})
+        self.assertEqual(season(fresh(25, -30), memory, 0), ({"mode": None, "temperature_c": 25, "at": -30}, {}))
+        self.assertEqual(season(fresh(27, 50), memory, 60)[1], {"heat": 1.5})
+        self.assertEqual(season(fresh(23, 100), memory, 120)[0]["mode"], "cool")
+        self.assertEqual(season({"outdoor": {"value": 30, "quality": "stale", "at": 100}}, memory, 3000)[0]["mode"], "cool")
+        self.assertEqual(season({}, memory, 100+21600)[0]["mode"], "cool")
+        self.assertEqual(season({}, memory, 100+21601)[0], {"mode": None})
+        season(fresh(27, 30000), memory, 30000)
+        self.assertEqual(season(fresh(21.5, 30060), memory, 30060)[0]["mode"], None)
+        self.assertEqual(season(fresh(14, 30120), memory, 30120)[1], {"cool": 1.5})
+        self.assertEqual(season(fresh(18, 30180), memory, 30180)[0]["mode"], "heat")
+        self.assertEqual(season(fresh(18.5, 30240), memory, 30240)[0]["mode"], None)
+        season({}, memory, 30300)
+        self.assertEqual(memory["season"], {"mode": None})
+
+    def test_off_season_band_still_allows_real_demand_and_settles_running_recovery(self):
+        from zone_control import track
+        policy = dict(pilot.POLICY, tracking_bands={"heat": 1.5})
+        for measured, qualified in ((22.4, True), (22.6, False)):
+            with self.subTest(measured=measured):
+                row = {"changed_at": 0, "points": [[0, measured], [600, measured], [1200, measured]]}
+                result = track(row, {"value": measured, "at": 1200, "quality": "fresh"}, 24, None, False, 1210, policy)
+                self.assertEqual((result["qualified"], result["direction"]), (qualified, "heat" if qualified else None))
+        row = {"changed_at": 0, "points": [[0, 23.2], [600, 23.2], [1200, 23.3], [1800, 23.3]],
+               "recovery": {"direction": "heat", "since": 0, "report_span": 600, "reports": 2, "last_outside": 600}}
+        settled = track(row, {"value": 23.3, "at": 1800, "quality": "fresh"}, 24, None, False, 1810, policy)
+        self.assertEqual((settled["intent"], settled["recovery_completed_at"]), ("maintain", 1800))
+        self.assertNotIn("recovery", row)
 
     def test_heat_and_cool_recovery_survive_single_boundary_report_and_restart(self):
         for mode, outside, boundary, relapse, settled, setting in (
