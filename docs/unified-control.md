@@ -52,7 +52,7 @@ stateDiagram-v2
 
 ## 区域与设备配置
 
-从 `home-assistant/shadow/topology.example.json` 建立本地 `topology.json`。`rooms.json` 继续绑定已有设备、硬件软限及调试见证。`sensors` 支持 `primary`、`auxiliary`、`constraint` 和 `environment`，显式禁用的点无需存在。每个区域具有独立主点，`primary` 直接使用主点，`weighted` 按配置把新鲜辅助点加入融合，独立证据仍采用主点的上报时间。`constraint` 独立保护危险边界，环境点使用配置的温度属性。
+从 `home-assistant/shadow/topology.example.json` 建立本地 `topology.json`。`rooms.json` 继续绑定已有设备、硬件软限及调试见证。`sensors` 支持 `primary`、`auxiliary`、`constraint` 和 `environment`，显式禁用的点无需存在。每个区域具有独立主点，`primary` 直接使用主点，`weighted` 按配置把辅助点加入融合，独立证据仍采用主点的上报时间；`estimated` 另把辅助点的上报计为区域上报，并可在主点短时失效时接管，见下文「多测点融合与在线区域模型」。`constraint` 独立保护危险边界，环境点使用配置的温度属性。
 
 `zones.target` 可映射某台虚拟恒温器、指定 HA 数值实体及可选属性，或设静态目标。`pause_entity` 可接绑定的 `input_boolean`。许可的 `paused_zones` 暂停一个区域，`isolated_rooms` 和伴侣手动状态限制对应设备。暂停区域仍保留温度约束。`actuators.influences` 显式描述设备可作用的多个区域。`connections` 记录区域耦合，`opposite_operation.enabled` 默认关闭。开启后还要求明确分区、低跨区影响、真实输出证据以及对侧匹配需求。新增室内主点后建立新区域，修改设备影响关系并提升 `observation_version`。变更定义、实际来源或目标会废弃受影响的暂态证据；设备基线及发令历史照常继承。
 
@@ -69,6 +69,22 @@ stateDiagram-v2
 跨区协助开机后的 `initial` 比本区目标弱 `assistance_initial_offset`（默认 1℃，受模式软限约束），本区不会一开机就被推向目标另一侧。一次运行中最近的加强指令若是为其他区域发出，该机视为仍在协助那个区域。协助对象不再是当前分配区域且本区也没有同向需求时，本次运行若以协助开机，减载后停机；若原本为本区运行、后来加码协助，则逐步退回到协助前的设温。超出舒适带需要停机而最短运行时间未满时，先把设温退到模式软限最弱端；处于最弱端或已退温、实测低耗且仍超出舒适带时，满足最短运行时间即停机。加强指令（含开机后补发的 `initial`）之后，指令后的上报还不足以单独形成趋势时，用指令前最后一次独立上报作为起点，且大部分跨度须在指令之后，得到区域的 `response_trend`；指令后的上报一旦足以形成趋势就不再使用这个起点。`response_trend` 只用于运行设备对本区过冲的减载判断；冷热仲裁、邻区风险和回归判断仍用指令后重新取证的 `trend`。减弱或停机指令仍从指令后重新取证。
 
 `zone_control.py` 产生状态、候选和区域作用范围。`continuous_pilot.py` 把同一决策写入状态输出和逐轮日志，用第二次 HA 观测复核后再串行执行。`live_evidence.py` 合并真上报与同源同代账本，避免分钟状态等待遮断实时功率。`service.py` 保留历史功率模型和 SQLite 分钟观测，可用 `shadow-health.json` 和状态 `published_at`／`stale_after` 查看更新时间。
+
+## 多测点融合与在线区域模型
+
+`fusion.py` 处理同一区域的多个测点。每个辅助点相对主点的偏差在两者的新上报相隔不超过 15 分钟时配对学习，每条上报只配对一次，单次修正不超过 1℃。三种 `fusion` 都学习偏差，`primary` 只记录、不参与控制，便于切换前先观察。`weighted` 与 `estimated` 中，辅助点过期时若偏差已由至少 `fusion_offset_min_pairs`（6）对上报确认、且最近一次配对在 `fusion_hold_seconds`（2 小时）内，按「主点 + 偏差」保留它的贡献；区域观测签名只取配置的测点，不随测点新鲜与否变化，所以辅助点掉线既不会让融合值跳变，也不会清空跟踪、维持设温和动作效果记录。`estimated` 用参与融合的最新上报时间作为区域上报时间，主点过期但最后一次上报未超过 `fusion_failover_seconds`（1 小时）时，用已确认偏差的辅助点换算主点并标记 `failover`。并排放置测得的传感器固定偏差可写入该测点的 `offset_c`（±3℃），修改 `fusion` 或 `offset_c` 会更新区域定义版本。
+
+`zone_model.py` 为每个区域在线拟合 dT = Δh·(Σa·(T环境 − T) + b·(T慢 − T) + Σg·P + c)。T慢 是区域温度约 45 分钟的滞后平均，代表墙体和家具，用来描述停机后的回弹；P 是每台设备在制热或制冷时的实测平均电功率（kW），取自已核对的功率上报；c 是缓慢变化的漂移。系数用带随机游走的卡尔曼滤波更新，起点是 `actuators.influences` 乘以 `model_prior_gain`，未被激励的系数方差不会超过先验。环境读数最多沿用 2 小时；模式在制热与制冷之间切换、运行中的设备缺少功率覆盖时跳过该区间。新增环境点或设备只改变特征时保留原有系数并重新评估就绪；区域测点、融合方式或目标定义变化时整体重置。
+
+每次新上报时记录「保持当前输出」的 10 分钟预报，并在 7.5–20 分钟后的第一条上报结算；期间有任一已回显指令或设备模式变化的窗口不计分，只累加 `unscored`。同一批窗口也为不变假设和规则趋势计分。累计至少 `model_min_samples`（48）个计分窗口、模型误差不超过两者中较小者的 `model_ready_margin`（0.9）倍、且误差落在 1σ 内的比例在 0.5–0.95 时就绪；已就绪后只要误差不超过较小者、覆盖率不低于 0.4 就保持。设备对其他区域的影响按它对本区响应的比值给出，本区响应须有正确符号并超过三倍标准差；只有该设备单独出力（≥0.15 kW）的区间计入激励次数，至少 `influence_min_excitation`（6）次后，比值连同两倍标准差都小于 `influence_negligible`（0.15）记为可忽略，减去两倍标准差仍大于 `influence_significant`（0.3）记为显著，其余为不确定。
+
+`model_active` 默认 0：模型、偏差与影响只学习和记录，控制决策不变。设为 1 后，已就绪区域的预报同时替换 `trend` 与 `response_trend`；可忽略的影响不再用于跨区协助和服务区域，也不计入该设备的邻区风险；显著但未配置的影响加入邻区风险。门禁、许可、最短运行、停机、换向保护和回执都不受影响。状态保存在 `closed_loop.model` 与 `closed_loop.fusion`，只在区域有新上报时改变；逐轮审计与状态输出包含 `zone_model`、各区域的 `model_trend` 和 `fusion`，脱敏遥测保留这些字段。用小时证据包离线复核：
+
+```sh
+python3 -B work/replay_zone_model.py evidence-*.zip [--fusion estimated] [--json report.json]
+```
+
+回放按每轮记录的配置版本运行，比较已计分窗口内模型、不变假设与规则趋势的误差，并列出学到的影响与辅助点偏差。
 
 ## 部署与回退
 
