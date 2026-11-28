@@ -84,9 +84,10 @@ def trial_review(db, config, journal, now, tick, zone):
         span = f"{min(r['measured'] for r in valid):.1f}–{max(r['measured'] for r in valid):.1f}℃" if valid else "—"
         rate = f"{100*band/len(valid):.0f}%" if valid else "—"
         lines.append(f"| {config[room]['name']} | {len(valid)}/{expected} | {span} | {rate} |")
-    lines.append("\n书房使用客厅参考温度。")
+    if "living" in config and "study" in config and config["living"].get("temperature") == config["study"].get("temperature"):
+        lines.append("\n书房使用客厅参考温度。")
     for group, reason in state["holds"].items():
-        name = "客厅与书房" if group == "living_study" else config[group]["name"]
+        name = "客厅与书房" if group == "living_study" else config.get(group, {}).get("name", group)
         lines.append(f"- {name}暂停原因为{reason}。")
 
     if actions:

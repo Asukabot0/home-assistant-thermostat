@@ -7,7 +7,7 @@ from time import time
 from cadence import latest_beeps
 from house_policy import ACTIVE, POLICY, recovering, thermostat_view
 from model import Activity, OVERSHOOT_HIGH_POWER_SECONDS, RAPID_REPORT_MAX_AGE, advise, increases_output, numeric
-from service import CONFIG, DATA, POWER_REPORT_GAP_SECONDS, initial_setpoint, open_readonly, power_context
+from service import CONFIG, DATA, POWER_REPORT_GAP_SECONDS, initial_setpoint, open_readonly, power_context, shared_sensor_groups
 from topology import report_time
 
 
@@ -81,8 +81,9 @@ def room_advice(room, fixed_mode="heat", *, offsets=None, mode_changed_at=None, 
         trial = db.execute("SELECT value FROM trials WHERE id=? AND room=?", (WITNESSES[room], room)).fetchone()
         entries = db.execute("SELECT tick,value FROM decisions WHERE room=? ORDER BY tick DESC LIMIT 66", (room,)).fetchall()
         now = time()
-        beep = latest_beeps(db, now).get(room) if house_since is None else None
-        reversal_beep = (latest_beeps(db, now, for_reversal=True).get(room)
+        shared_groups = shared_sensor_groups(ROOMS) if house_since is None else None
+        beep = latest_beeps(db, now, shared_groups=shared_groups).get(room) if house_since is None else None
+        reversal_beep = (latest_beeps(db, now, for_reversal=True, shared_groups=shared_groups).get(room)
                          if offsets is not None and house_since is None else None)
         limits = ROOMS[room]["soft_limits"]
         initial = {}

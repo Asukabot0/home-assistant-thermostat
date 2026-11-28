@@ -45,15 +45,17 @@ def learning_session(journals, tick):
     return dict(session, isolated_rooms=permit.get("isolated_rooms", [])) if session["start"] == start else None
 
 
-def learning_active(session, room, virtual, now=None):
+def learning_active(session, room, virtual, now=None, *, lock_group=None, active_lock_groups=None):
     if session is None or virtual is None or virtual["state"] != "auto":
         return None
     attrs = json.loads(virtual["shared_attrs"] or "{}")
-    group = "living_study" if room in SHARED_ROOMS else room
+    group = lock_group if lock_group is not None else ("living_study" if room in SHARED_ROOMS else room)
     override = session.get("external_overrides", {}).get(room)
+    orphan_hold = (active_lock_groups is not None
+                   and any(key not in active_lock_groups for key in session["holds"]))
     if (room in session.get("isolated_rooms", ()) or room in session.get("manual_holds", {})
             or override is not None and (now is None or now < override["until"])
-            or room in session["holds"] or group in session["holds"]
+            or orphan_hold or room in session["holds"] or group in session["holds"]
             or attrs.get("preset_mode") != "标准" or attrs.get("control_hold_latched", False)):
         return None
     return session["start"]

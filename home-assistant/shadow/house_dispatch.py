@@ -34,12 +34,19 @@ def initial_safety_setting(mode, setting, target, limits):
     return max(bounds[0], min(bounds[1], round(target)))
 
 
+def lock_group_for(room, topology):
+    return topology["actuators"][room]["lock_group"] if topology else "living_study" if room in {"living", "study"} else room
+
+
 def final_gate(candidate, now, live, readings, connected, state, configurations, *, policy=POLICY, topology=None, trace=None):
     room, kind, value, purpose = candidate
     feedback = live[room]
     shadow = readings[room]
     mode, setpoint, _, _, target, _, _ = feedback["signature"]
-    group = topology["actuators"][room]["lock_group"] if topology else "living_study" if room in {"living","study"} else room
+    group = lock_group_for(room, topology)
+    known_groups = {lock_group_for(r, topology) for r in live}
+    if any(key not in known_groups for key in state["holds"]):
+        return "存在未归属当前锁组的暂停记录，已暂停发令"
     if (feedback["signature"][3] != "auto" or feedback["signature"][5:] != ("标准", False)
             or feedback["native_authorized"] is not False or group in state["holds"]
             or not shadow["witness"] == "matched" or not shadow["followup_complete"]
@@ -116,6 +123,8 @@ def final_gate(candidate, now, live, readings, connected, state, configurations,
             return "持续高功率条件已解除"
         if purpose == "initial_safety_easing":
             batch = state.get("transitions", {}).get(group)
+            if batch is None or room not in batch.get("members", {}):
+                batch = next((b for b in state.get("transitions", {}).values() if room in b.get("members", {})), None)
             expected = initial_safety_setting(mode, numeric(setpoint), numeric(target),
                                               configurations[room]["soft_limits"][mode])
             if (batch and batch["mode"] == mode and now >= batch["ready_at"]

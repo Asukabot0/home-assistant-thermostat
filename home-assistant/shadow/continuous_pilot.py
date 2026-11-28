@@ -92,6 +92,21 @@ def group(room):
     return TOPOLOGY["actuators"][room]["lock_group"] if TOPOLOGY else "living_study" if room in SHARED_ROOMS else room
 
 
+def active_lock_groups(rooms=None):
+    return {group(room) for room in (ROOMS if rooms is None else rooms)}
+
+
+def transition_for(state, room):
+    transitions = state.get("transitions", {})
+    key = group(room)
+    if key in transitions and room in transitions[key].get("members", {}):
+        return key, transitions[key]
+    for candidate, batch in transitions.items():
+        if room in batch.get("members", {}):
+            return candidate, batch
+    return None, None
+
+
 def read_permit(now):
     try:
         raw = json.loads(LIVE_PERMIT.read_text(encoding="utf-8"))
@@ -183,7 +198,7 @@ def reconcile_report(state, room, values, now):
                     <= reconcile_setting("start_verify_seconds")
                     and last.get("peak_watts") is not None and last["peak_watts"] < running_watts(room))
     overrides = state.setdefault("external_overrides", {})
-    batch = state.get("transitions", {}).get(group(room))
+    _, batch = transition_for(state, room)
     if batch and room in batch["members"]:
         batch["members"][room]["phase"] = "done"
     if failed_start:
@@ -274,7 +289,7 @@ def settle(state, live, now, *, trial=True):
                         state["parked"][room]["handoff"] = True
                 elif action["purpose"] == "energy_start":
                     state.setdefault("parked", {}).pop(room, None)
-                batch = state.get("transitions", {}).get(group(room))
+                _, batch = transition_for(state, room)
                 if batch and action.get("transaction") == batch["id"]:
                     member = batch["members"][room]
                     batch["ready_at"] = max(action["proxy_at"], action["sent_at"] + BATCH_SPACING)
@@ -345,9 +360,17 @@ def assess(live, state, now, advise_room=room_advice, *, trial=True, isolated=()
             reconcile_report(state, room, values, now)
     echoes = acknowledged(state["commands"])
     details, ready, members = {}, {}, {}
+    known_groups = active_lock_groups(live)
+    orphan_holds = {k: v for k, v in state["holds"].items() if k not in known_groups}
     for key, batch in list(transitions.items()):
-        for room, member in batch["members"].items():
-            if (room not in pending and key not in state["holds"] and member["phase"] == "off"
+        member_rooms = batch.get("members", {})
+        held = key in state["holds"] or any(group(r) in state["holds"] for r in member_rooms if r in live)
+        for room, member in member_rooms.items():
+            if room not in live:
+                if member.get("phase") != "done":
+                    orphan_holds.setdefault(key, "存在未完成且未归属当前设备的事务记录")
+                continue
+            if (room not in pending and not held and member["phase"] == "off"
                     and live[room]["signature"][0] == "off"):
                 off = next((a for a in reversed(echoes) if a["room"] == room
                             and a.get("transaction") == batch["id"] and a["purpose"] == "reversal_off"), None)
@@ -355,18 +378,20 @@ def assess(live, state, now, advise_room=room_advice, *, trial=True, isolated=()
                     parked[room] = {"off_at": off["proxy_at"], "mode": off["before"][0],
                                     "started_at": off.get("before_mode_at", off["proxy_at"])}
                     member["phase"] = "done"
-            if member["phase"] == "queued" and room not in pending and key not in state["holds"]:
+            if member["phase"] == "queued" and room not in pending and not held:
                 member["phase"] = "done"  # Recompute unsent plans from the current whole-house demand.
             if member["phase"] != "done":
                 members[room] = (batch, member)
-        if key not in state["holds"] and not (pending & batch["members"].keys()) and all(
-                member["phase"] == "done" for member in batch["members"].values()):
+        if (not held and not (pending & member_rooms.keys()) and set(member_rooms) <= set(live)
+                and all(member["phase"] == "done" for member in member_rooms.values())):
             del transitions[key]
+    orphan_reason = (f"存在未归属当前锁组的暂停记录（{'、'.join(sorted(orphan_holds))}），请核对后清理或启用新许可"
+                     if orphan_holds else None)
     for room, values in live.items():
         mode, setpoint, fan, requested, target, preset, native_on = values["signature"]
         power = numeric(values["adapter"]["power"])
         yielding = yielded(state, room, now)
-        hold = state["holds"].get(group(room)) or manual.get(room) or yielding
+        hold = state["holds"].get(group(room)) or orphan_reason or manual.get(room) or yielding
         ready[room] = (room in connected and not hold and room not in pending
                        and requested == "auto" and preset == "标准" and native_on is False
                        and values["native_authorized"] is False and power is not None and 0 <= power <= 10000
@@ -427,7 +452,8 @@ def assess(live, state, now, advise_room=room_advice, *, trial=True, isolated=()
                           control_ready=ready, acquire_gentle=acquire_gentle)
     # Finish an already confirmed mode change before making any unrelated allocation.
     incomplete = {room for room, (_, member) in members.items() if member["phase"] == "initial"}
-    allocation_ready = {room: enabled and room not in incomplete and group(room) not in transitions
+    busy_groups = set(transitions) | {group(r) for r in members if r in live}
+    allocation_ready = {room: enabled and room not in incomplete and group(room) not in busy_groups
                         for room, enabled in ready.items()}
     need, reasons, candidates = allocate(allocation_ready, trace)
     plan = state.get("gentle")
@@ -477,10 +503,15 @@ def assess(live, state, now, advise_room=room_advice, *, trial=True, isolated=()
             closed.append(room)
     if closed:
         incomplete.difference_update(closed)
+        for room in closed:
+            members.pop(room, None)
         for key, batch in list(transitions.items()):
-            if key not in state["holds"] and all(m["phase"] == "done" for m in batch["members"].values()):
+            member_rooms = batch.get("members", {})
+            held = key in state["holds"] or any(group(r) in state["holds"] for r in member_rooms if r in live)
+            if not held and set(member_rooms) <= set(live) and all(m["phase"] == "done" for m in member_rooms.values()):
                 del transitions[key]
-        allocation_ready = {room: enabled and room not in incomplete and group(room) not in transitions
+        busy_groups = set(transitions) | {group(r) for r in members if r in live}
+        allocation_ready = {room: enabled and room not in incomplete and group(room) not in busy_groups
                             for room, enabled in ready.items()}
         # Assess again to release allocation slots. Preserve the first
         # lifecycle event in the audit, and do not acquire a new gentle owner
@@ -674,7 +705,7 @@ def cycle(call):
     batch = None
     control = verification.get("action_scopes", {}).get(room)
     if purpose in {"energy_start", "reversal_initial", "initial_safety_easing"}:
-        batch = state["transitions"].get(group(room))
+        _, batch = transition_for(state, room)
         if batch is None and purpose == "energy_start":
             batch = start_batch(state, room, value, checked, sent, control)
     action = {"room": room, "kind": kind, "value": value, "before": previous, "sent_at": sent, "status": "prepared",
