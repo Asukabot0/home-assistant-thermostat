@@ -138,7 +138,7 @@ class UnifiedCycleTests(unittest.TestCase):
         self.assertNotIn("bedroom", trace["feasible"]["lounge"])
         self.assertEqual(self.h.calls, [])
 
-    def test_auxiliary_initial_starts_milder_than_home_target_and_requires_continuing_recovery(self):
+    def test_auxiliary_initial_uses_home_target_and_requires_continuing_recovery(self):
         for measured, initial in ((23.4, 24), (22.7, None)):
             with self.subTest(measured=measured):
                 self.h.journal.unlink(missing_ok=True)
