@@ -43,6 +43,9 @@ def configure(definition, rooms):
             sources[key] = sensor.get("entity") or rooms[sensor["from_actuator"]]["temperature"]
             if not 0 < sensor.get("max_age_seconds", 1200) <= 7200 or not 0 < sensor.get("weight", 1) <= 10:
                 raise ValueError("Invalid sensor age or weight")
+            offset = sensor.get("offset_c", 0)
+            if isinstance(offset, bool) or not isinstance(offset, (int, float)) or not -3 <= offset <= 3:
+                raise ValueError("Invalid sensor calibration offset")
     primary_sources = set()
     for key, zone in zones.items():
         primary = zone["primary"]
@@ -52,7 +55,7 @@ def configure(definition, rooms):
         extras = zone.get("sensors", ())
         if (primary in extras or len(set(extras)) != len(extras)
                 or any(sensors[item]["role"] not in {"auxiliary", "constraint"} for item in extras)
-                or zone.get("fusion", "primary") not in {"primary", "weighted"}):
+                or zone.get("fusion", "primary") not in {"primary", "weighted", "estimated"}):
             raise ValueError("Invalid zone sensor roles or fusion")
         target = zone["target"]
         if (len(set(target) & {"actuator", "entity", "celsius"}) != 1
@@ -75,7 +78,7 @@ def configure(definition, rooms):
     for name, zone in zones.items():
         fusion = zone.get("fusion", "primary")
         selected = [item for item in zone.get("sensors", ()) if item in sources and
-                    (sensors[item]["role"] == "constraint" or fusion == "weighted")]
+                    (sensors[item]["role"] == "constraint" or fusion in {"weighted", "estimated"})]
         sensor_definitions = {item: [sources[item], {k: v for k, v in sensors[item].items() if k != "enabled"}]
                               for item in [zone["primary"], *selected]}
         zone_versions[name] = fingerprint([name, zone["primary"], fusion, zone["target"], zone.get("pause_entity"),
@@ -130,6 +133,8 @@ def sensor_reading(sensor, live, inputs, now):
         value = state.get("attributes", {}).get(sensor["attribute"]) if sensor.get("attribute") else state.get("state")
         at, source = report_time(state), [sensor["entity"], "ha_report"]
     value = numeric(value)
+    if value is not None and sensor.get("offset_c"):
+        value += sensor["offset_c"]
     valid_value = value is not None and (-50 <= value <= 65 if environment else 0 < value <= 50)
     valid = valid_value and source is not None and at is not None and 0 <= now-at <= sensor.get("max_age_seconds", 1200)
     return {"value": value, "at": at, "source": source, "quality": "fresh" if valid else
