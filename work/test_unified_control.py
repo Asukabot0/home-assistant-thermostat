@@ -138,6 +138,26 @@ class UnifiedCycleTests(unittest.TestCase):
         self.assertNotIn("bedroom", trace["feasible"]["lounge"])
         self.assertEqual(self.h.calls, [])
 
+    def test_running_unit_without_power_does_not_hold_the_zone_assignment(self):
+        for case, watts, started_ago in (("unpowered", 8, 1000), ("powered", 300, 1000), ("just_started", 8, 120)):
+            with self.subTest(case=case):
+                self.h.journal.unlink(missing_ok=True)
+                self.h.calls.clear()
+                self.scene(bed=("off", 25, 24.0, 8), lounge=("cool", 24, 24.9, watts), study=("off", 24, 24.9, 8))
+                living = self.h.live["living"]
+                living["adapter"]["last_mode_change"] = self.h.now - 3000
+                self.run_cycle()
+                self.run_cycle(600)
+                self.run_cycle(600)
+                living["adapter"]["last_mode_change"] = self.h.now + 600 - started_ago
+                updated = self.run_cycle(600)
+                commands = [(a["room"], a["purpose"], a["value"]) for a in updated["commands"]]
+                if case == "unpowered":
+                    self.assertIn(("study", "energy_start", "cool"), commands)
+                    self.assertEqual(self.trace()["unpowered_assignments"]["study"], ["living"])
+                else:
+                    self.assertNotIn("study", {room for room, *_ in commands})
+
     def test_auxiliary_initial_uses_home_target_and_requires_continuing_recovery(self):
         for measured, initial in ((23.4, 23), (22.7, None)):
             with self.subTest(measured=measured):

@@ -22,6 +22,7 @@
   "minimum_trend_span_seconds": 300,
   "minimum_progress_c": 0.15,
   "feedback_wait_seconds": 600,
+  "assignment_power_grace_seconds": 240,
   "reduction_wait_seconds": 180,
   "mild_recovery_deviation": 1.0,
   "peer_ideal_guard_c": 0.1,

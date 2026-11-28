@@ -320,6 +320,22 @@ def quiet_power(now, live, shadow, duration, *, after=None):
     return proof["last_report"]-max(since, after or since) >= duration
 
 
+def unpowered(now, peer, setting, need, zone, live, readings, actions, policy):
+    """A unit asked to run that stays at its off-level power does not hold a zone assignment."""
+    shadow = readings.get(peer) or {}
+    watts = numeric(live[peer]["adapter"]["power"])
+    cutoff = shadow.get("reversal_low_cutoff")
+    if cutoff is None and shadow.get("edges"):
+        cutoff = max(shadow["edges"])
+    if (watts is None or cutoff is None or watts > cutoff or zone["measured"] is None
+            or not current_power_evidence(now, live[peer], shadow)):
+        return False
+    calling = DIRECTION[need]*(setting-zone["measured"]) > policy["tracking_band"]+TEMP_EPSILON
+    asked = max([live[peer]["adapter"]["last_mode_change"],
+                 *(a["proxy_at"] for a in actions if a["room"] == peer and is_strengthening(a))])
+    return calling and now-asked >= policy.get("assignment_power_grace_seconds", 240)
+
+
 def exit_wait(room, direction, now, live, readings, state, policy):
     """An opposite stop echo alone does not free the next mode to strengthen."""
     return any(peer != room and peer in live and live[peer]["adapter"]["mode"] == "off"
@@ -569,10 +585,14 @@ def coordinate(live, readings, ready, state, now, configurations, connected, top
                     space = automatic_setpoint(setting, DIRECTION[need], configurations[peer]["soft_limits"][need])
                     last_effect = next((v for v in reversed(list(local.get("effects", {}).values()))
                                         if v["unit"] == peer and v["zone"] == serve and v["target"] == zone["target"]), None)
-                    return space is not None and (last_effect is None or last_effect["useful"])
+                    return (space is not None and (last_effect is None or last_effect["useful"])
+                            and not unpowered(now, peer, setting, need, zone, live, readings, actions, policy))
                 if any(capable(peer) for peer in live_same):
                     reasons[room] = "maintain_existing_zone_assignment"
                     continue
+                trace.setdefault("unpowered_assignments", {})[room] = sorted(
+                    peer for peer in live_same if numeric(live[peer]["adapter"]["setpoint"]) is not None
+                    and unpowered(now, peer, numeric(live[peer]["adapter"]["setpoint"]), need, zone, live, readings, actions, policy))
             if can_strengthen and room in state["parked"] and need in live[room]["adapter"]["modes"]:
                 candidates.append((3, rank, room, "mode", need, "energy_start"))
                 reasons[room] = "start_for_confirmed_zone_error"
