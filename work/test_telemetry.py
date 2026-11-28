@@ -190,6 +190,28 @@ class TelemetryTests(unittest.TestCase):
         for secret in (b"area_private",b"sensor.private",b"leak",b"token"):
             self.assertNotIn(secret,blob)
 
+    def test_zone_model_and_fusion_trace_survive_public_projection(self):
+        topo={"zones":{"area_private":{"primary":"s"}},"sensors":{"s":{"entity":"sensor.private"},"aux_private":{"entity":"sensor.aux"}}}
+        public=evidence.PublicSchema("a"*64,{"room_private":{}},topo)
+        trend={"delta":-0.4,"uncertainty":0.1,"from":0,"to":0,"reports":9,"source":"model"}
+        fusion={"mode":"estimated","failover":False,"sensors":{"aux_private":{"offset":-0.5,"pairs":7,"at":5,"estimated":True}}}
+        row={"ready":True,"used":False,"updates":40,"settled":50,"unscored":3,"reason":"updated","sigma":0.1,
+             "mae":[0.05,0.08,0.07],"coverage":0.7,"secret":"leak"}
+        influence=[{"unit":"room_private","mode":"cool","zone":"area_private","ratio":0.02,"std":0.02,"status":"negligible"}]
+        out=public.audit({"event":"cycle","at":1,"assessment":{
+            "zones":{"area_private":{"trend":trend,"model_trend":trend,"fusion":fusion}},
+            "zone_model":{"active":False,"zones":{"area_private":row},"influence":influence}}})
+        zone=public.aliases["area_private"]
+        projected=out["assessment"]
+        self.assertEqual(projected["zones"][zone]["model_trend"],trend)
+        self.assertEqual(projected["zones"][zone]["fusion"]["sensors"][public.aliases["aux_private"]]["pairs"],7)
+        kept=projected["zone_model"]["zones"][zone]
+        self.assertEqual((kept["ready"],kept["mae"],kept["reason"]),(True,[0.05,0.08,0.07],"updated"))
+        self.assertEqual(projected["zone_model"]["influence"][0]["unit"],public.aliases["room_private"])
+        blob=evidence.json_bytes(out)
+        for secret in (b"area_private",b"aux_private",b"room_private",b"leak",b"secret"):
+            self.assertNotIn(secret,blob)
+
     def test_reconcile_status_failures_and_audit_payload_survive_projection(self):
         public=evidence.PublicSchema("a"*64,{"living":{}},{})
         unit=public.aliases["living"]
