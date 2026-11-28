@@ -1477,6 +1477,7 @@ def _infer_next_command(
     if not permit_info.get("active"):
         has_queued_tx = any(
             m.get("phase") == "initial"
+            and not (actuators_by_room.get(m.get("room"), {}).get("hold_reason"))
             for tx in ledger["active_transactions"]
             if tx["group"] not in ledger["locks"]["holds"]
             for m in tx.get("members") or ()
@@ -1539,6 +1540,8 @@ def _infer_next_command(
             if member["phase"] == "initial":
                 room = member["room"]
                 act = actuators_by_room.get(room, {})
+                if act.get("hold_reason"):
+                    continue
                 mode = str(tx["mode"] or act.get("mode") or "")
                 limits = (rooms_cfg.get(room) or {}).get("soft_limits", {}).get(mode)
                 target = member["target"] if member["target"] is not None else act.get("target_c")

@@ -611,6 +611,7 @@ class DashboardCollectorTests(unittest.TestCase):
             self.assertEqual(demo_zones["lounge"]["label"], "客厅 / 书房区 (lounge)")
 
             # Orphaned legacy hold (living_study) under 3-zone topology must surface on actuators and fault health
+            # and prevent queued transactions on other lock groups from forecasting automatic dispatch.
             (pilot_dir / f"continuous-{int(now - 3600)}.json").write_text(
                 json.dumps({
                     "start": int(now - 3600),
@@ -618,7 +619,14 @@ class DashboardCollectorTests(unittest.TestCase):
                     "holds": {"living_study": "伴侣回报超时或与指令不一致，已暂停复发"},
                     "manual_holds": {},
                     "parked": {},
-                    "transitions": {},
+                    "transitions": {
+                        "living": {
+                            "id": now - 30,
+                            "mode": "cool",
+                            "ready_at": now - 1,
+                            "members": {"living": {"phase": "initial", "target": 24.0, "control": {"zone": "lounge", "target": 24.0}}},
+                        }
+                    },
                     "commands": [],
                     "closed_loop": {},
                 }),
@@ -627,6 +635,7 @@ class DashboardCollectorTests(unittest.TestCase):
             snap_orphan = collect_snapshot(paths, now=now)
             self.assertEqual(snap_orphan["controller"]["health"], "fault_locked")
             self.assertTrue(all(a["hold_reason"] and "living_study" in a["hold_reason"] for a in snap_orphan["actuators"]))
+            self.assertNotEqual(snap_orphan["next_command"]["stage"], "queued_transaction")
 
             # Live 3-zone status without mounted topology.json must not falsely adopt 2-zone topology.example.json
             (cfg_dir / "topology.json").unlink()
