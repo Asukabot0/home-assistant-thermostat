@@ -31,7 +31,7 @@ The Compose files are sidecar templates for an existing Home Assistant Container
 
 Automatic stops and subsequent starts require an independently verified local off-power reference for each device. Supply `verified_off_power` with the corresponding `entity` and an exclusive `ceiling_w` from actual confirmed stopped measurements. The examples omit that value so that powering off and restarting equipment is gated until commissioning. Mode and setting echoes alone are proxy evidence.
 
-Use `topology.example.json` to configure sensors, zones and equipment influence. See [unified control and evidence scheduling](docs/unified-control.md) for the state machine, production deployment, rollback and telemetry installation. Decisions are recorded entry by entry in the [decision ledger](docs/decision-ledger.md); `AGENTS.md` defines what to record and how.
+Use `topology.example.json` to configure sensors, zones and equipment influence. See [unified control and evidence scheduling](docs/unified-control.md) for the state machine, production deployment, rollback and telemetry installation.
 
 ## Web dashboard (read-only)
 
@@ -59,3 +59,7 @@ docker compose -f compose.dashboard.yaml up -d
 Security note: the dashboard has no built-in authentication and binds `127.0.0.1:8780` by default. Do **not** expose it directly to a LAN via `DASHBOARD_BIND=0.0.0.0` unless placed behind an authenticating reverse proxy (or accessed over SSH port forwarding / Tailscale).
 
 Production credentials, equipment identifiers, unreduced telemetry, command journals and backups belong in the local runtime files excluded by `.gitignore`.
+
+## Decisions
+
+Decisions are recorded entry by entry in the [decision ledger](docs/decision-ledger.md). `AGENTS.md` defines what to record and how.
