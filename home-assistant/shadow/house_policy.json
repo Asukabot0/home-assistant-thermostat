@@ -59,6 +59,7 @@
   "start_failure_reset_seconds": 86400,
   "model_active": 0,
   "model_min_samples": 48,
+  "model_min_running_samples": 24,
   "model_ready_margin": 0.9,
   "model_prior_gain": 8,
   "model_max_interval_seconds": 1800,

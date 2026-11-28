@@ -11,7 +11,7 @@ lists learned influence, and shows how auxiliary sensors would be fused.
 """
 import argparse
 import bisect
-from collections import defaultdict
+from collections import Counter, defaultdict
 import json
 from pathlib import Path
 import sys
@@ -55,7 +55,10 @@ def read_packs(paths):
 
 def site(config, fusion):
     zones = {key: dict(zone, fusion=fusion or zone.get("fusion", "primary")) for key, zone in config["zones"].items()}
-    return {"sensors": config["sensors"], "zones": zones, "actuators": config["actuators"],
+    # De-identified sources keep the kind: `input_` sources are entity points, others follow an actuator.
+    sensors = {key: dict(sensor, entity=sensor["source"]) if str(sensor.get("source", "")).startswith("input_")
+               else dict(sensor) for key, sensor in config["sensors"].items()}
+    return {"sensors": sensors, "zones": zones, "actuators": config["actuators"],
             "sources": {key: sensor["source"] for key, sensor in config["sensors"].items()},
             "zone_versions": {key: fingerprint([key, zone]) for key, zone in zones.items()}}
 
@@ -78,17 +81,21 @@ def replay(cycles, config, power_reports, policy, fusion=None, actions=(), versi
     tallies = defaultdict(lambda: {"n": 0, "model": 0.0, "persistence": 0.0, "rule": 0.0, "covered": 0})
     pending = defaultdict(list)
     first_ready = {}
+    holds = defaultdict(Counter)
     stamps = {unit: [at for at, _ in points] for unit, points in power_reports.items()}
+    clock = {"now": 0.0}
 
     def power(unit, start, end):
+        # Like the controller, use only the power reports received by this cycle.
         points = power_reports.get(unit, [])
         lo = max(0, bisect.bisect_left(stamps.get(unit, []), start)-1)
-        hi = bisect.bisect_right(stamps.get(unit, []), end)+1
+        hi = bisect.bisect_right(stamps.get(unit, []), clock["now"])
         kwh, covered = metered_interval(points[lo:hi], start, end)
         return kwh*3600/covered if covered >= 0.8*(end-start) else None
 
     for event in cycles:
         now, assessment = event["at"], event["assessment"]
+        clock["now"] = now
         version = event.get("config_sha256") if event.get("config_sha256") in versions else None
         if version not in sites:
             sites[version] = site(versions[version] if version else config, fusion)
@@ -123,6 +130,7 @@ def replay(cycles, config, power_reports, policy, fusion=None, actions=(), versi
             previous = (local.get("model", {}).get("zones", {}).get(key) or {}).get("last") or {}
             modeled = zone_model.observe_zone(context, key, ref, observed.get("trend"), environment, units_now, power,
                                               now, intervened)
+            holds[key][modeled["hold"] or "eligible"] += 1
             state = local["model"]["zones"][key]
             if state["ready"] and key not in first_ready:
                 first_ready[key] = now
@@ -152,7 +160,9 @@ def replay(cycles, config, power_reports, policy, fusion=None, actions=(), versi
                 "mae_persistence": round(tallies[key]["persistence"]/max(1, tallies[key]["n"]), 3),
                 "mae_rule": round(tallies[key]["rule"]/max(1, tallies[key]["n"]), 3),
                 "coverage": round(tallies[key]["covered"]/max(1, tallies[key]["n"]), 2),
-                "ready": state["ready"], "first_ready_at": first_ready.get(key),
+                "ready": state["ready"], "ready_running": state["ready_running"], "first_ready_at": first_ready.get(key),
+                "running_settled": state["running"]["n"], "holds": dict(holds[key]),
+                "running_mae": {name: state["running"].get(name) for name in ("model", "persistence", "rule", "coverage")},
                 "noise_c": round(state["noise"]**0.5, 3),
                 "coefficients": dict(zip(state["features"], [round(v, 3) for v in state["theta"]])),
                 "excited": state["excited"], "identities": len(identities[key]),
@@ -181,10 +191,16 @@ def main():
     if args.json:
         args.json.write_text(json.dumps(report, indent=2, ensure_ascii=False) + "\n")
     print(f"cycles {report['cycles']}  window {report['from']} .. {report['to']}")
-    print("zone                      updates settled  MAE model  persistence  rule   coverage  ready  noise")
+    print("zone                      updates settled  MAE model  persistence  rule   coverage  ready  running  noise")
     for key, row in sorted(report["zones"].items()):
         print(f"{key:<26}{row['updates']:>7}{row['settled']:>8}  {row['mae_model']:>9}  {row['mae_persistence']:>11}"
-              f"  {row['mae_rule']:>5}  {row['coverage']:>8}  {str(row['ready']):>5}  {row['noise_c']}")
+              f"  {row['mae_rule']:>5}  {row['coverage']:>8}  {str(row['ready']):>5}  "
+              f"{row['running_settled']:>3} {str(row['ready_running']):>5}  {row['noise_c']}")
+    for key, row in sorted(report["zones"].items()):
+        total = sum(row["holds"].values()) or 1
+        print(f"{key}: eligible {row['holds'].get('eligible', 0)/total:.0%} of cycles, holds "
+              f"{ {name: count for name, count in row['holds'].items() if name != 'eligible'} }, "
+              f"running intervals {row['running_mae']}")
     for key, row in sorted(report["zones"].items()):
         if row["offsets"]:
             print(f"{key}: identities {row['identities']}, held-offset cycles {row['held_offset_cycles']}, "

@@ -11,19 +11,26 @@ import test_p0_p1_dispatch as fixture
 import house_policy
 from service import metered_interval
 from topology import configure, fingerprint
+from zone_control import observations
 import zone_model
 
 
 pilot = fixture.pilot
 EXAMPLE = Path(pilot.__file__).with_name("topology.example.json")
 POLICY = dict(house_policy.POLICY)
+READY_STATS = {"n": 60, "unscored": 0, "model": 0.05, "persistence": 0.1, "rule": 0.1, "coverage": 0.7}
+
+
+def mark_ready(zone):
+    zone.update(ready=True, stats=dict(READY_STATS))
 
 
 def site(**influences):
     """Two zones and two units; `influences` overrides the configured cross influence."""
     actuators = {"ua": {"zone": "a", "influences": {"a": 1, "b": influences.get("ua_b", 0.35)}, "lock_group": "ua"},
                  "ub": {"zone": "b", "influences": {"b": 1, "a": influences.get("ub_a", 0.35)}, "lock_group": "ub"}}
-    sensors = {"pa": {"role": "primary"}, "pb": {"role": "primary"}, "outdoor": {"role": "environment"}}
+    sensors = {"pa": {"role": "primary"}, "pb": {"role": "primary"},
+               "outdoor": {"role": "environment", "entity": "sensor.outdoor"}}
     zones = {"a": {"primary": "pa"}, "b": {"primary": "pb"}}
     return {"sensors": sensors, "zones": zones, "actuators": actuators,
             "sources": {key: "sensor." + key for key in sensors},
@@ -75,16 +82,17 @@ class House:
                        "kw": self.power[unit][-1][1]/1000 if self.power[unit] else None} for unit in self.modes}
 
     def interval(self, unit, start, end):
-        kwh, covered = metered_interval(self.power[unit], start, end)
+        # Like the controller, only the reports received so far are known.
+        kwh, covered = metered_interval([p for p in self.power[unit] if p[0] <= self.t], start, end)
         return kwh*3600/covered if covered >= 0.8*(end-start) else None
 
 
-def run(house, topology, local, policy, minutes):
+def run(house, topology, local, policy, minutes, weather=True):
     outputs = {}
     for _ in range(minutes):
         house.step()
         context = zone_model.begin(local, topology, policy)
-        environment = {"outdoor": {"value": round(house.outdoor(), 1), "at": house.t, "quality": "fresh"}}
+        environment = {"outdoor": {"value": round(house.outdoor(), 1), "at": house.t, "quality": "fresh"}} if weather else {}
         for zone in ("a", "b"):
             if house.reports[zone] is not None:
                 outputs[zone] = zone_model.observe_zone(context, zone, house.reports[zone], None, environment,
@@ -105,12 +113,14 @@ class ZoneModelTests(unittest.TestCase):
             unit = "ua" if key == "a" else "ub"
             learned = zone["theta"][zone["features"].index(f"{unit}:cool")]
             self.assertAlmostEqual(learned, home_gain, delta=1.5, msg=key)
-            stats = zone["stats"]
+            stats, running = zone["stats"], zone["running"]
             self.assertGreaterEqual(stats["n"], POLICY["model_min_samples"])
             self.assertGreater(stats["unscored"], 0)
             self.assertLess(stats["model"], 0.7*stats["persistence"])
             self.assertTrue(0.5 <= stats["coverage"] <= 0.95, stats["coverage"])
-            self.assertTrue(zone["ready"])
+            self.assertGreaterEqual(running["n"], POLICY["model_min_running_samples"])
+            self.assertLess(running["model"], 0.5*min(running["persistence"], running["rule"]))
+            self.assertTrue(zone["ready"] and zone["ready_running"], key)
             self.assertFalse(self.outputs[key]["use"])  # Shadow by default.
 
     def test_learned_influence_separates_zero_from_real_cross_effect(self):
@@ -120,6 +130,7 @@ class ZoneModelTests(unittest.TestCase):
         self.assertAlmostEqual(cross["ratio"], 0.5, delta=0.15)
         self.assertEqual(cross["status"], "significant")
         self.assertNotIn(("ua", "heat", "b"), learned)  # Heating was never excited.
+        self.assertEqual(zone_model.trusted(learned, self.local["model"], self.topology), learned)
 
     def test_risk_influences_follow_confident_learning_only(self):
         learned = {("ub", "cool", "a"): {"status": "negligible", "ratio": 0.01, "std": 0.02},
@@ -134,7 +145,7 @@ class ZoneModelTests(unittest.TestCase):
         local = json.loads(json.dumps(self.local))
         house = deepcopy(self.house)
         outputs = run(house, self.topology, local, dict(POLICY, model_active=1), 30)
-        self.assertTrue(outputs["a"]["use"])
+        self.assertEqual((outputs["a"]["hold"], outputs["a"]["use"]), (None, True))
         self.assertEqual(outputs["a"]["forecast"]["source"], "model")
         zone = local["model"]["zones"]["a"]
         size = len(zone["theta"])
@@ -144,20 +155,33 @@ class ZoneModelTests(unittest.TestCase):
                 self.assertAlmostEqual(zone["covariance"][i][j], zone["covariance"][j][i], places=9)
         self.assertLess(len(json.dumps(local)), 20000)
 
+    def test_output_from_an_unidentified_unit_holds_the_forecast(self):
+        local = json.loads(json.dumps(self.local))
+        context = zone_model.begin(local, self.topology, dict(POLICY, model_active=1))
+        environment = {"outdoor": {"value": 31, "at": self.house.t, "quality": "fresh"}}
+        report = local["model"]["zones"]["a"]["last"]
+        cooling = {"ua": {"mode": "cool", "changed_at": 0, "kw": 0.6}, "ub": {"mode": "off", "changed_at": 0, "kw": 0.0}}
+        heating = {"ua": {"mode": "off", "changed_at": 0, "kw": 0.0}, "ub": {"mode": "heat", "changed_at": 0, "kw": 0.6}}
+        for units, hold in ((cooling, None), (heating, "unidentified_unit")):
+            outcome = zone_model.observe_zone(context, "a", dict(report, quality="fresh"), None, environment, units,
+                                              lambda *_: None, self.house.t)
+            self.assertEqual((outcome["hold"], outcome["use"]), (hold, hold is None))
+
 
 class FrequentReportTests(unittest.TestCase):
-    def test_minute_reports_still_learn_and_settle_forecasts(self):
+    def test_minute_reports_learn_gains_far_from_the_prior(self):
+        policy = dict(POLICY, model_prior_gain=3)
         house, topology, local = House(seed=11, cadences=(("a", 60), ("b", 60))), site(), {}
-        run(house, topology, local, POLICY, 1440)
-        for key in ("a", "b"):
+        run(house, topology, local, policy, 1440)
+        for key, unit, truth in (("a", "ua", -10.0), ("b", "ub", -8.0)):
             zone = local["model"]["zones"][key]
-            self.assertGreater(zone["updates"], 300, key)
+            self.assertGreater(zone["updates"], 150, key)
+            self.assertGreaterEqual(zone["excited"][unit]["cool"], POLICY["influence_min_excitation"], key)
+            self.assertAlmostEqual(zone["theta"][zone["features"].index(f"{unit}:cool")], truth, delta=2.0, msg=key)
             self.assertGreaterEqual(zone["stats"]["n"], POLICY["model_min_samples"], key)
             self.assertLessEqual(len(zone["pending"]),
                                  zone_model.SETTLE_SECONDS[1]//zone_model.PENDING_SPACING_SECONDS+1)
             self.assertLess(zone["stats"]["model"], zone["stats"]["persistence"])
-        gain = local["model"]["zones"]["a"]
-        self.assertAlmostEqual(gain["theta"][gain["features"].index("ua:cool")], -10.0, delta=2.0)
 
 
 class ZoneModelRobustnessTests(unittest.TestCase):
@@ -174,25 +198,34 @@ class ZoneModelRobustnessTests(unittest.TestCase):
         last = zone["last"]
         glitch = {"value": last["value"]+3.0, "at": last["at"]+300, "quality": "fresh"}
         environment = {"outdoor": {"value": 31, "at": glitch["at"], "quality": "fresh"}}
-        zone_model.observe_zone(self.context(), "a", glitch, None, environment, self.house.units_now(),
-                                lambda *_: 0.002, glitch["at"])
+        idle = {unit: {"mode": "off", "changed_at": 0, "kw": 0.0} for unit in ("ua", "ub")}
+        zone_model.observe_zone(self.context(), "a", glitch, None, environment, idle, lambda *_: 0.002, glitch["at"])
         self.assertLess(max(abs(a-b) for a, b in zip(zone["theta"], before)), 1.5)
         self.assertLess(zone["noise"], max(noise, zone_model.NOISE_FLOOR_C**2)*3)
 
-    def test_missing_power_and_reversal_skip_learning(self):
+    def test_uncovered_output_accumulates_and_a_reversal_skips_learning(self):
         zone = self.local["model"]["zones"]["a"]
         environment = {"outdoor": {"value": 31, "at": self.house.t+300, "quality": "fresh"}}
-        running = self.house.units_now()
-        running["ua"].update(mode="cool", changed_at=0)
-        updates = zone["updates"]
-        report = {"value": zone["last"]["value"], "at": zone["last"]["at"]+300, "quality": "fresh"}
+        running = {"ua": {"mode": "cool", "changed_at": 0, "kw": 0.6}, "ub": {"mode": "off", "changed_at": 0, "kw": 0.0}}
+        updates, anchor = zone["updates"], zone["anchor"]["at"]
+        for step in (300, 600):
+            report = {"value": zone["last"]["value"], "at": anchor+step, "quality": "fresh"}
+            zone_model.observe_zone(self.context(), "a", report, None, environment, running, lambda *_: None, report["at"])
+            self.assertEqual((zone["updates"], zone["reason"], zone["anchor"]["at"]), (updates, "accumulating", anchor))
+        report = dict(report, at=anchor+POLICY["model_max_interval_seconds"]+60)
         zone_model.observe_zone(self.context(), "a", report, None, environment, running, lambda *_: None, report["at"])
-        self.assertEqual((zone["updates"], zone["reason"]), (updates, "power_missing"))
-        zone["last"]["modes"]["ua"] = "heat"
+        self.assertEqual((zone["reason"], zone["anchor"]["at"]), ("interval", report["at"]))
+        zone["anchor"]["modes"]["ua"] = "heat"
         running["ua"]["changed_at"] = report["at"]+10
         report = dict(report, at=report["at"]+300)
         zone_model.observe_zone(self.context(), "a", report, None, environment, running, lambda *_: 0.5, report["at"])
         self.assertEqual((zone["updates"], zone["reason"]), (updates, "mode_reversal"))
+
+    def test_missing_environment_readings_do_not_stop_learning_or_forecasts(self):
+        updates = self.local["model"]["zones"]["a"]["updates"]
+        outputs = run(self.house, self.topology, self.local, POLICY, 120, weather=False)
+        self.assertGreater(self.local["model"]["zones"]["a"]["updates"], updates)
+        self.assertIsNotNone(outputs["a"]["forecast"])
 
     def test_intervention_leaves_forecasts_unscored(self):
         zone = self.local["model"]["zones"]["a"]
@@ -213,12 +246,13 @@ class ZoneModelRobustnessTests(unittest.TestCase):
         zone = self.local["model"]["zones"]["a"]
         gain = zone["theta"][zone["features"].index("ua:cool")]
         topology = deepcopy(self.topology)
-        topology["sensors"]["balcony"] = {"role": "environment"}
-        topology["sources"]["balcony"] = "sensor.balcony"
+        topology["sensors"]["balcony"] = {"role": "environment", "entity": "sensor.balcony"}
+        topology["sensors"]["fixed"] = {"role": "environment", "from_actuator": "ua"}
+        topology["sources"].update(balcony="sensor.balcony", fixed="sensor.fixed")
         migrated = zone_model.zone_state(zone_model.begin(self.local, topology, POLICY), "a")
-        self.assertEqual(migrated["features"][:2], ["env:balcony", "env:outdoor"])
+        self.assertEqual(migrated["features"][:3], ["env:balcony", "env:outdoor", "mass"])
         self.assertEqual(migrated["theta"][migrated["features"].index("ua:cool")], gain)
-        self.assertEqual((migrated["stats"]["n"], migrated["ready"]), (0, False))
+        self.assertEqual((migrated["stats"]["n"], migrated["ready"], migrated["ready_running"]), (0, False, False))
         topology["zone_versions"]["a"] = "changed"
         reset = zone_model.zone_state(zone_model.begin(self.local, topology, POLICY), "a")
         self.assertEqual(reset["updates"], 0)
@@ -238,7 +272,7 @@ class ControllerIntegrationTests(unittest.TestCase):
         return next(x.kwargs["assessment"] for x in reversed(self.audit.call_args_list)
                     if x.args == ("cycle",) and "assessment" in x.kwargs)
 
-    def learned_state(self):
+    def learned_state(self, ready):
         """Bedroom cooling clearly serves its own zone and leaves the lounge unchanged."""
         local = {}
         context = zone_model.begin(local, self.topology, POLICY)
@@ -250,20 +284,25 @@ class ControllerIntegrationTests(unittest.TestCase):
             zone["theta"][index] = gain
             zone["covariance"][index][index] = variance
             zone["excited"] = {"bedroom": {"cool": 12}}
+            if ready:
+                mark_ready(zone)
         return local["model"]
 
-    def assisted_start(self, active):
-        self.h.whole_scene(("off", 25, 23.4, 8), ("off", 24, 24.6, 8), ("off", 24, 24.6, 8))
+    def scene(self, *rooms):
+        self.h.whole_scene(*rooms)
         permit = json.loads(self.h.permit.read_bytes())
         for room, state in permit["rooms"].items():
             if state[0] == "off":
                 permit["rooms"][room] = ["cool", 25, "auto"]
         self.h.permit.write_text(json.dumps(permit))
         self.h.park("bedroom", "living", "study", ago=800)
+
+    def assisted_start(self, active, ready=True):
+        self.scene(("off", 25, 23.4, 8), ("off", 24, 24.6, 8), ("off", 24, 24.6, 8))
         bedroom = self.h.live["bedroom"]
         bedroom["signature"] = (*bedroom["signature"][:4], 23, *bedroom["signature"][5:])
         self.h.update_state(manual_holds={"living": "fixture", "study": "fixture"},
-                            closed_loop={"model": self.learned_state()})
+                            closed_loop={"model": self.learned_state(ready)})
         with patch.dict(house_policy.POLICY, {"model_active": active}):
             for seconds in (0, 600, 600, 600):
                 self.h.now += seconds
@@ -277,8 +316,9 @@ class ControllerIntegrationTests(unittest.TestCase):
         trace = self.trace()
         self.assertEqual([(a["purpose"], a["control"]["zone"]) for a in started["commands"]], [("energy_start", "lounge")])
         self.assertFalse(trace["zone_model"]["active"])
-        self.assertIn({"unit": "bedroom", "mode": "cool", "zone": "lounge", "ratio": 0.02, "std": 0.02,
-                       "status": "negligible"}, trace["zone_model"]["influence"])
+        lounge = next(row for row in trace["zone_model"]["influence"] if row["zone"] == "lounge")
+        self.assertEqual((lounge["unit"], lounge["mode"], lounge["ratio"], lounge["status"], lounge["trusted"]),
+                         ("bedroom", "cool", 0.02, "negligible", True))
 
     def test_active_model_stops_assistance_that_cannot_reach_the_zone(self):
         started = self.assisted_start(1)
@@ -286,6 +326,67 @@ class ControllerIntegrationTests(unittest.TestCase):
         self.assertTrue(trace["zone_model"]["active"])
         self.assertNotIn("bedroom", trace["feasible"].get("lounge", []))
         self.assertEqual([(a["purpose"], a["control"]["zone"]) for a in started["commands"]], [("energy_start", "sleep")])
+
+    def test_active_model_ignores_influence_until_both_zones_are_ready(self):
+        started = self.assisted_start(1, ready=False)
+        trace = self.trace()
+        self.assertIn("bedroom", trace["feasible"]["lounge"])
+        self.assertEqual([(a["purpose"], a["control"]["zone"]) for a in started["commands"]], [("energy_start", "lounge")])
+        self.assertFalse(next(row for row in trace["zone_model"]["influence"] if row["zone"] == "lounge")["trusted"])
+
+    def test_example_topology_learns_without_actuator_environment_points(self):
+        self.scene(("off", 25, 24.0, 8), ("off", 25, 24.1, 8), ("off", 25, 24.1, 8))
+        for _ in range(12):
+            self.h.now += 600
+            for room in self.h.live:
+                self.h.observe(room)
+            state = self.h.snapshot()
+        zones = state["closed_loop"]["model"]["zones"]
+        self.assertEqual(zones["sleep"]["features"][0], "mass")
+        for key in ("sleep", "lounge"):
+            self.assertGreater(zones[key]["updates"], 5, key)
+            self.assertGreater(zones[key]["stats"]["n"], 0, key)
+        self.assertEqual(self.h.calls, [])
+
+
+class ObservationTests(unittest.TestCase):
+    def setUp(self):
+        harness = fixture.DispatchTests()
+        harness.setUp()
+        self.addCleanup(harness.doCleanups)
+        harness.whole_scene(("off", 25, 24.0, 8), ("off", 25, 24.2, 8), ("off", 25, 24.2, 8))
+        self.harness, self.topology = harness, configure(json.loads(EXAMPLE.read_bytes()), pilot.ROOMS)
+
+    def observe(self, memory, policy=POLICY, seconds=600, change=0.0):
+        live = self.harness.live
+        self.harness.now += seconds
+        for room in live:
+            live[room]["temperature"] += change
+            live[room]["temperature_report_at"] = self.harness.now
+        return observations(self.topology, deepcopy(live), {}, memory, [], set(), self.harness.now, policy)[0]
+
+    def test_active_model_replaces_only_the_response_trend(self):
+        memory = {}
+        for _ in range(4):
+            self.observe(memory, change=-0.1)
+        for zone in memory["model"]["zones"].values():
+            mark_ready(zone)
+        zones = self.observe(memory, dict(POLICY, model_active=1), change=-0.1)
+        sleep = zones["sleep"]
+        self.assertIsNone(sleep["model_hold"])
+        self.assertEqual(sleep["response_trend"]["source"], "model")
+        self.assertNotEqual((sleep["trend"] or {}).get("source"), "model")
+
+    def test_damaged_model_state_falls_back_to_rules(self):
+        memory = {}
+        self.observe(memory)
+        memory["model"]["zones"]["sleep"]["covariance"] = "damaged"
+        zones = self.observe(memory, dict(POLICY, model_active=1))
+        self.assertEqual(zones["sleep"]["model_hold"], "model_error")
+        self.assertEqual(memory["model"]["errors"]["sleep"]["error"], "TypeError")
+        self.assertNotIn("sleep", memory["model"]["zones"])
+        self.observe(memory)
+        self.assertIn("sleep", memory["model"]["zones"])
 
 
 if __name__ == "__main__":

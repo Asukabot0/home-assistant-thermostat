@@ -4,8 +4,8 @@ Between two temperature reports a zone is modeled as
 
     dT = dh * (sum_e a_e*(T_e - T) + b*(T_m - T) + sum_u sum_m g_um*P_um + c)
 
-where T_e are environment readings, T_m is a slow lagged average of the zone
-temperature standing in for walls and furniture, P_um is the measured mean
+where T_e are `entity` environment readings, T_m is a slow lagged average of the
+zone temperature standing in for walls and furniture, P_um is the measured mean
 electric power (kW) of unit u while it reported mode m, dh is the interval in
 hours and c is a slowly varying drift. A Kalman filter with random-walk
 coefficients starts from the configured influence matrix. Forecasts assume the
@@ -21,9 +21,9 @@ from topology import fingerprint
 MODEL_VERSION = 1
 MODES = ("heat", "cool")
 SIGN = {"heat": 1, "cool": -1}
-MODEL_DEFAULTS = {"model_active": 0, "model_min_samples": 48, "model_ready_margin": 0.9, "model_prior_gain": 8,
-                  "model_max_interval_seconds": 1800, "influence_negligible": 0.15, "influence_significant": 0.3,
-                  "influence_min_excitation": 6}
+MODEL_DEFAULTS = {"model_active": 0, "model_min_samples": 48, "model_min_running_samples": 24,
+                  "model_ready_margin": 0.9, "model_prior_gain": 8, "model_max_interval_seconds": 1800,
+                  "influence_negligible": 0.15, "influence_significant": 0.3, "influence_min_excitation": 6}
 MIN_INTERVAL_SECONDS = 120
 SETTLE_SECONDS = (450, 1200)
 ENVIRONMENT_HOLD_SECONDS = 7200
@@ -31,6 +31,7 @@ MASS_SECONDS = 2700
 STATS_WINDOW = 48
 PENDING_SPACING_SECONDS = 240
 EXCITATION_KW = 0.15
+IDENTIFIED_FRACTION = 0.25
 HUBER = 3.0
 INITIAL_NOISE_C = 0.08
 NOISE_FLOOR_C, NOISE_CEILING_C = 0.03, 0.5
@@ -80,13 +81,15 @@ def prior(topology, key, environment, units, policy):
 
 def structure(topology, key, environment, units):
     return fingerprint([MODEL_VERSION, topology["zone_versions"][key],
-                        [[name, topology["sources"][name]] for name in environment], units])
+                        [[name, topology["sources"][name], topology["sensors"][name].get("offset_c", 0)]
+                         for name in environment], units])
 
 
 def begin(local, topology, policy):
     """Return the learning context of one assessment."""
+    # Only entity environment points carry live readings.
     environment = sorted(name for name, sensor in topology["sensors"].items()
-                         if sensor["role"] == "environment" and sensor.get("enabled", True))
+                         if sensor["role"] == "environment" and sensor.get("enabled", True) and "entity" in sensor)
     state = local.get("model")
     if not isinstance(state, dict) or state.get("version") != MODEL_VERSION:
         state = local["model"] = {"version": MODEL_VERSION, "zones": {}}
@@ -117,14 +120,20 @@ def zone_state(context, key):
         zone = context["state"]["zones"][key] = {
             "structure": shape, "zone_version": topology["zone_versions"][key], "features": names, "theta": mean,
             "covariance": covariance, "noise": zone["noise"] if kept else INITIAL_NOISE_C**2,
+            "noise_running": zone["noise_running"] if kept else INITIAL_NOISE_C**2,
             "updates": zone["updates"] if kept else 0,
             "excited": {unit: counts for unit, counts in zone["excited"].items() if unit in units} if kept else {},
-            "pending": [], "stats": {"n": 0, "unscored": 0}, "ready": False, "last": None, "anchor": None}
+            "pending": [], "stats": {"n": 0, "unscored": 0}, "running": {"n": 0}, "ready": False,
+            "ready_running": False, "last": None, "anchor": None}
     return zone
 
 
-def kalman(zone, x, y, variance_cap, drift):
-    """Random-walk prediction, then a Huber-weighted measurement update in Joseph form."""
+def kalman(zone, x, y, variance_cap, drift, noise_key):
+    """Random-walk prediction, then a Huber-weighted measurement update in Joseph form.
+
+    `noise_key` selects the measurement noise: intervals with equipment output
+    are noisier than idle ones, so each keeps its own adaptive estimate.
+    """
     theta, p = zone["theta"], zone["covariance"]
     n = len(theta)
     for i in range(n):
@@ -139,8 +148,8 @@ def kalman(zone, x, y, variance_cap, drift):
     px = matvec(p, x)
     spread = dot(x, px)
     innovation = y-dot(x, theta)
-    limit = HUBER*sqrt(spread+zone["noise"])
-    noise = zone["noise"]*max(1.0, abs(innovation)/limit)
+    limit = HUBER*sqrt(spread+zone[noise_key])
+    noise = zone[noise_key]*max(1.0, abs(innovation)/limit)
     gain = [value/(spread+noise) for value in px]
     zone["theta"] = [t+k*innovation for t, k in zip(theta, gain)]
     a = [[(1.0 if i == j else 0.0)-gain[i]*x[j] for j in range(n)] for i in range(n)]
@@ -150,23 +159,36 @@ def kalman(zone, x, y, variance_cap, drift):
     zone["covariance"] = [[(updated[i][j]+updated[j][i])/2 for j in range(n)] for i in range(n)]
     clipped = max(-limit, min(limit, innovation))
     estimate = max(NOISE_FLOOR_C**2, min(NOISE_CEILING_C**2, clipped**2-spread))
-    zone["noise"] += NOISE_ADAPTATION*(estimate-zone["noise"])
+    predicted_spread = sqrt(spread+zone[noise_key])
+    zone[noise_key] += NOISE_ADAPTATION*(estimate-zone[noise_key])
+    return innovation, predicted_spread
 
 
 def regressor(last, environment, hours, powers):
-    return ([hours*(value-last["value"]) for value in environment] + [hours*(last["mass"]-last["value"])]
-            + [hours*kw for kw in powers] + [hours])
+    # A missing environment reading contributes nothing rather than blocking the zone.
+    return ([hours*(value-last["value"]) if value is not None else 0.0 for value in environment]
+            + [hours*(last["mass"]-last["value"])] + [hours*kw for kw in powers] + [hours])
 
 
 def split_power(mode, kw):
     return [kw if mode == wanted else 0.0 for wanted in MODES]
 
 
-def learn(context, key, zone, ref, units_now, power):
+def drawing(units_now):
+    """Units drawing real power now, with the mode they report."""
+    return [(unit, row["mode"]) for unit, row in sorted(units_now.items())
+            if row.get("mode") in MODES and (row.get("kw") or 0) >= EXCITATION_KW]
+
+
+def learn(context, key, zone, ref, units_now, power, intervened):
     """Update the coefficients from the interval between the learning anchor and the new report.
 
-    Reports closer than MIN_INTERVAL_SECONDS to the anchor return "accumulating"
-    and leave the anchor in place, so frequent reports still form intervals.
+    "accumulating" leaves the anchor in place: the report is closer than
+    MIN_INTERVAL_SECONDS to it, or a running unit's power reports do not cover
+    the interval yet, typically because the next meter report is still due.
+    Intervals in which a unit drew power, with no command or mode change after
+    the anchor, also score the prediction made before the update against
+    persistence and the rule trend; they show whether operation is modeled.
     """
     anchor = zone["anchor"]
     if anchor is None:
@@ -176,8 +198,6 @@ def learn(context, key, zone, ref, units_now, power):
         return "accumulating"
     if elapsed > setting(context["policy"], "model_max_interval_seconds"):
         return "interval"
-    if any(value is None for value in anchor["environment"]):
-        return "environment_missing"
     operation = {}
     for unit in context["units"]:
         condition = units_now.get(unit) or {}
@@ -189,7 +209,7 @@ def learn(context, key, zone, ref, units_now, power):
         kw = power(unit, anchor["at"], ref["at"])
         if kw is None:
             if running:
-                return "power_missing"
+                return "accumulating"
             kw = 0.0
         mode = next(iter(running), None)
         if mode is None and kw >= EXCITATION_KW:
@@ -198,22 +218,32 @@ def learn(context, key, zone, ref, units_now, power):
     hours = elapsed/3600
     powers = [value for unit in context["units"] for value in split_power(*operation[unit])]
     x = regressor(anchor, anchor["environment"], hours, powers)
-    _, variance, drift = prior(context["topology"], key, context["environment"], context["units"], context["policy"])
-    kalman(zone, x, ref["value"]-anchor["value"], variance, [hours*value for value in drift])
+    policy = context["policy"]
+    _, variance, drift = prior(context["topology"], key, context["environment"], context["units"], policy)
+    change = ref["value"]-anchor["value"]
+    output = [(unit, mode) for unit, (mode, kw) in operation.items() if mode and kw >= EXCITATION_KW]
+    innovation, spread = kalman(zone, x, change, variance, [hours*value for value in drift],
+                                "noise_running" if output else "noise")
     zone["updates"] += 1
-    drawing = [(unit, mode) for unit, (mode, kw) in operation.items() if mode and kw >= EXCITATION_KW]
-    if len(drawing) == 1:
+    if len(output) == 1:
         # Only intervals where a single unit draws real power separate its influence from the others.
-        unit, mode = drawing[0]
+        unit, mode = output[0]
         counts = zone["excited"].setdefault(unit, {})
         counts[mode] = counts.get(mode, 0)+1
+    changes = [intervened, *((units_now.get(unit) or {}).get("changed_at") or 0 for unit in context["units"])]
+    if output and max(changes) < anchor["at"]:
+        rule = anchor["rule"]*elapsed/policy["forecast_seconds"]
+        record(zone["running"], {"model": abs(innovation), "persistence": abs(change), "rule": abs(change-rule)},
+               float(abs(innovation) <= spread))
+        zone["ready_running"] = judged(zone["running"], zone["ready_running"],
+                                       setting(policy, "model_min_running_samples"), policy)
     return "updated"
 
 
 def forecast(context, zone, environment, units_now):
     """Projected change over the controller's forecast horizon if the current output continues."""
     last = zone["last"]
-    if last is None or any(value is None for value in environment):
+    if last is None:
         return None
     powers = []
     for unit in context["units"]:
@@ -224,14 +254,32 @@ def forecast(context, zone, environment, units_now):
         powers += split_power(mode, kw)
     x = regressor(last, environment, context["policy"]["forecast_seconds"]/3600, powers)
     spread = dot(x, matvec(zone["covariance"], x))
-    return {"delta": dot(x, zone["theta"]), "uncertainty": sqrt(max(0.0, spread)+zone["noise"]),
+    noise = zone["noise_running"] if drawing(units_now) else zone["noise"]
+    return {"delta": dot(x, zone["theta"]), "uncertainty": sqrt(max(0.0, spread)+noise),
             "from": last["at"], "to": last["at"], "reports": zone["updates"], "source": "model"}
+
+
+def record(stats, errors, covered):
+    stats["n"] += 1
+    alpha = max(1/stats["n"], 1/STATS_WINDOW)
+    for name, error in [*errors.items(), ("coverage", covered)]:
+        stats[name] = compact(stats.get(name, error)+alpha*(error-stats.get(name, error)))
+
+
+def judged(stats, ready, minimum, policy):
+    """Readiness with hysteresis: earn it with margin and calibrated spread, keep it while not worse."""
+    if stats["n"] < minimum:
+        return False
+    baseline = min(stats["persistence"], stats["rule"])
+    if ready:
+        return stats["model"] <= baseline and stats["coverage"] >= 0.4
+    return stats["model"] <= setting(policy, "model_ready_margin")*baseline and 0.5 <= stats["coverage"] <= 0.95
 
 
 def settle(context, zone, ref, intervened):
     """Score forecasts against the first report 7.5 to 20 minutes later when nothing was changed meanwhile."""
-    horizon = context["policy"]["forecast_seconds"]
-    stats, keep = zone["stats"], []
+    horizon, policy = context["policy"]["forecast_seconds"], context["policy"]
+    keep = []
     for item in zone["pending"]:
         age = ref["at"]-item["at"]
         if age < SETTLE_SECONDS[0]:
@@ -240,27 +288,40 @@ def settle(context, zone, ref, intervened):
         if age > SETTLE_SECONDS[1]:
             continue
         if intervened >= item["at"]:
-            stats["unscored"] += 1
+            zone["stats"]["unscored"] += 1
             continue
         scale = age/horizon
         actual = ref["value"]-item["value"]
         errors = {"model": abs(actual-scale*item["model"]), "persistence": abs(actual),
                   "rule": abs(actual-scale*item["rule"])}
         covered = float(errors["model"] <= item["sigma"]*max(1.0, scale))
-        stats["n"] += 1
-        alpha = max(1/stats["n"], 1/STATS_WINDOW)
-        for name, error in [*errors.items(), ("coverage", covered)]:
-            stats[name] = compact(stats.get(name, error)+alpha*(error-stats.get(name, error)))
+        record(zone["stats"], errors, covered)
     zone["pending"] = keep
-    policy = context["policy"]
-    if stats["n"] < setting(policy, "model_min_samples"):
-        zone["ready"] = False
-        return
-    baseline = min(stats["persistence"], stats["rule"])
-    if zone["ready"]:
-        zone["ready"] = stats["model"] <= baseline and stats["coverage"] >= 0.4
-    else:
-        zone["ready"] = stats["model"] <= setting(policy, "model_ready_margin")*baseline and 0.5 <= stats["coverage"] <= 0.95
+    zone["ready"] = judged(zone["stats"], zone["ready"], setting(policy, "model_min_samples"), policy)
+
+
+def identified(zone, unit, mode, policy):
+    """A unit's effect on this zone is learned from enough single-unit intervals and is no longer prior-wide."""
+    name = f"{unit}:{mode}"
+    if name not in zone["features"]:
+        return False
+    index = zone["features"].index(name)
+    return (zone["excited"].get(unit, {}).get(mode, 0) >= setting(policy, "influence_min_excitation")
+            and sqrt(max(zone["covariance"][index][index], 0.0)) <= IDENTIFIED_FRACTION*setting(policy, "model_prior_gain"))
+
+
+def eligibility(context, zone, projected, units_now):
+    """Why the forecast may not replace the rule estimate now, or None when it may."""
+    if projected is None:
+        return "no_forecast"
+    if not zone["ready"]:
+        return "not_ready"
+    running = drawing(units_now)
+    if running and not zone["ready_running"]:
+        return "running_not_ready"
+    if any(not identified(zone, unit, mode, context["policy"]) for unit, mode in running):
+        return "unidentified_unit"
+    return None
 
 
 def observe_zone(context, key, ref, rule, environment, units_now, power, now, intervened=0):
@@ -271,7 +332,8 @@ def observe_zone(context, key, ref, rule, environment, units_now, power, now, in
     unit to its current mode, last mode change and kW, `power(unit, start, end)`
     returns the measured mean kW over an interval or None, and `intervened` is the
     latest time any control action took effect. State changes only when the zone
-    has a new report.
+    has a new report. `hold` explains why the forecast is not eligible, in shadow
+    mode as well, and `use` is set only when the policy enables the model.
     """
     zone = zone_state(context, key)
     values = []
@@ -285,7 +347,7 @@ def observe_zone(context, key, ref, rule, environment, units_now, power, now, in
     if fresh:
         changes = [intervened, *((units_now.get(unit) or {}).get("changed_at") or 0 for unit in context["units"])]
         settle(context, zone, ref, max(changes))
-        zone["reason"] = learn(context, key, zone, ref, units_now, power)
+        zone["reason"] = learn(context, key, zone, ref, units_now, power, intervened)
         elapsed = ref["at"]-last["at"] if last else inf
         if elapsed <= setting(context["policy"], "model_max_interval_seconds"):
             weight = 1-exp(-elapsed/MASS_SECONDS)
@@ -293,7 +355,8 @@ def observe_zone(context, key, ref, rule, environment, units_now, power, now, in
         else:
             mass = ref["value"]
         zone["last"] = {"at": ref["at"], "value": ref["value"], "environment": values, "mass": compact(mass),
-                        "modes": {unit: (units_now.get(unit) or {}).get("mode") for unit in context["units"]}}
+                        "modes": {unit: (units_now.get(unit) or {}).get("mode") for unit in context["units"]},
+                        "rule": compact(rule["delta"]) if rule else 0.0}
         if zone["reason"] != "accumulating":
             zone["anchor"] = zone["last"]
     projected = forecast(context, zone, values, units_now)
@@ -303,14 +366,15 @@ def observe_zone(context, key, ref, rule, environment, units_now, power, now, in
         pending = [item for item in zone["pending"] if ref["at"]-item["at"] <= SETTLE_SECONDS[1]]
         if not pending or ref["at"]-pending[-1]["at"] >= PENDING_SPACING_SECONDS:
             pending.append({"at": ref["at"], "value": ref["value"], "model": compact(projected["delta"]),
-                            "sigma": compact(projected["uncertainty"]), "rule": compact(rule["delta"]) if rule else 0.0})
+                            "sigma": compact(projected["uncertainty"]), "rule": zone["last"]["rule"]})
         zone["pending"] = pending
     if fresh:
         zone["theta"] = [compact(value) for value in zone["theta"]]
         zone["covariance"] = [[compact(value) for value in row] for row in zone["covariance"]]
-        zone["noise"] = compact(zone["noise"])
-    return {"forecast": projected, "ready": zone["ready"],
-            "use": active(context["policy"]) and zone["ready"] and projected is not None}
+        zone["noise"], zone["noise_running"] = compact(zone["noise"]), compact(zone["noise_running"])
+    hold = eligibility(context, zone, projected, units_now)
+    return {"forecast": projected, "ready": zone["ready"], "hold": hold,
+            "use": active(context["policy"]) and hold is None}
 
 
 def influence(state, topology, policy):
@@ -348,6 +412,17 @@ def influence(state, topology, policy):
     return result
 
 
+def trusted(learned, state, topology):
+    """Learned influence whose source and affected zones both have ready models."""
+    zones = state.get("zones", {}) if isinstance(state, dict) else {}
+
+    def ready(key):
+        return bool((zones.get(key) or {}).get("ready"))
+
+    return {(unit, mode, zone): entry for (unit, mode, zone), entry in learned.items()
+            if ready(topology["actuators"][unit]["zone"]) and ready(zone)}
+
+
 def negligible(learned, unit, mode, zone):
     return (learned.get((unit, mode, zone)) or {}).get("status") == "negligible"
 
@@ -366,19 +441,24 @@ def risk_influences(room, mode, topology, learned):
     return influences
 
 
-def summary(state, zones, learned, policy):
+def summary(state, zones, learned, policy, topology):
     """Compact trace of model readiness, forecast quality and confident learned influence."""
     if not isinstance(state, dict):
         return None
+    mae = ("model", "persistence", "rule")
     rows = {}
     for key, zone in state.get("zones", {}).items():
-        stats = zone["stats"]
-        rows[key] = {"ready": zone["ready"], "used": ((zones.get(key) or {}).get("trend") or {}).get("source") == "model",
+        stats, running = zone["stats"], zone["running"]
+        rows[key] = {"ready": zone["ready"], "ready_running": zone["ready_running"],
+                     "used": ((zones.get(key) or {}).get("response_trend") or {}).get("source") == "model",
                      "updates": zone["updates"], "settled": stats["n"], "unscored": stats.get("unscored", 0),
-                     "reason": zone.get("reason"), "sigma": round(sqrt(zone["noise"]), 3),
-                     "mae": [round(stats[name], 3) if name in stats else None for name in ("model", "persistence", "rule")],
+                     "running_settled": running["n"], "reason": zone.get("reason"), "sigma": round(sqrt(zone["noise"]), 3),
+                     "sigma_running": round(sqrt(zone["noise_running"]), 3),
+                     "mae": [round(stats[name], 3) if name in stats else None for name in mae],
+                     "running_mae": [round(running[name], 3) if name in running else None for name in mae],
                      "coverage": round(stats["coverage"], 2) if "coverage" in stats else None}
+    accepted = trusted(learned, state, topology)
     confident = [{"unit": unit, "mode": mode, "zone": zone, "ratio": round(entry["ratio"], 3),
-                  "std": round(entry["std"], 3), "status": entry["status"]}
+                  "std": round(entry["std"], 3), "status": entry["status"], "trusted": (unit, mode, zone) in accepted}
                  for (unit, mode, zone), entry in sorted(learned.items()) if entry["status"] != "uncertain"]
-    return {"active": active(policy), "zones": rows, "influence": confident}
+    return {"active": active(policy), "zones": rows, "influence": confident, "errors": state.get("errors", {})}

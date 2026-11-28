@@ -232,7 +232,12 @@ def observations(topology, live, inputs, state, actions, paused, now, policy=POL
     fusion_memory = state.setdefault("fusion", {})
     for removed in fusion_memory.keys()-topology["zones"].keys():
         del fusion_memory[removed]
-    learning = zone_model.begin(state, topology, policy)
+    try:
+        learning = zone_model.begin(state, topology, policy)
+    except Exception as error:  # A damaged learned state must not stop control.
+        state.pop("model", None)
+        learning = zone_model.begin(state, topology, policy)
+        learning["state"]["errors"] = {"model": {"at": now, "error": type(error).__name__}}
     units_now = unit_conditions(topology, live)
     intervened = max((a["proxy_at"] for a in actions), default=0)
     readings = readings or {}
@@ -243,7 +248,11 @@ def observations(topology, live, inputs, state, actions, paused, now, policy=POL
     out = {}
     for key, zone in topology["zones"].items():
         primary = by_sensor[zone["primary"]]
-        ref, fusion = fuse(zone, topology, by_sensor, fusion_memory.setdefault(key, {}), now, policy)
+        try:
+            ref, fusion = fuse(zone, topology, by_sensor, fusion_memory.setdefault(key, {}), now, policy)
+        except Exception as error:
+            fusion_memory[key] = {}
+            ref, fusion = dict(primary), {"mode": zone.get("fusion", "primary"), "error": type(error).__name__}
         sensors = {k: by_sensor[k] for k in zone.get("sensors", ()) if k in by_sensor}
         target = zone_target(zone, live, inputs)
         switched = inputs.get(zone.get("pause_entity"), {}).get("state")
@@ -275,16 +284,22 @@ def observations(topology, live, inputs, state, actions, paused, now, policy=POL
         response = (trend(points, after, now, policy, anchored=True)
                     if forecast is None and ref["quality"] == "fresh" and changed > memory["changed_at"]
                     and strengthened_last(influencing) else forecast)
-        modeled = zone_model.observe_zone(learning, key, ref, forecast, environment, units_now, power, now, intervened)
+        try:
+            modeled = zone_model.observe_zone(learning, key, ref, forecast, environment, units_now, power, now, intervened)
+        except Exception as error:
+            learning["state"]["zones"].pop(key, None)
+            learning["state"].setdefault("errors", {})[key] = {"at": now, "error": type(error).__name__}
+            modeled = {"forecast": None, "ready": False, "hold": "model_error", "use": False}
         if modeled["use"]:
-            # A ready model already accounts for the measured output of each unit,
-            # so it replaces both the rule trend and the anchored response.
-            forecast = response = modeled["forecast"]
+            # Like the anchored response, the model only serves the local overshoot
+            # checks of running equipment; arbitration, peer risk and recovery keep
+            # the trend re-established after each command.
+            response = modeled["forecast"]
         result = track(memory, ref, target, forecast, is_paused, now, policy)
         result.update(source_version=identity, observation_definition=definition, source=ref["source"], primary=zone["primary"],
                       primary_reading=primary, inputs=sensors,
                       constraints={k: s for k, s in sensors.items() if topology["sensors"][k]["role"] == "constraint"},
-                      fusion=fusion, model_trend=modeled["forecast"])
+                      fusion=fusion, model_trend=modeled["forecast"], model_hold=modeled["hold"])
         result["response_trend"] = response
         out[key] = result
     for room, modes in list(state.get("maintenance", {}).items()):
@@ -598,9 +613,15 @@ def coordinate(live, readings, ready, state, now, configurations, connected, top
     zones, environment = observations(topology, live, inputs, local, actions, paused, now, policy, readings=readings)
     for key, zone in zones.items():
         zone["key"] = key
-    learned = zone_model.influence(local.get("model"), topology, policy)
-    # Learned influence is recorded in every run but changes allocation only when enabled.
-    gated = learned if zone_model.active(policy) else {}
+    try:
+        learned = zone_model.influence(local.get("model"), topology, policy)
+        # Learned influence is always recorded, but changes allocation only when
+        # enabled and when both zones involved have ready models.
+        gated = zone_model.trusted(learned, local["model"], topology) if zone_model.active(policy) else {}
+        model_summary = zone_model.summary(local.get("model"), zones, learned, policy, topology)
+    except Exception as error:
+        learned = gated = {}
+        model_summary = {"active": zone_model.active(policy), "errors": {"summary": {"at": now, "error": type(error).__name__}}}
     modes = {room: live[room]["adapter"]["mode"] for room in connected}
     output = {room: mode in ACTIVE and room in readings and credible_output(now, live[room], readings[room])
               for room, mode in modes.items()}
@@ -646,8 +667,7 @@ def coordinate(live, readings, ready, state, now, configurations, connected, top
                  environment=environment, season=local.get("season"), owner=owner, demand_order=demands, feasible=feasible, output_evidence=output,
                  risks={}, equipment={}, observations_after={}, action_scopes=scopes, energy_scores=energy_scores,
                  recent_effects=list(local.get("effects", {}).values())[-8:], uncertain_zones=sorted(uncertain),
-                 handoff=handoff, conflict=contest, yielding_blocks=blocked, elected=elected,
-                 zone_model=zone_model.summary(local.get("model"), zones, learned, policy))
+                 handoff=handoff, conflict=contest, yielding_blocks=blocked, elected=elected, zone_model=model_summary)
     for key in demands:
         if key != owner:
             zones[key].update(intent="limited", reason="unconfirmed_influencing_equipment" if key in uncertain else
