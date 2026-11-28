@@ -1,0 +1,42 @@
+name: room-thermostat-dashboard
+
+services:
+  thermostat-dashboard:
+    image: ${DASHBOARD_IMAGE:-python:3.12-slim}
+    command: ["python3", "-B", "-m", "dashboard", "--host", "0.0.0.0", "--port", "8780"]
+    restart: unless-stopped
+    read_only: true
+    tmpfs: ["/tmp:size=16m,mode=1777"]
+    # Match compose.pilot.yaml's identity (UID 0 with cap_drop: [ALL], no cap_add)
+    # so the dashboard can read the exact same 0600 journals and configs without
+    # adding privileged capabilities such as CAP_DAC_READ_SEARCH.
+    user: "${DASHBOARD_USER:-0:0}"
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    mem_limit: 128m
+    pids_limit: 64
+    environment:
+      TZ: ${TZ:-Asia/Shanghai}
+      PYTHONDONTWRITEBYTECODE: "1"
+      PYTHONPATH: /app
+      THERMOSTAT_SHADOW_CONFIG_DIR: /opt/shadow-config
+      THERMOSTAT_PILOT_DATA_DIR: /pilot
+      THERMOSTAT_SHADOW_DATA_DIR: /shadow-data
+      THERMOSTAT_SHADOW_OUTPUT_DIR: /shadow-output
+      THERMOSTAT_NEURAL_OUTPUT_DIR: /neural-output
+    volumes:
+      - ./dashboard:/app/dashboard:ro
+      - ./shadow:/opt/shadow-config:ro
+      - ./pilot-data:/pilot:ro
+      - ./shadow-data:/shadow-data:ro
+      - ../outputs/climate-shadow:/shadow-output:ro
+      - ../outputs/neural-shadow:/neural-output:ro
+    # Keep bound to loopback by default: the dashboard has no built-in authentication.
+    # Do not set DASHBOARD_BIND=0.0.0.0 on an untrusted LAN without an authenticating reverse proxy.
+    ports:
+      - "${DASHBOARD_BIND:-127.0.0.1}:${DASHBOARD_PORT:-8780}:8780"
+    logging:
+      driver: json-file
+      options:
+        max-size: 2m
+        max-file: "2"
